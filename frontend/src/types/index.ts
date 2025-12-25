@@ -164,6 +164,20 @@ export interface Strategy {
   max_drawdown?: number;
 }
 
+// Enhanced strategy info from new backend
+export interface StrategyInfo {
+  name: string;
+  display_name: string;
+  description: string;
+  category: string;
+  default_config: Record<string, unknown>;
+}
+
+export interface StrategiesResponse {
+  strategies: StrategyInfo[];
+  categories: Record<string, string[]>;
+}
+
 // Bot types
 export type BotStatus = 'CREATED' | 'STARTING' | 'RUNNING' | 'STOPPING' | 'STOPPED' | 'ERROR';
 
@@ -189,10 +203,73 @@ export interface Bot {
 
 // Backtest types
 export type BacktestStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+export type SlippageModel = 'none' | 'fixed' | 'volume_based' | 'spread_based';
+
+export interface BacktestRequest {
+  strategy: string;
+  start_date: string;
+  end_date: string;
+  initial_capital?: number;
+  fee_rate?: number;
+  slippage_model?: SlippageModel;
+  slippage_bps?: number;
+  market_ids?: string[];
+  strategy_config?: Record<string, unknown>;
+}
+
+export interface BacktestMetrics {
+  total_return: number;
+  total_return_pct: number;
+  annualized_return_pct: number;
+  sharpe_ratio: number;
+  sortino_ratio: number;
+  calmar_ratio: number;
+  max_drawdown: number;
+  max_drawdown_pct: number;
+  max_drawdown_duration_days: number;
+  volatility_pct: number;
+  downside_deviation_pct: number;
+  total_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  win_rate_pct: number;
+  avg_win: number;
+  avg_loss: number;
+  avg_trade: number;
+  profit_factor: number;
+  expectancy: number;
+  avg_trade_duration_hours: number;
+  max_consecutive_wins: number;
+  max_consecutive_losses: number;
+  skewness: number;
+  kurtosis: number;
+  var_95: number;
+  cvar_95: number;
+  recovery_factor: number;
+  ulcer_index: number;
+  serenity_index: number;
+  avg_exposure_pct: number;
+  max_exposure_pct: number;
+  time_in_market_pct: number;
+  best_trade: number;
+  worst_trade: number;
+  best_day: number;
+  worst_day: number;
+  best_month: number;
+  worst_month: number;
+}
+
+export interface EquityPoint {
+  timestamp: string;
+  equity: number;
+  drawdown: number;
+  drawdown_pct: number;
+}
 
 export interface Backtest {
   id: number;
   strategy_id: number;
+  strategy_name?: string;
   name?: string;
   start_date: string;
   end_date: string;
@@ -220,26 +297,30 @@ export interface Backtest {
   started_at?: string;
   completed_at?: string;
   duration_seconds?: number;
-  equity_curve: Array<{ date: string; value: number }>;
+  equity_curve: EquityPoint[];
+  metrics?: BacktestMetrics;
   created_at: string;
 }
 
 export interface BacktestTrade {
   id: number;
   backtest_id: number;
+  market_id: string;
   market_condition_id: string;
   token_id: string;
   side: OrderSide;
+  outcome: string;
   entry_price: number;
   exit_price?: number;
   size: number;
   fee: number;
+  slippage?: number;
   entry_time: string;
   exit_time?: string;
   pnl?: number;
   pnl_pct?: number;
-  signal_name?: string;
-  signal_strength?: number;
+  signal_type?: string;
+  confidence?: number;
 }
 
 // Arbitrage types

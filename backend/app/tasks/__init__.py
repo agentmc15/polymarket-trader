@@ -11,6 +11,7 @@ celery_app = Celery(
         "app.tasks.market_sync",
         "app.tasks.trader_tracking",
         "app.tasks.bot_execution",
+        "app.tasks.backtesting",
     ],
 )
 

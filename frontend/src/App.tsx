@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useMarkets } from './hooks/useMarkets'
+import { Backtesting } from './components/backtesting'
 
 function App() {
   const [activeTab, setActiveTab] = useState<'markets' | 'trading' | 'arbitrage' | 'traders' | 'bots' | 'backtesting'>('markets')
@@ -115,11 +116,7 @@ function App() {
           </div>
         )}
 
-        {activeTab === 'backtesting' && (
-          <div className="text-center py-12 text-muted-foreground">
-            Backtesting interface coming soon...
-          </div>
-        )}
+        {activeTab === 'backtesting' && <Backtesting />}
       </main>
     </div>
   )
