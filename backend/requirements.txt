@@ -1,0 +1,37 @@
+# FastAPI and server
+fastapi[all]>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Database
+sqlalchemy[asyncio]>=2.0.25
+asyncpg>=0.29.0
+alembic>=1.13.1
+
+# Cache and task queue
+redis>=5.0.1
+celery[redis]>=5.3.6
+
+# Polymarket integration
+py-clob-client>=0.1.0
+web3>=6.14.0
+
+# HTTP client
+httpx>=0.26.0
+
+# Configuration
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+
+# Testing
+pytest>=7.4.4
+pytest-asyncio>=0.23.3
+factory-boy>=3.3.0
+pytest-cov>=4.1.0
+
+# Code quality
+black>=24.1.0
+mypy>=1.8.0
+ruff>=0.1.14
+
+# Type stubs
+types-redis>=4.6.0
