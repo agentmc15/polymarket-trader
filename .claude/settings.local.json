@@ -7,7 +7,15 @@
       "Bash(npm install:*)",
       "Bash(npx tailwindcss:*)",
       "Bash(./node_modules/.bin/tailwindcss:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial project setup: Polymarket trading platform\n\n- Backend: FastAPI with async SQLAlchemy, Celery tasks, Polymarket API integration\n- Frontend: React 18 + TypeScript + Vite + TailwindCSS + TanStack Query\n- Docker: PostgreSQL/TimescaleDB, Redis, multi-stage builds\n- Full project structure with models, routes, services, hooks, and stores\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "postgres",
+    "filesystem",
+    "github",
+    "fetch"
+  ],
+  "enableAllProjectMcpServers": true
 }
