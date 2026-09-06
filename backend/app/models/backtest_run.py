@@ -3,10 +3,9 @@ from datetime import datetime
 from enum import Enum as PyEnum
 
 from sqlalchemy import DateTime, Enum, Float, Index, String, func
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base
+from app.models.base import Base, JSONDict, JSONList
 
 
 class BacktestRunStatus(str, PyEnum):
@@ -32,7 +31,7 @@ class BacktestRun(Base):
 
     # Strategy configuration
     strategy_name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
-    strategy_config: Mapped[dict] = mapped_column(JSONB, default=dict)
+    strategy_config: Mapped[dict] = mapped_column(JSONDict, default=dict)
 
     # Backtest parameters
     start_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -58,8 +57,24 @@ class BacktestRun(Base):
     total_trades: Mapped[int] = mapped_column(default=0)
 
     # Results - Detailed data (stored as JSON)
-    equity_curve: Mapped[list] = mapped_column(JSONB, default=list)
-    trades_list: Mapped[list] = mapped_column(JSONB, default=list)
+    equity_curve: Mapped[list] = mapped_column(JSONList, default=list)
+    trades_list: Mapped[list] = mapped_column(JSONList, default=list)
+
+    #: Trustworthiness and coverage payload for this run (migration
+    #: `003`, PLAN.md D6 / GUARDRAILS.md §1.7): `depth_source`,
+    #: `fill_at`, the intent counters, `unrealized_at_end`, and the
+    #: survivorship `coverage` census. A return figure without these is
+    #: not interpretable, so they are persisted alongside it instead of
+    #: being discarded when the Celery task returns. One JSON blob
+    #: rather than a dozen scalar columns because nothing queries or
+    #: aggregates on it — it is read whole, as a report.
+    #:
+    #: `server_default="{}"` so a row written before this column existed
+    #: reads as an EMPTY report ("this run predates coverage
+    #: reporting"), never as `None` and never as "coverage was zero".
+    report: Mapped[dict] = mapped_column(
+        JSONDict, default=dict, server_default="{}", nullable=False
+    )
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(

@@ -1,14 +1,12 @@
 """Backtest models."""
+import enum
 from datetime import datetime
 
 from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index, String, Text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.base import Base, TimestampMixin
+from app.models.base import Base, JSONDict, JSONList, TimestampMixin
 from app.models.trade import OrderSide
-
-import enum
 
 
 class BacktestStatus(str, enum.Enum):
@@ -34,7 +32,7 @@ class Backtest(Base, TimestampMixin):
     start_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     end_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     initial_capital: Mapped[float] = mapped_column(Float, nullable=False)
-    parameters: Mapped[dict] = mapped_column(JSONB, default=dict)
+    parameters: Mapped[dict] = mapped_column(JSONDict, default=dict)
 
     # Status
     status: Mapped[BacktestStatus] = mapped_column(Enum(BacktestStatus), default=BacktestStatus.PENDING)
@@ -69,8 +67,8 @@ class Backtest(Base, TimestampMixin):
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Equity curve and additional data
-    equity_curve: Mapped[list] = mapped_column(JSONB, default=list)
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    equity_curve: Mapped[list] = mapped_column(JSONList, default=list)
+    extra_data: Mapped[dict] = mapped_column("extra_data", JSONDict, default=dict)
 
     # Relationships
     trades: Mapped[list["BacktestTrade"]] = relationship(back_populates="backtest", cascade="all, delete-orphan")
@@ -113,7 +111,7 @@ class BacktestTrade(Base):
     signal_strength: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Metadata
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_data: Mapped[dict] = mapped_column("extra_data", JSONDict, default=dict)
 
     # Relationships
     backtest: Mapped["Backtest"] = relationship(back_populates="trades")

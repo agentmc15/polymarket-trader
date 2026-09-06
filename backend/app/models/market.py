@@ -2,11 +2,20 @@
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, Float, Index, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.base import Base, TimestampMixin
+from app.models.base import Base, JSONDict, JSONList, TimestampMixin
 
 if TYPE_CHECKING:
     from app.models.position import Position
@@ -14,12 +23,26 @@ if TYPE_CHECKING:
 
 
 class Market(Base, TimestampMixin):
-    """Market model representing a Polymarket prediction market."""
+    """Market model representing a prediction market on some venue.
+
+    `condition_id` alone is NOT globally unique any more (T15): the same
+    string could in principle collide across venues (or, more likely,
+    two markets on different venues legitimately share a Polymarket-style
+    condition id format by coincidence of how each venue mints ids), so
+    the real identity is the pair `(venue, condition_id)` — see the
+    `UniqueConstraint` in `__table_args__`. `condition_id` keeps its own
+    (non-unique) index for the common "look this condition id up
+    regardless of venue" query.
+    """
 
     __tablename__ = "markets"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    condition_id: Mapped[str] = mapped_column(String(66), unique=True, index=True)
+    #: `"polymarket"` or `"kalshi"` (`app.venues.types.VenueId`). Defaults
+    #: to `"polymarket"` since every `Market` row predates multi-venue
+    #: support and was implicitly a Polymarket market.
+    venue: Mapped[str] = mapped_column(String(16), default="polymarket", index=True)
+    condition_id: Mapped[str] = mapped_column(String(66), index=True)
     question_id: Mapped[str | None] = mapped_column(String(66), nullable=True)
 
     # Market details
@@ -28,8 +51,8 @@ class Market(Base, TimestampMixin):
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     # Token information
-    token_ids: Mapped[dict] = mapped_column(JSONB, default=dict)
-    outcomes: Mapped[list] = mapped_column(JSONB, default=list)
+    token_ids: Mapped[dict] = mapped_column(JSONDict, default=dict)
+    outcomes: Mapped[list] = mapped_column(JSONList, default=list)
 
     # Market status
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -46,12 +69,12 @@ class Market(Base, TimestampMixin):
     liquidity: Mapped[float] = mapped_column(Float, default=0.0)
 
     # Current prices
-    outcome_prices: Mapped[dict] = mapped_column(JSONB, default=dict)
+    outcome_prices: Mapped[dict] = mapped_column(JSONDict, default=dict)
 
     # Metadata
     source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     icon_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_data: Mapped[dict] = mapped_column("extra_data", JSONDict, default=dict)
 
     # Relationships
     prices: Mapped[list["MarketPrice"]] = relationship(back_populates="market", cascade="all, delete-orphan")
@@ -63,6 +86,12 @@ class Market(Base, TimestampMixin):
         Index("ix_markets_category", "category"),
         Index("ix_markets_is_active", "is_active"),
         Index("ix_markets_end_date", "end_date"),
+        UniqueConstraint(
+            "venue", "condition_id", name="uq_markets_venue_condition_id"
+        ),
+        CheckConstraint(
+            "venue IN ('polymarket', 'kalshi')", name="ck_markets_venue_valid"
+        ),
     )
 
 
@@ -72,7 +101,7 @@ class MarketPrice(Base):
     __tablename__ = "market_prices"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    market_id: Mapped[int] = mapped_column(index=True)
+    market_id: Mapped[int] = mapped_column(ForeignKey("markets.id"), index=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     # OHLCV data for each outcome

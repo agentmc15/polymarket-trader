@@ -3,28 +3,27 @@
 Provides REST endpoints for running backtests, viewing results,
 and managing backtest history.
 """
+import logging
 from datetime import datetime
 from enum import Enum
 from typing import Any
-import logging
 
 from celery.result import AsyncResult
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, func, desc
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import desc, func, select
 
 from app.api.deps import AsyncSessionDep
 from app.models.backtest_run import BacktestRun, BacktestRunStatus
+from app.services.backtesting import DEFAULT_CAPITAL_LEVELS
 from app.strategies import (
     STRATEGIES,
     STRATEGY_CATEGORIES,
     get_default_config,
     list_strategies,
 )
-from app.services.backtesting import SlippageModel
-from app.tasks.backtesting import run_backtest_task
 from app.tasks import celery_app
-
+from app.tasks.backtesting import run_backtest_task, run_sweep_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -120,6 +119,44 @@ class BacktestResponse(BaseModel):
     message: str = Field(..., description="Status message")
 
 
+class SweepRequest(BacktestRequest):
+    """Request schema for a capital sweep (PLAN.md D12, T22).
+
+    Extends `BacktestRequest` with `capital_levels` — every other field
+    (dates, fee/slippage config, market filter) is held fixed across the
+    sweep, exactly as `run_sweep`'s `base_config` is (T22 sweeps CAPITAL,
+    not strategy behavior).
+    """
+
+    capital_levels: list[float] | None = Field(
+        default=None,
+        description=(
+            "Capital levels to sweep, USD (default: "
+            f"{', '.join(str(int(c)) for c in DEFAULT_CAPITAL_LEVELS)})"
+        ),
+    )
+
+    @field_validator("capital_levels")
+    @classmethod
+    def validate_capital_levels(cls, v: list[float] | None) -> list[float] | None:
+        """Reject an explicitly empty or non-positive level list."""
+        if v is None:
+            return v
+        if not v:
+            raise ValueError("capital_levels must be non-empty when provided")
+        if any(level <= 0 for level in v):
+            raise ValueError("every capital_levels entry must be positive")
+        return v
+
+
+class SweepResponse(BaseModel):
+    """Response schema for sweep creation."""
+
+    id: int = Field(..., description="Parent backtest ID (strategy_name=sweep:<name>)")
+    status: str = Field(..., description="Current status")
+    message: str = Field(..., description="Status message")
+
+
 class TradeMetrics(BaseModel):
     """Trade statistics."""
 
@@ -166,6 +203,16 @@ class BacktestStatusResponse(BaseModel):
     trade_metrics: TradeMetrics | None = None
     risk_metrics: RiskMetrics | None = None
 
+    #: Trustworthiness and coverage payload (`BacktestRun.report`,
+    #: migration `003`): `depth_source`, `fill_at`, the intent counters,
+    #: settlement/unrealized counts, and the survivorship `coverage`
+    #: census. GUARDRAILS.md §1.7 requires a result produced from
+    #: synthesized depth, same-snapshot fills, or a mostly-unresolved
+    #: market population to be labeled as such wherever it is shown —
+    #: this endpoint is one of those places. An EMPTY dict means the run
+    #: predates report capture, NOT that its coverage was zero.
+    report: dict[str, Any] = Field(default_factory=dict)
+
     # Progress
     progress: float = 0.0
     error_message: str | None = None
@@ -174,10 +221,7 @@ class BacktestStatusResponse(BaseModel):
     created_at: datetime
     completed_at: datetime | None = None
 
-    class Config:
-        """Pydantic config."""
-
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class EquityCurvePoint(BaseModel):
@@ -352,6 +396,67 @@ async def start_backtest(
     )
 
 
+@router.post("/sweep", response_model=SweepResponse)
+async def start_sweep(
+    request: SweepRequest,
+    session: AsyncSessionDep,
+) -> SweepResponse:
+    """Start a capital sweep using Celery (PLAN.md D12, T22).
+
+    Creates a PARENT `BacktestRun` (`strategy_name=f"sweep:{name}"`) that
+    `run_sweep_task` fills in with the aggregate `EdgeDecayReport`
+    (`report["edge_decay"]`) plus the ids of one CHILD `BacktestRun` per
+    capital level, each populated identically to a standalone run.
+
+    Args:
+        request: Sweep configuration (`BacktestRequest` + `capital_levels`).
+        session: Database session.
+
+    Returns:
+        SweepResponse: Parent backtest ID and initial status.
+    """
+    levels = request.capital_levels or list(DEFAULT_CAPITAL_LEVELS)
+
+    backtest = BacktestRun(
+        strategy_name=f"sweep:{request.strategy}",
+        strategy_config=request.strategy_config,
+        start_date=request.start_date,
+        end_date=request.end_date,
+        initial_capital=max(levels),
+        fee_rate=request.fee_rate,
+        status=BacktestRunStatus.PENDING,
+    )
+
+    session.add(backtest)
+    await session.commit()
+    await session.refresh(backtest)
+
+    backtest_id = backtest.id
+
+    request_data = {
+        "strategy_name": request.strategy,
+        "strategy_config": request.strategy_config,
+        "start_date": request.start_date.isoformat(),
+        "end_date": request.end_date.isoformat(),
+        "fee_rate": request.fee_rate,
+        "slippage_model": request.slippage_model.value,
+        "slippage_value": request.slippage_value,
+        "markets": request.markets,
+        "capital_levels": levels,
+    }
+
+    task = run_sweep_task.delay(backtest_id, request_data)
+    _backtest_task_ids[backtest_id] = task.id
+
+    logger.info(f"Started sweep {backtest_id} with Celery task {task.id}")
+
+    return SweepResponse(
+        id=backtest_id,
+        status="PENDING",
+        message=f"Sweep queued. Task ID: {task.id}",
+    )
+
+
 @router.get("/{backtest_id}", response_model=BacktestStatusResponse)
 async def get_backtest_status(
     backtest_id: int,
@@ -420,10 +525,55 @@ async def get_backtest_status(
         total_return_pct=(backtest.total_return * 100) if backtest.total_return else None,
         trade_metrics=trade_metrics,
         risk_metrics=risk_metrics,
+        report=dict(backtest.report or {}),
         progress=progress,
         created_at=backtest.created_at,
         completed_at=backtest.completed_at,
     )
+
+
+@router.get("/{backtest_id}/edge-decay")
+async def get_backtest_edge_decay(
+    backtest_id: int,
+    session: AsyncSessionDep,
+) -> dict[str, Any]:
+    """Get the `EdgeDecayReport` for a completed sweep (PLAN.md D12, T22).
+
+    GUARDRAILS.md §1.7: the returned payload carries `depth_source`/
+    `fill_at` on every row and the `sweep_ceiling_note`/
+    `unmeasurable_note` caveats — a caller displaying `edge_dies_at`
+    without also showing those is not showing the whole number.
+
+    Args:
+        backtest_id: The PARENT sweep's backtest ID (the one returned by
+            `POST /api/v1/backtests/sweep`, `strategy_name=f"sweep:
+            {name}"`).
+        session: Database session.
+
+    Returns:
+        dict[str, Any]: `edge_decay_report_to_dict()`'s shape.
+
+    Raises:
+        HTTPException: 404 if the backtest does not exist, or if it
+            carries no `edge_decay` report (not a sweep, or not yet
+            completed).
+    """
+    query = select(BacktestRun).where(BacktestRun.id == backtest_id)
+    result = await session.execute(query)
+    backtest = result.scalar_one_or_none()
+
+    if not backtest:
+        raise HTTPException(status_code=404, detail="Backtest not found")
+
+    edge_decay: dict[str, Any] | None = (backtest.report or {}).get("edge_decay")
+    if edge_decay is None:
+        raise HTTPException(
+            status_code=404,
+            detail="This backtest has no edge-decay report — it is not a "
+            "sweep, or the sweep has not completed yet",
+        )
+
+    return edge_decay
 
 
 @router.get("/{backtest_id}/equity-curve", response_model=EquityCurveResponse)

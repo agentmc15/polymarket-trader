@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import api_router
 from app.config import settings
 from app.database import close_db, init_db
+from app.logging_config import configure_logging
 
 
 @asynccontextmanager
@@ -41,6 +42,12 @@ def create_application() -> FastAPI:
     Returns:
         FastAPI: Configured application instance.
     """
+    # Before anything else: the structured-logging config
+    # (`app/logging_config.py`). Without it, every `extra={...}` field on
+    # an order event -- including the `naked_exposure` alarm -- is
+    # discarded by the default formatter and the line reads `order`.
+    configure_logging(level="DEBUG" if settings.debug else None)
+
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
