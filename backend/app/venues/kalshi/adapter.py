@@ -159,6 +159,13 @@ _MARKETS_PAGE_LIMIT = 200
 #: repeated cursor, so this only bounds the pathological case.
 _MAX_MARKET_PAGES = 50
 
+#: Extra attempts after a 429 before giving up on one request.
+_RATE_LIMIT_RETRIES = 2
+
+#: First back-off after a 429, doubled per retry. Kalshi sends no
+#: `Retry-After` on these, so the schedule is ours, not the venue's.
+_RATE_LIMIT_BACKOFF_S = 1.0
+
 #: Normalized `MarketStatus` -> the `status` query value Kalshi expects.
 #: Kalshi calls a resolved market `"settled"` (PLAN.md §3: `result` is
 #: populated once a market settles).
@@ -262,6 +269,10 @@ class KalshiAdapter(BaseAdapter):
         # client would reach the network (GUARDRAILS.md §1.4).
         self._transport = transport
         self._client_loop: asyncio.AbstractEventLoop | None = None
+        # Request pacing state. The lock is loop-bound like the client, so
+        # it is rebuilt by `_rebind_client_if_loop_changed` too.
+        self._pace_lock: asyncio.Lock | None = None
+        self._next_request_at = 0.0
         self._http = httpx.AsyncClient(
             base_url=self._settings.kalshi_api_base_url,
             transport=transport,
@@ -295,6 +306,41 @@ class KalshiAdapter(BaseAdapter):
             timeout=30.0,
         )
         self._client_loop = loop
+        self._pace_lock = asyncio.Lock()
+
+    async def _pace(self) -> None:
+        """Wait until this adapter is allowed to issue its next request.
+
+        Kalshi's unauthenticated limit is about 10 requests a second and
+        it answers a burst with a bare 429 (no `Retry-After`). Pagination
+        in `list_markets` fires as fast as the network allows, so before
+        this existed every scan tripped the limit and threw away every
+        page it had already collected.
+
+        Serialized through a lock because the limit is per CLIENT, not
+        per call site: concurrent book fetches share the same budget as
+        the paging loop, so pacing each coroutine independently would not
+        bound the aggregate rate.
+        """
+        if self._transport is not None:
+            # An injected transport is a test double (GUARDRAILS.md §1.4
+            # forbids tests reaching a venue), and a MockTransport has no
+            # rate limit to respect. Pacing it only makes the suite sleep
+            # -- it tripled the venue tests' runtime -- so the pacing
+            # logic is covered by testing `_pace` directly instead.
+            return
+        if self._pace_lock is None:
+            self._pace_lock = asyncio.Lock()
+        interval = self._settings.kalshi_min_request_interval_s
+        if interval <= 0:
+            return
+        async with self._pace_lock:
+            now = asyncio.get_running_loop().time()
+            wait = self._next_request_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = asyncio.get_running_loop().time()
+            self._next_request_at = now + interval
 
     @property
     def _client(self) -> httpx.AsyncClient:
@@ -397,11 +443,36 @@ class KalshiAdapter(BaseAdapter):
             VenueRateLimited: On HTTP 429.
             VenuePayloadError: If the body is not a JSON object.
         """
-        request = self._client.build_request("GET", path, params=params)
-        self._apply_auth(request, require_auth=require_auth)
-        response = await self._client.send(request)
-        raise_for_venue_error(response)
-        return json_object(response)
+        # One retry budget for the whole call. Pacing should keep us under
+        # the limit; this is the safety net for the case where another
+        # process shares the same source address, which pacing cannot see.
+        # An injected transport is a test double, and its 429 is a fixture
+        # rather than a transient condition -- retrying one only sleeps
+        # through a deterministic answer (it cost 3s in a single test).
+        attempts = 1 if self._transport is not None else _RATE_LIMIT_RETRIES + 1
+        for attempt in range(attempts):
+            await self._pace()
+            request = self._client.build_request("GET", path, params=params)
+            self._apply_auth(request, require_auth=require_auth)
+            response = await self._client.send(request)
+            if response.status_code != 429 or attempt == attempts - 1:
+                raise_for_venue_error(response)
+                return json_object(response)
+            # Kalshi sends no Retry-After on these, so back off on a
+            # doubling schedule rather than guessing a header exists.
+            header = response.headers.get("Retry-After")
+            delay = float(header) if header and header.isdigit() else _RATE_LIMIT_BACKOFF_S * (2**attempt)
+            logger.warning(
+                "kalshi",
+                extra={
+                    "event": "kalshi_rate_limited_retrying",
+                    "path": path,
+                    "attempt": attempt + 1,
+                    "sleep_s": delay,
+                },
+            )
+            await asyncio.sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     # -- Market metadata --------------------------------------------------
 

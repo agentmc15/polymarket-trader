@@ -250,6 +250,23 @@ class Settings(BaseSettings):
     # `settlement_delay_hours`/`min_hours_for_annualization` are hours;
     # `liquidity_fraction`/`min_viable_annualized` are dimensionless
     # fractions.
+    #: Minimum seconds between two Kalshi HTTP requests, applied across
+    #: concurrent callers. Kalshi's UNAUTHENTICATED limit was measured at
+    #: roughly 10 req/s: 17 requests succeeded in 1.69s and the 18th
+    #: returned 429, with no `Retry-After` header. `list_markets` pages
+    #: at `limit=200` for up to 50 pages as fast as it can, so it tripped
+    #: the limit on every single scan and raised -- discarding the ~3400
+    #: markets it had already fetched. The net effect was that Kalshi
+    #: contributed NOTHING to any pass, and cross-venue arbitrage, the
+    #: whole point of scanning two venues, could never fire.
+    #:
+    #: 0.10s was measured as sufficient: 25 consecutive paged requests
+    #: completed with zero 429s, in 4.7s. Authenticated limits are higher,
+    #: so this is deliberately the conservative setting for the
+    #: no-credentials case rather than the fastest one that works.
+    kalshi_min_request_interval_s: float = Field(
+        default=0.10, alias="KALSHI_MIN_REQUEST_INTERVAL_S"
+    )
     kalshi_taker_fee_rate: float = Field(default=0.07, alias="KALSHI_TAKER_FEE_RATE")
     kalshi_maker_fee_rate: float = Field(default=0.0, alias="KALSHI_MAKER_FEE_RATE")
     polymarket_taker_fee_overrides: dict[str, float] = Field(
