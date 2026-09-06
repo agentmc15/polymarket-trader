@@ -30,21 +30,46 @@ UNTRUSTED TEXT (GUARDRAILS.md §6): `question` and `rules_text` come from
 a venue payload. They are returned for a human to READ and are never
 executed, evaluated, or interpreted as instructions by anything on this
 path.
+
+CONCURRENT WRITERS (T37). Three writers reach `event_links`: this
+module's two review routes, `POST /links/propose`, and the
+`app.tasks.matching` beat — and the beat runs while a reviewer is
+reading. Two consequences are handled here rather than left to
+last-write-wins. `POST /links/{id}/approve` carries its own precondition
+(`status = 'proposed' AND reviewed_at IS NULL`) IN the UPDATE, so an
+approval that arrives after another reviewer has already decided the
+same link is a `409`, not a silent overwrite of their decision;
+`app.services.matching.persist` carries the mirror-image predicate so
+the beat cannot overwrite an approval. And `POST /links/propose` treats
+the beat inserting one of its pairs first as a `409` rather than an
+unhandled `IntegrityError` — the same "nothing is lost by deferring"
+reading `app.tasks.matching` takes of that race from its side.
+
+`POST /links/{id}/reject` deliberately has NO such precondition. It is
+the revocation path: taking an approved link back out of the trading set
+is always allowed and always fail-safe, because a rejected link is one
+`cross_venue_arbitrage` may not touch. The asymmetry is the point —
+guard the transition that CLEARS capital to move, not the one that
+stops it.
 """
+import logging
 from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import AsyncSessionDep, MarketDataAdaptersDep
 from app.models.event_link import EventLink
-from app.services.matching import persist_proposals, propose_links
+from app.services.matching import PROPOSED, persist_proposals, propose_links
 from app.strategies.base import normalize_outcome
 from app.utils.time import utcnow
 from app.venues.base import MarketDataAdapter, VenueError
 from app.venues.types import VenueId, VenueMarket
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -425,12 +450,39 @@ async def propose(
 
     Returns:
         ProposeResponse: Counts plus every row involved.
+
+    Raises:
+        HTTPException: 409 if the beat (or another operator) inserted one
+            of these pairs between this call's lookup and its commit. The
+            pass is rolled back whole and NOTHING is written — which
+            costs nothing, because the matcher is deterministic and the
+            row the other writer just filed is the row this call would
+            have filed. `app.tasks.matching` reads the same race the same
+            way from its side; an unhandled `IntegrityError` here would
+            have been a 500 for a race with no consequences.
     """
     markets_a = await adapters["polymarket"].list_markets(status="open")
     markets_b = await adapters["kalshi"].list_markets(status="open")
     proposals = propose_links(markets_a, markets_b, min_confidence=min_confidence)
 
-    outcome = await persist_proposals(session, proposals)
+    try:
+        outcome = await persist_proposals(session, proposals)
+    except IntegrityError as exc:
+        await session.rollback()
+        logger.warning(
+            "link_proposal",
+            extra={
+                "event": "link_proposal_conflict",
+                "proposals": len(proposals),
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "another writer filed one of these pairs while this pass was "
+                "running; nothing was written — retry"
+            ),
+        ) from exc
 
     # `persist_proposals` commits but does not refresh: only a caller
     # rendering a response needs the server-side `created_at`/`updated_at`
@@ -525,6 +577,15 @@ async def approve_link(
     it. `reviewed_by`/`reviewed_at`/`notes` are written here and only
     here.
 
+    Only a link that is still `"proposed"` and still unreviewed may be
+    approved, and that precondition travels IN the UPDATE rather than
+    being checked against the row read a moment earlier (T37). Two
+    reviewers opening the same queue entry is ordinary, and the second
+    one's approval must not quietly erase the first one's rejection — the
+    note explaining WHY a pair is not the same bet ("Kalshi settles on
+    the AP call, Polymarket on state certification") is the one thing in
+    this table no machine can rediscover.
+
     Args:
         link_id: Primary key of the `event_links` row.
         request: Reviewer, notes, and an optional outcome map that
@@ -541,7 +602,9 @@ async def approve_link(
             guess the correspondence between two venues' outcome labels.
             An approved link with no map is worse than no link: T18 would
             build legs whose `f"{venue}:{market_id}:{outcome}"` position
-            ids match nothing.
+            ids match nothing. 409 if the link has already been decided,
+            including by another reviewer between this request's read and
+            its write.
     """
     row = await session.get(EventLink, link_id)
     if row is None:
@@ -560,11 +623,39 @@ async def approve_link(
             ),
         )
 
-    row.outcome_map = outcome_map
-    row.status = "approved"
-    row.reviewed_by = request.reviewed_by
-    row.reviewed_at = utcnow()
-    row.notes = request.notes
+    # Field by field from the validated model, never `**model_dump()`
+    # (see this module's MASS ASSIGNMENT note) — and guarded, so the
+    # decision this request believes it is making is the decision the
+    # database is still waiting for.
+    result = await session.execute(
+        update(EventLink)
+        .where(
+            EventLink.id == link_id,
+            EventLink.status == PROPOSED,
+            EventLink.reviewed_at.is_(None),
+        )
+        .values(
+            outcome_map=outcome_map,
+            status="approved",
+            reviewed_by=request.reviewed_by,
+            reviewed_at=utcnow(),
+            notes=request.notes,
+        ),
+        execution_options={"synchronize_session": False},
+    )
+    if not result.rowcount:
+        decided = await session.get(EventLink, link_id, populate_existing=True)
+        if decided is None:
+            raise HTTPException(status_code=404, detail=f"link {link_id} not found")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"link {link_id} is already {decided.status!r}, decided by "
+                f"{decided.reviewed_by!r}; nothing was changed. Re-read the link "
+                "before deciding it again"
+            ),
+        )
+
     await session.commit()
     await session.refresh(row)
     return _link_out(row)
@@ -579,6 +670,14 @@ async def reject_link(
     No outcome map is required: a rejected link is never traded, and the
     reviewer's `notes` are the durable output — the reason two contracts
     that scored alike are not the same bet.
+
+    No `status` precondition either, unlike `approve_link` (T37). This is
+    the revocation path: a link an earlier reviewer approved must stay
+    rejectable the moment someone spots the settlement difference, and
+    the result of winning that race is a link nothing may trade — the
+    fail-safe side. Guarding it would mean an operator had to undo an
+    approval before they could withdraw it, which is exactly backwards
+    for the transition that STOPS capital moving.
 
     Args:
         link_id: Primary key of the `event_links` row.

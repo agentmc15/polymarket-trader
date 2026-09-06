@@ -35,20 +35,44 @@ Rows are matched on the UNIQUE `(venue_a, market_a, venue_b, market_b)`
 tuple that `propose_links` already puts in canonical order, so a pair
 cannot re-enter the queue by arriving from the other venue's list first.
 
+CASE 3 AND CASE 4 HOLD UNDER CONCURRENCY, NOT MERELY IN ORDER (T37). A
+pass reads a row, judges it undecided, and writes it — and a human can
+approve that same row in between, because the reviewer's approval is a
+different transaction on a different connection and a real pass carries
+hundreds of proposals between the read and the commit. Checking
+`is_decided` on a Python object loaded earlier is therefore a check of
+what WAS true, not of what is true when the UPDATE lands. So the check is
+also carried IN THE UPDATE ITSELF: `update_proposal` builds
+`... WHERE id = :id AND status = 'proposed' AND reviewed_at IS NULL`, and
+`persist_proposals` reads `rowcount` — zero means a human got there
+first, and the pair is counted in `skipped_reviewed` exactly as if the
+decision had already been visible at read time.
+
+A statement-level precondition rather than `SELECT ... FOR UPDATE` or a
+`version_id_col`, deliberately: it behaves identically on Postgres
+(production) and SQLite (the test engine, where `FOR UPDATE` parses and
+then does nothing), so the guarantee is exercised by the same test that
+runs in CI. It costs one thing worth naming: the row lock is taken when
+the UPDATE executes rather than at commit, so a reviewer approving a row
+this pass has already rescored blocks until the pass commits. The pass
+does no I/O beyond the database once it starts filing, so that wait is
+short — and blocking is the correct behaviour anyway, since the
+alternative is the two writes racing.
+
 THIS MODULE WRITES EXACTLY ONE LIFECYCLE VALUE, `PROPOSED`. It cannot
 express another: the only status assignment is on a freshly built row,
-`update_proposal` never touches `status`/`reviewed_by`/`reviewed_at`, and
-`persist_proposals` REFUSES a proposal that arrives carrying any other
-value (`ValueError`) rather than trusting its caller. Promotion is a
-human act performed through `app/api/routes/links.py` — see
-`app.models.event_link` and PLAN.md D9/R1 for why that separation is
-structural rather than stylistic.
+`update_proposal` never touches `status`/`reviewed_by`/`reviewed_at` (it
+only READS them, as the precondition), and `persist_proposals` REFUSES a
+proposal that arrives carrying any other value (`ValueError`) rather than
+trusting its caller. Promotion is a human act performed through
+`app/api/routes/links.py` — see `app.models.event_link` and PLAN.md
+D9/R1 for why that separation is structural rather than stylistic.
 """
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import Update, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.event_link import EventLink
@@ -71,17 +95,20 @@ class ProposalOutcome:
         updated: Existing UNDECIDED proposals rescored in place.
         skipped_reviewed: Pairs the matcher proposed again that a human
             has already approved or rejected. Left EXACTLY as the
-            reviewer left them.
+            reviewer left them. Includes the pairs a human decided
+            DURING this pass, whose guarded UPDATE matched no row.
         rows: Every row the call touched, plus the decided ones it
             declined to touch, in proposal order.
 
     Note:
-        `rows` are live ORM objects on the caller's session. The session
-        has been committed; whether their attributes are still loaded
-        depends on that session's `expire_on_commit`. A caller that needs
-        `created_at`/`updated_at` (the API route, building a response)
-        refreshes them itself; a caller that only needs the counters (the
-        Celery beat) must not touch them at all.
+        `rows` are live ORM objects on the caller's session, and since
+        T37 the rescore is issued as a guarded UPDATE statement rather
+        than as an attribute assignment, so a row's in-memory attributes
+        hold what the pass READ, not what it wrote. A caller rendering
+        them (the API route, building a response) must `refresh` each row
+        — which it already does for the server-side
+        `created_at`/`updated_at`; a caller that only needs the counters
+        (the Celery beat) must not touch them at all.
     """
 
     created: int
@@ -109,12 +136,18 @@ def is_decided(row: EventLink) -> bool:
     status happens to read `"proposed"` is the failure this function
     exists to make impossible.
 
+    This answers the question ABOUT A LOADED PYTHON OBJECT, so its answer
+    is only as fresh as the SELECT that produced it. It is the cheap
+    skip, not the guarantee: the guarantee is the identical predicate
+    carried in `update_proposal`'s `WHERE`, which the database evaluates
+    against the row as it is when the UPDATE executes.
+
     Args:
         row: A persisted `event_links` row.
 
     Returns:
-        bool: `True` if a human has decided this pair and the proposer
-            must leave it alone.
+        bool: `True` if a human had decided this pair as of the read that
+            loaded it, and the proposer must leave it alone.
     """
     return row.status != PROPOSED or row.reviewed_at is not None
 
@@ -147,23 +180,49 @@ def new_proposal(proposal: EventLink) -> EventLink:
     )
 
 
-def update_proposal(existing: EventLink, proposal: EventLink) -> None:
-    """Refresh an UNDECIDED proposal in place from a fresh score.
+def update_proposal(existing: EventLink, proposal: EventLink) -> Update:
+    """Build the GUARDED update that rescores one undecided proposal.
 
-    The caller must have established `not is_decided(existing)` first.
+    A statement rather than an attribute assignment, because the point of
+    this function is the `WHERE` (T37). Assigning
+    `existing.confidence = ...` would make the decidedness test and the
+    write two different transactions separated by the rest of the pass; a
+    human approving in that window would be silently overwritten, and the
+    haircut `app.strategies.cross_venue_arbitrage` applies as
+    `p_same_resolution` would be the machine's number rather than the one
+    the reviewer accepted. Carrying `status = 'proposed' AND reviewed_at
+    IS NULL` in the statement makes the database re-check decidedness at
+    the moment of the write, so a decision made mid-pass wins.
+
     Only the three derived fields move: a venue that edits a question or
     moves a close time changes the score, and the review queue should
     show today's score rather than the one from whenever the pair was
-    first seen. `status`, `reviewed_by`, `reviewed_at` and `notes` are
-    deliberately absent from this function's body.
+    first seen. `status`, `reviewed_by`, `reviewed_at` and `notes` appear
+    only as the precondition READ; nothing here assigns them.
 
     Args:
-        existing: The persisted, undecided row.
+        existing: The persisted row, as this session read it. Only its
+            `id` is used — every value that decides whether the write
+            happens is re-read by the database.
         proposal: The freshly scored proposal for the same pair.
+
+    Returns:
+        Update: The guarded statement. Its `rowcount` is 1 when the row
+            was still undecided and 0 when a human decided it first.
     """
-    existing.confidence = proposal.confidence
-    existing.evidence = dict(proposal.evidence)
-    existing.outcome_map = dict(proposal.outcome_map)
+    return (
+        update(EventLink)
+        .where(
+            EventLink.id == existing.id,
+            EventLink.status == PROPOSED,
+            EventLink.reviewed_at.is_(None),
+        )
+        .values(
+            confidence=proposal.confidence,
+            evidence=dict(proposal.evidence),
+            outcome_map=dict(proposal.outcome_map),
+        )
+    )
 
 
 async def _find_existing(
@@ -210,6 +269,12 @@ async def persist_proposals(
     filed queue is harder to reason about than an empty one, and the next
     interval refiles it.
 
+    Safe against a human deciding a row MID-PASS: every rescore is a
+    guarded UPDATE that re-checks `status`/`reviewed_at` in the database
+    at the moment it writes (see `update_proposal` and this module's
+    docstring). A pair decided between this pass's read and its write is
+    counted in `skipped_reviewed`, not overwritten.
+
     Args:
         session: Database session. Committed by this function.
         proposals: Unsaved rows from
@@ -255,8 +320,34 @@ async def persist_proposals(
             touched.append(existing)
             continue
 
-        update_proposal(existing, proposal)
-        updated += 1
+        # `synchronize_session=False`: the guarded statement is the write
+        # of record, and letting the ORM also mirror it onto `existing`
+        # would put the pass's numbers on a row the database may have
+        # refused to change. `rows` therefore carry what was READ — see
+        # `ProposalOutcome.rows`.
+        result = await session.execute(
+            update_proposal(existing, proposal),
+            execution_options={"synchronize_session": False},
+        )
+        if result.rowcount:
+            updated += 1
+        else:
+            # A human approved or rejected this pair between this pass's
+            # SELECT above and this UPDATE. Their decision stands; the
+            # pair is skipped exactly as if it had already been decided
+            # when the pass read it.
+            skipped_reviewed += 1
+            logger.info(
+                "link_proposal",
+                extra={
+                    "event": "link_rescore_declined_decided_row",
+                    "link_id": existing.id,
+                    "venue_a": existing.venue_a,
+                    "market_a": existing.market_a,
+                    "venue_b": existing.venue_b,
+                    "market_b": existing.market_b,
+                },
+            )
         touched.append(existing)
 
     await session.commit()
