@@ -118,6 +118,20 @@ def upgrade() -> None:
         DO $$
         BEGIN
             IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+                -- TimescaleDB refuses to convert a table carrying ANY unique
+                -- index that omits the partitioning column, and `book_snapshots_pkey`
+                -- is on `id` alone. Without this DROP the conversion fails with
+                -- "cannot create a unique index without the column ts" and
+                -- takes the whole migration chain down with it -- verified
+                -- against timescale/timescaledb:latest-pg15.
+                --
+                -- Dropping it is safe rather than a concession: row uniqueness
+                -- is already enforced by the natural key
+                -- `uq_book_snapshots_venue_market_outcome_ts (venue, market_id, outcome, ts)`,
+                -- created above, which DOES contain the partitioning column. The
+                -- surrogate PK adds nothing here, `id` keeps its sequence and
+                -- stays unique, and no foreign key references this table.
+                ALTER TABLE book_snapshots DROP CONSTRAINT IF EXISTS book_snapshots_pkey;
                 PERFORM create_hypertable('book_snapshots', 'ts', if_not_exists => TRUE);
             END IF;
         END $$;

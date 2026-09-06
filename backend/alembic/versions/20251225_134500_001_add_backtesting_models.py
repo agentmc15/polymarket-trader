@@ -59,6 +59,20 @@ def upgrade() -> None:
         DO $$
         BEGIN
             IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+                -- TimescaleDB refuses to convert a table carrying ANY unique
+                -- index that omits the partitioning column, and `price_history_pkey`
+                -- is on `id` alone. Without this DROP the conversion fails with
+                -- "cannot create a unique index without the column timestamp" and
+                -- takes the whole migration chain down with it -- verified
+                -- against timescale/timescaledb:latest-pg15.
+                --
+                -- Dropping it is safe rather than a concession: row uniqueness
+                -- is already enforced by the natural key
+                -- `uq_price_history_market_timestamp (market_id, timestamp)`,
+                -- created above, which DOES contain the partitioning column. The
+                -- surrogate PK adds nothing here, `id` keeps its sequence and
+                -- stays unique, and no foreign key references this table.
+                ALTER TABLE price_history DROP CONSTRAINT IF EXISTS price_history_pkey;
                 PERFORM create_hypertable('price_history', 'timestamp', if_not_exists => TRUE);
             END IF;
         END $$;
