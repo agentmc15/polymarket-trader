@@ -30,12 +30,11 @@ switch was thrown. The halt now lives at PLACEMENT
 `OrderRouter.submit`), and this pass, which places nothing, keeps
 running.
 """
-import asyncio
 import logging
 from typing import Any
 
 from app.config import settings
-from app.database import async_session_factory
+from app.database import async_session_factory, run_async_task
 from app.execution.reconcile import reconcile
 from app.tasks import celery_app
 from app.venues.registry import get_read_adapter
@@ -100,4 +99,4 @@ def reconcile_all() -> dict[str, Any]:
     Returns:
         dict[str, Any]: The per-venue reconciliation result.
     """
-    return asyncio.run(reconcile_venues())
+    return run_async_task(reconcile_venues())

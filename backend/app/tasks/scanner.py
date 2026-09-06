@@ -38,14 +38,13 @@ engaged kill switch (which only blocks PLACEMENT) has no bearing on
 whether discovery keeps running, and discovery genuinely never touches
 the placement fence at all.
 """
-import asyncio
 import logging
 from typing import Any
 
 from sqlalchemy import select
 
 from app.config import settings
-from app.database import async_session_factory
+from app.database import async_session_factory, run_async_task
 from app.models.event_link import EventLink
 from app.services.scanner import (
     ARBITRAGE_STRATEGIES,
@@ -156,7 +155,7 @@ def scan_opportunities() -> dict[str, Any]:
     Returns:
         dict[str, Any]: The scan summary.
     """
-    return asyncio.run(run_scan())
+    return run_async_task(run_scan())
 
 
 @celery_app.task(name="app.tasks.scanner.scan_near_resolution")
@@ -166,4 +165,4 @@ def scan_near_resolution() -> dict[str, Any]:
     Returns:
         dict[str, Any]: The scan summary.
     """
-    return asyncio.run(run_near_resolution_scan())
+    return run_async_task(run_near_resolution_scan())

@@ -386,10 +386,15 @@ class PolymarketAdapter(BaseAdapter):
                 disables memoization entirely.
         """
         self.venue: VenueId = "polymarket"
-        self._gamma_client = httpx.AsyncClient(
+        # Kept so the clients can be REBUILT when the event loop changes;
+        # see `_client_for`. Tests inject a MockTransport here and it must
+        # survive a rebuild, or a rebuilt client would reach the network.
+        self._transport = transport
+        self._client_loop: asyncio.AbstractEventLoop | None = None
+        self._gamma = httpx.AsyncClient(
             base_url=settings.gamma_api_url, transport=transport, timeout=30.0
         )
-        self._clob_client = httpx.AsyncClient(
+        self._clob = httpx.AsyncClient(
             base_url=settings.clob_api_url, transport=transport, timeout=30.0
         )
         self._clob_wrapper: ClobClientWrapper | None = None
@@ -425,10 +430,58 @@ class PolymarketAdapter(BaseAdapter):
         #: does not make.
         self._book_market_memo: _AsyncTtlMemo[VenueMarket] = _AsyncTtlMemo(ttl_s)
 
+
+    def _rebind_clients_if_loop_changed(self) -> None:
+        """Rebuild both clients when the running event loop has changed.
+
+        In paper mode `make_paper_adapter` hands back a PROCESS-WIDE
+        singleton on purpose -- its in-memory orders are the only record
+        there is -- so this adapter outlives any one event loop. Each
+        Celery beat tick runs `asyncio.run(...)`, which creates a loop
+        and closes it on the way out, and an `httpx.AsyncClient` holds
+        connections bound to the loop that opened them.
+
+        The result, observed against the live API: tick 1 of a beat
+        succeeds, and every tick afterwards dies inside the transport
+        with `RuntimeError: Event loop is closed`. Retrying never helps,
+        because the dead pool is reused forever. No test could see it --
+        the suite runs one loop per process.
+
+        Rebuilding is correct rather than defensive: connections owned by
+        a closed loop are unusable, and the injected transport is
+        preserved so a rebuilt client in a test still cannot reach the
+        network.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._client_loop is loop and not self._gamma.is_closed:
+            return
+        self._gamma = httpx.AsyncClient(
+            base_url=settings.gamma_api_url, transport=self._transport, timeout=30.0
+        )
+        self._clob = httpx.AsyncClient(
+            base_url=settings.clob_api_url, transport=self._transport, timeout=30.0
+        )
+        self._client_loop = loop
+
+    @property
+    def _gamma_client(self) -> httpx.AsyncClient:
+        """The Gamma client, rebound to the running loop if needed."""
+        self._rebind_clients_if_loop_changed()
+        return self._gamma
+
+    @property
+    def _clob_client(self) -> httpx.AsyncClient:
+        """The CLOB client, rebound to the running loop if needed."""
+        self._rebind_clients_if_loop_changed()
+        return self._clob
+
     async def aclose(self) -> None:
         """Close both underlying `httpx.AsyncClient` instances."""
-        await self._gamma_client.aclose()
-        await self._clob_client.aclose()
+        await self._gamma.aclose()
+        await self._clob.aclose()
 
     # -- Market metadata -----------------------------------------------
 

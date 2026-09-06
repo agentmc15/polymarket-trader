@@ -47,7 +47,6 @@ order-PLACING adapter behind `assert_live_allowed()`; this task places
 nothing, ever, and an engaged kill switch has no bearing on whether a
 review queue keeps filling.
 """
-import asyncio
 import logging
 from itertools import combinations
 from typing import Any
@@ -55,7 +54,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
-from app.database import async_session_factory
+from app.database import async_session_factory, run_async_task
 from app.models.event_link import EventLink
 from app.services.matching import persist_proposals, propose_links
 from app.tasks import celery_app
@@ -207,4 +206,4 @@ def propose_event_links() -> dict[str, Any]:
     Returns:
         dict[str, Any]: The pass summary.
     """
-    return asyncio.run(run_link_proposal())
+    return run_async_task(run_link_proposal())

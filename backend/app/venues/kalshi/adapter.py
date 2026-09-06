@@ -92,6 +92,7 @@ non-textual guarantee is the GET-only `_get` above, which no amount of
 grep evasion could fake, plus `tests/venues/test_kalshi_adapter.py::
 test_the_read_adapter_cannot_place_or_cancel_orders`.
 """
+import asyncio
 import logging
 import math
 from collections.abc import Mapping
@@ -255,16 +256,55 @@ class KalshiAdapter(BaseAdapter):
         """
         self.venue: VenueId = "kalshi"
         self._settings = settings_obj if settings_obj is not None else _default_settings
-        self._client = httpx.AsyncClient(
+        # Kept so the client can be REBUILT when the event loop changes;
+        # see `_rebind_client_if_loop_changed`. Tests inject a
+        # MockTransport here and it must survive a rebuild, or a rebuilt
+        # client would reach the network (GUARDRAILS.md §1.4).
+        self._transport = transport
+        self._client_loop: asyncio.AbstractEventLoop | None = None
+        self._http = httpx.AsyncClient(
             base_url=self._settings.kalshi_api_base_url,
             transport=transport,
             timeout=30.0,
         )
         self._private_key: rsa.RSAPrivateKey | None = None
 
+    def _rebind_client_if_loop_changed(self) -> None:
+        """Rebuild the client when the running event loop has changed.
+
+        In paper mode `make_paper_adapter` returns a PROCESS-WIDE
+        singleton on purpose, so this adapter outlives any one event
+        loop. Each Celery beat tick runs `asyncio.run(...)`, which closes
+        its loop on the way out, and an `httpx.AsyncClient` holds
+        connections bound to the loop that opened them.
+
+        Observed against the live API: tick 1 of a beat succeeds and
+        every tick after it dies in the transport with `RuntimeError:
+        Event loop is closed`, forever, because the dead pool is reused.
+        The suite cannot see it -- one loop per test process.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._client_loop is loop and not self._http.is_closed:
+            return
+        self._http = httpx.AsyncClient(
+            base_url=self._settings.kalshi_api_base_url,
+            transport=self._transport,
+            timeout=30.0,
+        )
+        self._client_loop = loop
+
+    @property
+    def _client(self) -> httpx.AsyncClient:
+        """The HTTP client, rebound to the running loop if needed."""
+        self._rebind_client_if_loop_changed()
+        return self._http
+
     async def aclose(self) -> None:
         """Close the underlying `httpx.AsyncClient`."""
-        await self._client.aclose()
+        await self._http.aclose()
 
     # -- Signing and transport -------------------------------------------
 

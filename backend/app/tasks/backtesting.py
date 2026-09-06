@@ -1,12 +1,11 @@
 """Celery tasks for backtesting."""
-import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
 
-from app.database import get_session_context
+from app.database import get_session_context, run_async_task
 from app.models.backtest_run import BacktestRun, BacktestRunStatus
 from app.services.backtesting import (
     BacktestConfig,
@@ -238,7 +237,7 @@ def run_backtest_task(
 
     # Run the async backtest logic
     try:
-        result = asyncio.run(
+        result = run_async_task(
             _run_backtest_async(
                 task=self,
                 backtest_id=backtest_id,
@@ -259,7 +258,7 @@ def run_backtest_task(
         logger.exception(f"Backtest task {backtest_id} failed with error: {e}")
 
         # Mark as failed in database
-        asyncio.run(_mark_backtest_failed(backtest_id, str(e)))
+        run_async_task(_mark_backtest_failed(backtest_id, str(e)))
 
         return {
             "status": "FAILED",
@@ -481,7 +480,7 @@ def run_sweep_task(
     slippage_model = SLIPPAGE_MODEL_MAP.get(slippage_model_str, SlippageModel.FIXED)
 
     try:
-        return asyncio.run(
+        return run_async_task(
             _run_sweep_async(
                 task=self,
                 parent_backtest_id=parent_backtest_id,
@@ -498,7 +497,7 @@ def run_sweep_task(
         )
     except Exception as e:
         logger.exception(f"Sweep task {parent_backtest_id} failed with error: {e}")
-        asyncio.run(_mark_backtest_failed(parent_backtest_id, str(e)))
+        run_async_task(_mark_backtest_failed(parent_backtest_id, str(e)))
         return {
             "status": "FAILED",
             "backtest_id": parent_backtest_id,
@@ -670,7 +669,7 @@ def cancel_backtest(backtest_id: int) -> dict[str, Any]:
 
             return {"status": "CANCELLED", "backtest_id": backtest_id}
 
-    return asyncio.run(_cancel())
+    return run_async_task(_cancel())
 
 
 @celery_app.task(name="app.tasks.backtesting.cleanup_old_backtests")
@@ -709,4 +708,4 @@ def cleanup_old_backtests(days: int = 30) -> dict[str, Any]:
 
             return {"deleted": deleted_count, "older_than_days": days}
 
-    return asyncio.run(_cleanup())
+    return run_async_task(_cleanup())

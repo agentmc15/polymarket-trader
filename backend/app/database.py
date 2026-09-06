@@ -1,6 +1,8 @@
 """Async SQLAlchemy database configuration."""
-from collections.abc import AsyncGenerator
+import asyncio
+from collections.abc import AsyncGenerator, Coroutine
 from contextlib import asynccontextmanager
+from typing import Any, TypeVar
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -28,6 +30,50 @@ async_session_factory = async_sessionmaker(
     autocommit=False,
     autoflush=False,
 )
+
+
+_T = TypeVar("_T")
+
+
+def run_async_task(coro: Coroutine[Any, Any, _T]) -> _T:
+    """Run `coro` in a fresh event loop, then dispose the engine pool.
+
+    EVERY Celery entry point must use this instead of a bare
+    `asyncio.run(...)`. `engine` above is a module-level singleton, and
+    its pool holds asyncpg connections bound to whatever loop first
+    opened them. `asyncio.run` closes its loop on the way out, so those
+    pooled connections survive into the next task invocation attached to
+    a loop that no longer exists.
+
+    In a worker process that means the FIRST tick of a beat succeeds and
+    every tick after it raises `RuntimeError: Event loop is closed` --
+    observed directly against a live Postgres: tick 1 OK, ticks 2 and 3
+    dead. It is not a venue problem and no amount of retrying helps,
+    because the pool never heals.
+
+    No test could catch this. `conftest.py` binds one SQLite
+    `StaticPool` connection inside a single event loop, so the second
+    loop that breaks production never exists in the suite.
+
+    Disposing in a `finally` returns the process to a clean slate: the
+    next call builds a new pool against its own loop. The cost is one
+    connection handshake per beat tick, which is negligible next to a
+    pass that fetches hundreds of books.
+
+    Args:
+        coro: The coroutine to run to completion.
+
+    Returns:
+        The coroutine's result.
+    """
+
+    async def _run() -> _T:
+        try:
+            return await coro
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_run())
 
 
 async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
