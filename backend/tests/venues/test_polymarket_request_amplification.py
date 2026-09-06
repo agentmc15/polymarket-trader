@@ -309,12 +309,12 @@ async def test_the_memo_is_bounded_and_does_not_grow_without_limit(
     exercised with a deliberately tiny value rather than by fetching
     4096 markets.
 
-    The claim is BOUNDED, not exactly capped. Eviction runs inside
-    `_store`, so between two evictions each table can gain one entry per
-    store, and the lock the evicting caller is currently holding always
-    survives the sweep. Both tables therefore settle within a small
-    constant of `cap` -- and, which is the actual point, neither grows
-    with the 20 distinct keys used here.
+    The claim is BOUNDED, not exactly capped. Value eviction runs inside
+    `_store` and lock eviction inside `_lock_for`, so between two sweeps
+    each table can gain one entry per call, and the lock the sweeping
+    caller is currently holding always survives. Both tables therefore
+    settle within a small constant of `cap` -- and, which is the actual
+    point, neither grows with the 20 distinct keys used here.
     """
     cap = 2
     monkeypatch.setattr(adapter_module, "_MEMO_MAX_ENTRIES", cap)
@@ -331,15 +331,130 @@ async def test_the_memo_is_bounded_and_does_not_grow_without_limit(
 
 
 @pytest.mark.asyncio
-async def test_get_market_itself_is_not_memoized() -> None:
-    """`get_market()` is a public read and keeps its freshness contract.
+async def test_a_failing_factory_does_not_grow_the_lock_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T43 F3 -- the cap has to bound the table the FAILURES fill.
 
-    The memo serves `get_book`'s token-id resolution only. The matcher
-    and the links API call `get_market()` to decide whether two markets
-    describe the same event, and handing them a minute-old answer is a
-    behaviour change nobody asked for -- the request amplification was
-    never their fault. Two `get_market()` calls therefore still issue
-    two Gamma market lookups.
+    `_MEMO_MAX_ENTRIES`' own comment says it exists so a paper-mode memo
+    (process-wide singleton, process-lifetime tables) cannot accumulate
+    an entry per market the process ever saw. Until T43 it bounded
+    `_values` only: the lock sweep sat BELOW `_store`'s under-cap early
+    return, so it ran only when a SUCCESSFUL store had pushed the value
+    table over the cap. A factory that always raises never stores
+    anything, so `_values` never grew, so the sweep never ran -- while
+    `_lock_for` went on minting one `asyncio.Lock` per key on every miss.
+    Measured against the shipped cap of 4096, 10,000 failing lookups left
+    `_values` at 0 and `_locks` at 10,000.
+
+    The failing factory is the whole point and is not contrived: `get`
+    documents a raise as UNCACHED and retried by the next caller, and a
+    venue outage makes every lookup in a pass one of these.
+
+    `_values` is asserted at 0 as well, because it is what makes the
+    assertion above non-vacuous: it proves the keys really did miss and
+    really did reach `_lock_for`, rather than the loop having been
+    short-circuited somewhere earlier.
+    """
+    cap = 4
+    monkeypatch.setattr(adapter_module, "_MEMO_MAX_ENTRIES", cap)
+    memo: adapter_module._AsyncTtlMemo[int] = adapter_module._AsyncTtlMemo(60.0)
+
+    async def always_fails() -> int:
+        raise RuntimeError("venue is down")
+
+    for i in range(200):
+        with pytest.raises(RuntimeError):
+            await memo.get(f"key-{i}", always_fails)
+
+    assert len(memo._values) == 0, "a raising factory must cache nothing"
+    assert len(memo._locks) <= cap + 1, (
+        f"200 failing lookups left {len(memo._locks)} locks behind a cap of {cap}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_both_tables_are_mutated_only_under_the_thread_guard() -> None:
+    """T43 F4 -- the check-then-mutate is serialized, and stays serialized.
+
+    `_lock_for` reads `_lock_loop`, then reads `_locks` -- on state
+    reachable from a PROCESS-WIDE singleton, with nothing between the two
+    halves. Two OS threads each inside their own `asyncio.run` can
+    interleave there so that one is handed a lock the other created for
+    a different loop (`RuntimeError: ... is bound to a different event
+    loop`), or tear `_store`'s comprehensions apart mid-rebuild
+    (`RuntimeError: dictionary changed size during iteration`).
+
+    THE RACE ITSELF IS NOT REPRODUCED HERE, deliberately. It needs
+    `sys.setswitchinterval(1e-7)` to surface -- at the default 5 ms,
+    4 threads x 3000 rounds produce zero errors -- and at that interval
+    the workload takes minutes, which is not a unit test, it is a flaky
+    one. What IS deterministic, fast and exactly as load-bearing is the
+    property the fix rests on: every MUTATION of the two tables happens
+    inside `_guard`. Recording the guard's acquisitions around one `get`
+    pins both call sites at once -- `_lock_for` before the factory runs,
+    `_store` after -- so a later edit cannot quietly drop one.
+
+    Why serialize rather than document: the shipped Celery prefork pool
+    gives one `asyncio.run` per PROCESS, so there is no second loop over
+    this object today. It appears the day anyone runs `--pool=threads`
+    or `gevent`, or drives the paper singleton from a worker thread --
+    a one-word config change nobody would connect to this file. The
+    critical sections are a few dict operations with no `await` in them.
+    """
+    memo: adapter_module._AsyncTtlMemo[int] = adapter_module._AsyncTtlMemo(60.0)
+    events: list[str] = []
+    real_guard = memo._guard
+
+    class RecordingGuard:
+        """Delegates to the real lock, noting when it is entered."""
+
+        def __enter__(self) -> bool:
+            events.append("guard-enter")
+            return real_guard.__enter__()
+
+        def __exit__(self, *exc: object) -> None:
+            events.append("guard-exit")
+            real_guard.release()
+
+    memo._guard = RecordingGuard()  # type: ignore[assignment]
+
+    async def make() -> int:
+        events.append("factory")
+        return 7
+
+    assert await memo.get("m", make) == 7
+
+    # `_lock_for` guarded (before the factory), `_store` guarded (after).
+    assert events == [
+        "guard-enter",
+        "guard-exit",
+        "factory",
+        "guard-enter",
+        "guard-exit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_market_refetches_its_market_legs_and_shares_the_events_memo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exactly which of `get_market()`'s three legs are memoized (T43).
+
+    `_book_market_memo` serves `get_book`'s token-id resolution only, and
+    `get_market()` never reads it: the matcher and the links API call
+    `get_market()` to decide whether two markets describe the same event,
+    and handing them a minute-old answer is a behaviour change nobody
+    asked for -- the request amplification was never their fault. Both
+    per-market legs are therefore re-issued on every call.
+
+    But the THIRD leg, `GET gamma/events`, goes through
+    `_event_id_by_market_id` and so through the shared `_events_memo` --
+    so `get_market()` is PARTIALLY memoized, and the comment on
+    `_book_market_memo` used to claim it "stays UNMEMOIZED". Asserting
+    `/events == 1` alongside the two `== 2`s is what pins the corrected
+    claim: one field of the returned `VenueMarket` (`event_id`) may be up
+    to `ttl_s` stale, and no other.
     """
     transport = CountingTransport()
     adapter = PolymarketAdapter(transport=transport)
@@ -349,4 +464,18 @@ async def test_get_market_itself_is_not_memoized() -> None:
 
     assert transport.counts["gamma-api.polymarket.com/markets"] == 2
     assert transport.counts[f"clob.polymarket.com/markets/{MARKET_A001}"] == 2
+    assert transport.counts["gamma-api.polymarket.com/events"] == 1, (
+        "the events leg is served by the shared memo, not re-fetched"
+    )
+
+    # And with the memo disabled, the same two calls cost two listings --
+    # which is what makes the assertion above a statement about the MEMO
+    # rather than about `/events` happening to be called once.
+    fresh_transport = CountingTransport()
+    fresh = PolymarketAdapter(transport=fresh_transport, market_cache_ttl_s=0.0)
+    await fresh.get_market(MARKET_A001)
+    await fresh.get_market(MARKET_A001)
+    assert fresh_transport.counts["gamma-api.polymarket.com/events"] == 2
+
     await adapter.aclose()
+    await fresh.aclose()

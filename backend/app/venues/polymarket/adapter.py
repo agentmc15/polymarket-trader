@@ -93,6 +93,7 @@ live response before trusting them for sizing.
 """
 import asyncio
 import json
+import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from datetime import UTC, datetime
@@ -183,6 +184,38 @@ class _AsyncTtlMemo(Generic[_T]):
     are NEVER memoized: `GET /book` is issued on every single
     `get_book` call, which is the whole point of the pass.
 
+    BOTH TABLES ARE CAPPED, AND THE LOCK TABLE IS CAPPED WHERE LOCKS ARE
+    BORN (T43 F3). `_MEMO_MAX_ENTRIES` exists because a paper-mode memo
+    is process-lifetime, and until T43 it bounded `_values` only: the
+    lock sweep lived below `_store`'s under-cap early return, so it ran
+    only when a SUCCESSFUL store had pushed the value table over the cap.
+    A factory that always RAISES never stores anything, so `_values`
+    never grew, so the sweep never ran — while `_lock_for` kept minting a
+    lock per key. 10,000 failing lookups left `_values` empty and
+    `_locks` at 10,000. The sweep is therefore in `_lock_for` now, on the
+    only path that can grow that table, and `_store` bounds values only.
+
+    THREAD SAFETY (T43 F4). Both tables are mutated under `_guard`, a
+    plain `threading.Lock`. `_lock_for` is a check-then-mutate on state
+    reachable from a PROCESS-WIDE singleton, so two OS threads each
+    inside their own `asyncio.run` could interleave between the loop
+    check and the `_locks.get` and hand a waiter a lock another loop had
+    already contended (`RuntimeError: ... is bound to a different event
+    loop`), or tear `_store`'s comprehensions apart mid-rebuild
+    (`RuntimeError: dictionary changed size during iteration`). Both
+    reproduce under `sys.setswitchinterval(1e-7)`, neither at the default
+    5 ms — and the shipped Celery prefork pool gives one `asyncio.run`
+    per PROCESS, so today there is no second loop over this object. It
+    goes live the day anyone runs `--pool=threads` or `gevent`, or drives
+    the paper singleton from a worker thread, which is a one-word config
+    change nobody would connect to this file. The critical sections are a
+    handful of dict operations with no `await` in them, so serializing
+    them costs a lock acquisition against work whose next step is an HTTP
+    request; documenting the hazard instead would have been the more
+    expensive option. `_cached` stays outside the guard deliberately: it
+    only reads, and both a `dict.get` and the rebinding it may race are
+    individually atomic under the GIL, so it sees either table whole.
+
     Attributes:
         ttl_s: How long a cached value is served for. `<= 0` disables
             the memo entirely — every call goes to `factory`.
@@ -194,6 +227,10 @@ class _AsyncTtlMemo(Generic[_T]):
         self._values: dict[str, tuple[float, _T]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._lock_loop: asyncio.AbstractEventLoop | None = None
+        #: Serializes every MUTATION of the two tables above. See the
+        #: class docstring's THREAD SAFETY note for why a process-wide
+        #: singleton needs one and why it is cheap here.
+        self._guard = threading.Lock()
 
     def _cached(self, key: str) -> tuple[_T] | None:
         """Return `(value,)` if `key` is cached and unexpired, else `None`.
@@ -233,37 +270,57 @@ class _AsyncTtlMemo(Generic[_T]):
         two-loops-both-contended shape. A loop change therefore discards
         the whole lock table. Cached VALUES are plain data and survive
         it.
+
+        THIS IS ALSO WHERE THE LOCK TABLE IS CAPPED (T43 F3). Minting a
+        lock is the only thing that grows it, and it happens on every
+        MISS — including the misses of a factory that raises, which store
+        nothing and so used to slip past a sweep that only ran when the
+        value table went over cap. Sweeping here bounds the table on the
+        path that fills it. Only UNHELD locks are dropped, and dropping
+        one is safe: the worst case is that a newcomer builds a fresh one
+        and performs one redundant fetch. There is no window in which a
+        caller loses the lock it was just handed — `get` acquires it with
+        no `await` in between — so single-flight is unaffected.
+
+        The whole body runs under `_guard`; see the class docstring.
         """
         loop = asyncio.get_running_loop()
-        if self._lock_loop is not loop:
-            self._lock_loop = loop
-            self._locks = {}
-        lock = self._locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[key] = lock
-        return lock
+        with self._guard:
+            if self._lock_loop is not loop:
+                self._lock_loop = loop
+                self._locks = {}
+            lock = self._locks.get(key)
+            if lock is None:
+                if len(self._locks) >= _MEMO_MAX_ENTRIES:
+                    self._locks = {
+                        lock_key: held
+                        for lock_key, held in self._locks.items()
+                        if held.locked()
+                    }
+                lock = asyncio.Lock()
+                self._locks[key] = lock
+            return lock
 
     def _store(self, key: str, value: _T) -> None:
-        """Cache `value` under `key`, evicting expired entries when over cap."""
-        self._values[key] = (time.monotonic(), value)
-        if len(self._values) <= _MEMO_MAX_ENTRIES:
-            return
-        now = time.monotonic()
-        self._values = {
-            k: entry
-            for k, entry in self._values.items()
-            if now - entry[0] < self.ttl_s
-        }
-        if len(self._values) > _MEMO_MAX_ENTRIES:
-            self._values.clear()
-        # An unheld lock is safe to drop: the worst case is that a
-        # newcomer builds a fresh one and performs one redundant fetch.
-        self._locks = {
-            lock_key: lock
-            for lock_key, lock in self._locks.items()
-            if lock.locked()
-        }
+        """Cache `value` under `key`, evicting expired entries when over cap.
+
+        Values only. The lock table is bounded in `_lock_for`, where
+        locks are created (T43 F3) — a sweep here could not see the keys
+        a FAILING factory leaves behind, because a failure never reaches
+        this method at all. Runs under `_guard`; see the class docstring.
+        """
+        with self._guard:
+            self._values[key] = (time.monotonic(), value)
+            if len(self._values) <= _MEMO_MAX_ENTRIES:
+                return
+            now = time.monotonic()
+            self._values = {
+                k: entry
+                for k, entry in self._values.items()
+                if now - entry[0] < self.ttl_s
+            }
+            if len(self._values) > _MEMO_MAX_ENTRIES:
+                self._values.clear()
 
     async def get(
         self, key: str, factory: Callable[[], Coroutine[Any, Any, _T]]
@@ -344,11 +401,25 @@ class PolymarketAdapter(BaseAdapter):
         #: became 1).
         self._events_memo: _AsyncTtlMemo[dict[str, str]] = _AsyncTtlMemo(ttl_s)
         #: Keyed by `market_id`. Serves `get_book`'s outcome -> token_id
-        #: resolution ONLY, so a market's two outcomes cost one lookup
-        #: between them instead of one each. `get_market()` itself stays
-        #: UNMEMOIZED: it is a public read whose callers (the matcher,
-        #: the links API) are entitled to a fresh answer, and nothing
-        #: about F6 is their fault.
+        #: resolution ONLY: a market's two outcomes cost one lookup
+        #: between them instead of one each, and `get_market()` never
+        #: reads this memo, so its two per-market legs (`GET gamma/
+        #: markets?condition_ids=...` and `GET clob/markets/{id}`) are
+        #: re-issued on every call. Its callers — the matcher, the links
+        #: API — are entitled to a fresh answer and nothing about F6 is
+        #: their fault.
+        #:
+        #: `get_market()` IS PARTIALLY MEMOIZED, and an earlier version
+        #: of this comment claimed otherwise (T43). Its third leg, `GET
+        #: gamma/events`, goes through `_event_id_by_market_id` and so
+        #: through the SHARED `_events_memo` above — measured, the first
+        #: call issues `/markets`, `/events` and `/markets/{id}` and the
+        #: second issues only `/markets` and `/markets/{id}`. Exactly one
+        #: field is affected, `VenueMarket.event_id`, which may be up to
+        #: `ttl_s` stale; event grouping turns over on a scale of hours
+        #: and nothing in `app/` reads that field, so the staleness is
+        #: harmless — but "stays UNMEMOIZED" was a guarantee this code
+        #: does not make.
         self._book_market_memo: _AsyncTtlMemo[VenueMarket] = _AsyncTtlMemo(ttl_s)
 
     async def aclose(self) -> None:

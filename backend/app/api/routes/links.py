@@ -51,6 +51,27 @@ is always allowed and always fail-safe, because a rejected link is one
 `cross_venue_arbitrage` may not touch. The asymmetry is the point —
 guard the transition that CLEARS capital to move, not the one that
 stops it.
+
+NOTES ARE APPEND-ONLY (T43). That asymmetry is about the LIFECYCLE
+column and says nothing about `notes`, and until T43 `reject_link`
+assigned `row.notes = request.notes` unconditionally — so a second
+rejection, including a bare one carrying no note at all, replaced the
+previous reviewer's reason with `""` and returned `200`. `notes` is the
+one column here whose contents no re-run can rediscover, so rejection
+now MERGES rather than overwrites (`_appended_notes`): existing text is
+never shortened, a new note is appended under a header naming its author
+and the time, and a rejection carrying no note leaves the text exactly
+as it was. Rejection itself stays unconditionally permitted — nothing
+here turns the fail-safe direction into a `409`.
+
+A DECISION IS TERMINAL ON THIS API, and `approve_link`'s `409` detail
+now says so. No route returns a link to `"proposed"`: `approve_link`
+requires `status = 'proposed' AND reviewed_at IS NULL`, `reject_link`
+only ever writes `"rejected"`, and `persist_proposals` skips decided
+rows — so a link rejected against a mistyped `link_id` stays rejected
+until someone edits the row in the database. The detail this replaced
+told the operator to "re-read the link before deciding it again", naming
+an action that does not exist.
 """
 import logging
 from datetime import datetime
@@ -226,6 +247,11 @@ class RejectRequest(BaseModel):
     `notes` is where the reason lives, and it is the most valuable text
     in this table: "Kalshi settles on the AP call, Polymarket on state
     certification" is knowledge no score can rediscover.
+
+    It is therefore APPENDED to whatever the row already carries rather
+    than replacing it (`_appended_notes`), and the default `""` means
+    "I am withdrawing this link and have nothing to add", not "blank the
+    previous reviewer's reason".
     """
 
     #: T33, same rule and same reason as `ApproveRequest` above: a
@@ -235,6 +261,53 @@ class RejectRequest(BaseModel):
 
     reviewed_by: str = Field(min_length=1, max_length=100)
     notes: str = Field(default="", max_length=4000)
+
+
+def _appended_notes(
+    existing: str | None, incoming: str, reviewed_by: str, decided_at: datetime
+) -> str | None:
+    """Merge a rejecting reviewer's note into whatever the row carries.
+
+    WHY APPEND RATHER THAN REFUSE-BLANK-OVER-NON-BLANK (T43 F2). Both
+    stop the reproduced defect — a bare `POST /links/{id}/reject`
+    blanking the previous reviewer's reason with a `200` — but refusing
+    only the EMPTY overwrite closes half of it: a rejection carrying any
+    note at all, even a one-word one, would still delete a paragraph
+    somebody wrote after reading two rules texts, silently and with the
+    same `200`. That is the same loss for the same reason. Appending
+    closes both, and it costs nothing structurally: `EventLink.notes` is
+    `Text`, so an accumulated history has no column bound (the 4000-char
+    limit on `RejectRequest.notes` is per REQUEST), and rejection stays
+    unconditionally permitted, which is the property `reject_link`'s
+    docstring is built on. Nothing here can make a rejection fail.
+
+    Each appended block carries a header naming its author and the time,
+    because `reviewed_by`/`reviewed_at` hold only the LATEST decision —
+    once a third rejection lands, that header is the only surviving
+    record of who wrote the second note. The first note on a row is
+    stored verbatim instead, so the ordinary one-reviewer row reads
+    exactly as it always has and matches what `approve_link` writes.
+
+    Args:
+        existing: `EventLink.notes` as persisted, possibly `None`.
+        incoming: The note on this request, possibly `""`.
+        reviewed_by: Who is rejecting now — the appended block's author.
+        decided_at: This decision's aware-UTC timestamp, the same value
+            written to `reviewed_at`, so the two agree exactly.
+
+    Returns:
+        str | None: The merged note. Never shorter than `existing`, and
+            `existing` unchanged whenever `incoming` is blank.
+    """
+    previous = (existing or "").strip()
+    addition = incoming.strip()
+    if not previous:
+        # Nothing to lose: store what the reviewer typed, byte for byte,
+        # including the `""` a bare rejection sends.
+        return incoming
+    if not addition:
+        return existing
+    return f"{previous}\n\n[{reviewed_by} @ {decided_at.isoformat()}] {addition}"
 
 
 def _link_out(row: EventLink) -> LinkOut:
@@ -647,12 +720,30 @@ async def approve_link(
         decided = await session.get(EventLink, link_id, populate_existing=True)
         if decided is None:
             raise HTTPException(status_code=404, detail=f"link {link_id} not found")
+        # Symmetric with `persist_proposals`' `link_rescore_declined_
+        # decided_row` (T43). A machine losing this race already left a
+        # server-side trace; a contested HUMAN decision — the rarer and
+        # more interesting event of the two — left none at all, so a
+        # reviewer reporting "my approval did not stick" was
+        # unreconstructable from the logs.
+        logger.warning(
+            "link_review",
+            extra={
+                "event": "link_approval_declined_decided_row",
+                "link_id": link_id,
+                "attempted_by": request.reviewed_by,
+                "decided_status": decided.status,
+                "decided_by": decided.reviewed_by,
+            },
+        )
         raise HTTPException(
             status_code=409,
             detail=(
                 f"link {link_id} is already {decided.status!r}, decided by "
-                f"{decided.reviewed_by!r}; nothing was changed. Re-read the link "
-                "before deciding it again"
+                f"{decided.reviewed_by!r}; nothing was changed. A decision is "
+                "terminal on this API — no route returns a link to 'proposed' — "
+                "so a link decided in error has to be corrected in the database "
+                "directly"
             ),
         )
 
@@ -679,9 +770,24 @@ async def reject_link(
     approval before they could withdraw it, which is exactly backwards
     for the transition that STOPS capital moving.
 
+    That argument covers the LIFECYCLE column and nothing else, which is
+    why `notes` is now merged rather than assigned (T43 F2). "Durable
+    output" was not true of a column any later rejection overwrote,
+    including a bare one with no note in it; `_appended_notes` makes it
+    true without adding a precondition, so rejection is still always
+    permitted and still cannot fail on account of what a previous
+    reviewer wrote.
+
+    REJECTION IS TERMINAL. Nothing in this API moves a decided link back
+    to `"proposed"`, so a rejection filed against a mistyped `link_id`
+    bans that pair until the row is edited in the database. See this
+    module's docstring; `approve_link`'s conflict detail says the same
+    thing to whoever hits it.
+
     Args:
         link_id: Primary key of the `event_links` row.
-        request: Reviewer and notes.
+        request: Reviewer and notes. `notes` is appended to the row's
+            existing text, never substituted for it.
         session: Database session.
 
     Returns:
@@ -694,10 +800,13 @@ async def reject_link(
     if row is None:
         raise HTTPException(status_code=404, detail=f"link {link_id} not found")
 
+    decided_at = utcnow()
     row.status = "rejected"
     row.reviewed_by = request.reviewed_by
-    row.reviewed_at = utcnow()
-    row.notes = request.notes
+    row.reviewed_at = decided_at
+    row.notes = _appended_notes(
+        row.notes, request.notes, request.reviewed_by, decided_at
+    )
     await session.commit()
     await session.refresh(row)
     return _link_out(row)
