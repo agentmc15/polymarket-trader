@@ -2,80 +2,98 @@
 
 This module provides a collection of trading strategies for backtesting
 and live trading on Polymarket prediction markets.
+
+`cross_platform_arbitrage` was removed in T10 (PLAN.md §2: no new
+strategy files beyond `cross_venue_arbitrage.py`) — its "sell on the
+higher venue" logic assumed a naked short neither venue supports. T18
+restored the 9th entry as `cross_venue_arbitrage`, whose real,
+`Intent(kind="cross_venue")`-based form buys YES on one venue and NO on
+the other and holds both to resolution (PLAN.md D8).
 """
 from typing import Any
 
 from app.strategies.base import BaseStrategy, MarketSnapshot, Signal, SignalType
+from app.strategies.binary_complement_arbitrage import (
+    DEFAULT_CONFIG as BINARY_ARB_CONFIG,
+)
 
 # Import all strategy implementations
 from app.strategies.binary_complement_arbitrage import (
     BinaryComplementArbitrageStrategy,
-    DEFAULT_CONFIG as BINARY_ARB_CONFIG,
 )
-from app.strategies.multi_outcome_bundle_arbitrage import (
-    MultiOutcomeBundleArbitrageStrategy,
-    DEFAULT_CONFIG as MULTI_OUTCOME_CONFIG,
+from app.strategies.catalyst_momentum import (
+    DEFAULT_CONFIG as CATALYST_CONFIG,
 )
 from app.strategies.catalyst_momentum import (
     CatalystMomentumStrategy,
-    DEFAULT_CONFIG as CATALYST_CONFIG,
 )
-from app.strategies.settlement_edge import (
-    SettlementEdgeStrategy,
-    DEFAULT_CONFIG as SETTLEMENT_CONFIG,
-)
-from app.strategies.term_structure_spreads import (
-    TermStructureSpreadsStrategy,
-    DEFAULT_CONFIG as TERM_STRUCTURE_CONFIG,
+from app.strategies.correlation_hedging import (
+    DEFAULT_CONFIG as CORRELATION_CONFIG,
 )
 from app.strategies.correlation_hedging import (
     CorrelationHedgingStrategy,
-    DEFAULT_CONFIG as CORRELATION_CONFIG,
 )
-from app.strategies.cross_platform_arbitrage import (
-    CrossPlatformArbitrageStrategy,
-    DEFAULT_CONFIG as CROSS_PLATFORM_CONFIG,
+from app.strategies.cross_venue_arbitrage import (
+    DEFAULT_CONFIG as CROSS_VENUE_CONFIG,
+)
+from app.strategies.cross_venue_arbitrage import (
+    CrossVenueArbitrageStrategy,
+)
+from app.strategies.favorite_compounder import (
+    DEFAULT_CONFIG as FAVORITE_CONFIG,
 )
 from app.strategies.favorite_compounder import (
     FavoriteCompounderStrategy,
-    DEFAULT_CONFIG as FAVORITE_CONFIG,
+)
+from app.strategies.multi_outcome_bundle_arbitrage import (
+    DEFAULT_CONFIG as MULTI_OUTCOME_CONFIG,
+)
+from app.strategies.multi_outcome_bundle_arbitrage import (
+    MultiOutcomeBundleArbitrageStrategy,
+)
+from app.strategies.no_bias_exploit import (
+    DEFAULT_CONFIG as NO_BIAS_CONFIG,
 )
 from app.strategies.no_bias_exploit import (
     NoBiasExploitStrategy,
-    DEFAULT_CONFIG as NO_BIAS_CONFIG,
 )
-from app.strategies.whale_copy_trading import (
-    WhaleCopyTradingStrategy,
-    DEFAULT_CONFIG as WHALE_COPY_CONFIG,
+from app.strategies.settlement_edge import (
+    DEFAULT_CONFIG as SETTLEMENT_CONFIG,
 )
-
+from app.strategies.settlement_edge import (
+    SettlementEdgeStrategy,
+)
+from app.strategies.term_structure_spreads import (
+    DEFAULT_CONFIG as TERM_STRUCTURE_CONFIG,
+)
+from app.strategies.term_structure_spreads import (
+    TermStructureSpreadsStrategy,
+)
 
 # Strategy registry mapping names to classes
 STRATEGIES: dict[str, type[BaseStrategy]] = {
     "binary_complement_arbitrage": BinaryComplementArbitrageStrategy,
     "multi_outcome_bundle_arbitrage": MultiOutcomeBundleArbitrageStrategy,
+    "cross_venue_arbitrage": CrossVenueArbitrageStrategy,
     "catalyst_momentum": CatalystMomentumStrategy,
     "settlement_edge": SettlementEdgeStrategy,
     "term_structure_spreads": TermStructureSpreadsStrategy,
     "correlation_hedging": CorrelationHedgingStrategy,
-    "cross_platform_arbitrage": CrossPlatformArbitrageStrategy,
     "favorite_compounder": FavoriteCompounderStrategy,
     "no_bias_exploit": NoBiasExploitStrategy,
-    "whale_copy_trading": WhaleCopyTradingStrategy,
 }
 
 # Default configurations for each strategy
 DEFAULT_CONFIGS: dict[str, dict[str, Any]] = {
     "binary_complement_arbitrage": BINARY_ARB_CONFIG,
     "multi_outcome_bundle_arbitrage": MULTI_OUTCOME_CONFIG,
+    "cross_venue_arbitrage": CROSS_VENUE_CONFIG,
     "catalyst_momentum": CATALYST_CONFIG,
     "settlement_edge": SETTLEMENT_CONFIG,
     "term_structure_spreads": TERM_STRUCTURE_CONFIG,
     "correlation_hedging": CORRELATION_CONFIG,
-    "cross_platform_arbitrage": CROSS_PLATFORM_CONFIG,
     "favorite_compounder": FAVORITE_CONFIG,
     "no_bias_exploit": NO_BIAS_CONFIG,
-    "whale_copy_trading": WHALE_COPY_CONFIG,
 }
 
 # Strategy categories for organization
@@ -83,7 +101,7 @@ STRATEGY_CATEGORIES: dict[str, list[str]] = {
     "arbitrage": [
         "binary_complement_arbitrage",
         "multi_outcome_bundle_arbitrage",
-        "cross_platform_arbitrage",
+        "cross_venue_arbitrage",
     ],
     "momentum": [
         "catalyst_momentum",
@@ -98,9 +116,6 @@ STRATEGY_CATEGORIES: dict[str, list[str]] = {
     ],
     "systematic": [
         "favorite_compounder",
-    ],
-    "copy_trading": [
-        "whale_copy_trading",
     ],
 }
 
@@ -204,14 +219,13 @@ __all__ = [
     # Strategy classes
     "BinaryComplementArbitrageStrategy",
     "MultiOutcomeBundleArbitrageStrategy",
+    "CrossVenueArbitrageStrategy",
     "CatalystMomentumStrategy",
     "SettlementEdgeStrategy",
     "TermStructureSpreadsStrategy",
     "CorrelationHedgingStrategy",
-    "CrossPlatformArbitrageStrategy",
     "FavoriteCompounderStrategy",
     "NoBiasExploitStrategy",
-    "WhaleCopyTradingStrategy",
     # Registry and factory
     "STRATEGIES",
     "DEFAULT_CONFIGS",
