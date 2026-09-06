@@ -10,8 +10,8 @@ left" below, and none of it is blocking.
 
 ## State in one paragraph
 
-The `market-edge` kit is fully executed: **24/24 planned tasks, plus 24 unplanned remediation and
-hardening tasks** (T21b–T21f, T25–T45) driven by five phase reviews, three red-team passes, a
+The `market-edge` kit is fully executed: **24/24 planned tasks, plus 26 unplanned remediation and
+hardening tasks** (T21b–T21f, T25–T47) driven by five phase reviews, three red-team passes, a
 verification pass, and a deployment audit. Migrations run **001 → 007**, the frontend typechecks and
 lints clean, and everything is committed and pushed to `main`. Nothing is in flight and nothing is
 blocked. Run `cd backend && python3 -m pytest -q` for the current test count — a number written here
