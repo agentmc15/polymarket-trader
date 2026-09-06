@@ -6423,3 +6423,50 @@ by the system for memory pressure. F4 had ALREADY been reproduced twice independ
 finding is confirmed rather than leaving further runs queued; a scheduler-hostile probe is a cost
 with no remaining evidentiary value after the second reproduction. No stray processes remain
 (`pgrep` clean) and `git status --porcelain` is empty.
+
+---
+
+### Ledger repair — T38–T43 backfilled into TASKS.md, T40/T41 outcomes reconstructed
+
+Auditing the ledger against `TASKS.md` before dispatching Phase 6 turned up the discipline failure
+HANDOFF.md warns about, now for the third time in this run, and in two distinct severities:
+
+- **T38, T39, T42, T43** carried correct `outcome:` lines but had no `### T` entry in `TASKS.md`.
+  `bin/routing_scorecard.py` drops outcomes whose task id it cannot find, so all four were silently
+  excluded. The 34/40 figure quoted in HANDOFF.md and in the README was computed on a denominator
+  four tasks short.
+- **T40 and T41** had neither a `TASKS.md` entry nor any ledger line at all — their implementer
+  reports are in this file (above, under their own headings) but nothing machine-readable was ever
+  appended. They were invisible to the scorecard in both directions.
+
+Both are now fixed: `TASKS.md` gained a `## Phase 5R` section covering T38–T43, and T44/T45 were
+written into a `## Phase 6` section **before** their dispatch returned, which is the actual remedy —
+the entry has to exist at dispatch time, not at close.
+
+The T40/T41 lines below are **reconstructed, not remembered**, and the evidence is worth stating
+because a fabricated ledger line is worse than a missing one. Task-to-agent mapping came from the
+session's own transcripts, matched on a phrase only that implementer could have written: the T40
+agent is the one that recorded the Compose version `v2.35.1-desktop.1` while editing
+`docker-compose.yml`, and each transcript's opening brief names its own disjoint file set
+(`docker-compose.yml`/`.env.example`/`Dockerfile` for T40; `app/tasks/*`, `api/routes/markets.py`,
+`README.md` for T41). The dispatch model came from the `"model"` field on each transcript's own
+assistant turns — both `claude-sonnet-5` — rather than from memory of what I pinned. `attempts=1`
+follows from there being exactly one transcript carrying each brief. `review=none` is accurate
+rather than modest: I ran each verify command myself, but neither task got a separate verifier or
+reviewer dispatch. `run=` is the single invocation id already stamped on all 46 other lines here.
+
+No `agent:` line is written for either task from a guessed id; the two ids below are the ones the
+transcript files are named for, which is evidence, not inference.
+
+agent: T40 id=aa3455b7da729f0de role=implementer model=sonnet
+outcome: T40 model=sonnet attempts=1 result=pass review=none run=2026-09-05-3bd5
+agent: T41 id=afd906fc8ca68b44f role=implementer model=sonnet
+outcome: T41 model=sonnet attempts=1 result=pass review=none run=2026-09-05-3bd5
+
+**Why this keeps happening, and the structural fix.** Every instance shares a shape: a task
+dispatched *reactively*, out of a review or audit finding, rather than read off the plan. Planned
+tasks were written into `TASKS.md` by the architect before execution began, so they could not be
+missed; remediation tasks are invented mid-run by the orchestrator, and the ledger entry is a second
+step that nothing forces. The fix is not vigilance — vigilance already failed three times — it is
+ordering: write the `TASKS.md` entry as part of composing the brief, in the same edit, so a task
+that was never written down is also a task that was never dispatched.

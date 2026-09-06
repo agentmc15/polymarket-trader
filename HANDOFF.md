@@ -16,10 +16,16 @@ deployment audit. The backend suite went **654 → 841 passing**, migrations **0
 frontend typechecks and lints clean, and everything is committed and pushed to `main`. Nothing is
 in flight and nothing is blocked.
 
-The routing scorecard reads **34/40 first-try, 80% cheap-model review survival** (run it yourself —
-see "Where things live"). Note that number counts only tasks present in `TASKS.md`; outcomes for
-tasks dispatched without a `TASKS.md` entry are silently dropped, which happened twice in this run.
-**Write the entry at dispatch time, not at close.**
+The routing scorecard reads **40/46 first-try, 81% cheap-model review survival** (run it yourself —
+see "Where things live").
+
+That figure was **34/40, 80%** until the ledger was audited against `TASKS.md`, and the correction
+is the more useful fact. The scorecard drops outcomes whose task id is not in `TASKS.md`, and six
+tasks had been dispatched without an entry: T38/T39/T42/T43 had correct `outcome:` lines that were
+silently excluded, and T40/T41 had no ledger line at all. All six were first-try passes, so the run
+had been **under**-reporting itself. **Write the `TASKS.md` entry as part of composing the brief, in
+the same edit** — this lapse happened three times here, always on tasks invented mid-run from a
+review finding rather than read off the plan, and vigilance is demonstrably not the fix.
 
 ---
 
@@ -160,11 +166,32 @@ cd backend && python3 -m app.scripts.sweep --synthetic --levels 500,5000,50000 -
 
 Measured, not asserted. Full per-role table in NOTES.md under "Routing scorecard".
 
-- **`red-team` was by far the highest-value role**: 5 dispatches, 32 findings, 28 confirmed, 88%
-  precision, **425% marginal catch rate** — including both severe money bugs, found on code that had
-  *already* passed its verifier and a phase reviewer. The **plain `verifier` was the weakest**: 67%
-  precision, 50% marginal. Next kit: keep red-team and reviewer, spend the verifier's budget on a
-  second red-team pass.
+- **Role evidence, recomputed from the full `agent:`/`reviewer:` ledger at end of run** (an earlier
+  draft of this file quoted a mid-run snapshot and drew the wrong conclusion from it — see below):
+
+  | Role | Dispatches | Findings | Confirmed | Precision |
+  |---|---:|---:|---:|---:|
+  | `red-team` | 7 | 52 | 45 | 86% |
+  | phase `reviewer` | 5 | 51 | 47 | 92% |
+  | `verifier` | 4 | 10 | 9 | 90% |
+  | `second-verifier` | 3 | 5 | 5 | 100% |
+  | `test-author` | 2 | 6 | 5 | 83% |
+  | `security-auditor` | 2 | 6 | 6 | 100% |
+  | `scout` | 1 | 1 | 1 | 100% |
+  | `implementer` | 60 | — | — | — |
+
+  **`red-team` was the highest-value role**, but not for the reason I wrote earlier. It is not more
+  *precise* than the others — at 86% it is the least precise finding-producer in the table. It is
+  the highest-**volume**: 45 confirmed defects, nearly as many as every other review layer combined,
+  including both severe money bugs, found on code that had already passed its verifier *and* a phase
+  reviewer.
+  **Correction worth stating plainly**: this file previously claimed the plain `verifier` was the
+  weakest role at 67% precision and recommended spending its budget on a second red-team pass. That
+  was computed from three dispatches mid-run; across all four it is **90%**, statistically
+  indistinguishable from red-team and the phase reviewer. Precision does not separate these roles —
+  every one of them lands between 83% and 100%. **Volume of confirmed findings does**, and that is
+  the axis to route on. Keep the verifier; add red-team passes with new budget rather than by
+  cannibalising a layer that was performing.
 - **The architect's own recurring defect** (9 instances): task verify commands used *directory*-scoped
   `ruff check` and whole-project `tsc`/`npm run lint` gates, which sweep in untouched legacy files —
   contradicting PLAN §2's own "untouched legacy files are not a gate". Scope lint gates to the files

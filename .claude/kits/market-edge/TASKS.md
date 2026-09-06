@@ -1435,3 +1435,193 @@ cd backend && python3 -m pytest -q tests/matching/test_link_write_races.py
 ```
 
 ---
+
+## Phase 5R — Audit remediation (added during execution, not by the architect)
+
+Backfilled into TASKS.md after the fact. T38–T43 were dispatched, completed and verified without
+a `TASKS.md` entry, so `bin/routing_scorecard.py` silently dropped their `outcome:` lines — the
+scorecard read 34/40 when the real denominator was larger. T40 and T41 had no `outcome:` line at
+all. Both failures are the same discipline lapse recorded in HANDOFF.md; this section closes it,
+and T44/T45 below were written here **at dispatch time**, which is the actual fix.
+
+### T38 — One failing book fetch must not kill the scan pass
+- status: done
+- model: opus
+- independent: no
+
+**Brief.** `_fetch_book` let a single venue 404 propagate through `asyncio.gather`, aborting the
+whole pass. `gather(return_exceptions=False)` *abandons* its siblings rather than cancelling them,
+so the pass also leaked detached fetches. Interleave across venues so a snapshot is not skewed by
+draining one venue first.
+
+**Acceptance.** A per-book failure is counted and skipped, not raised; the pass completes with a
+`books_failed` count and per-venue error types; no fetch is left detached.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/services/test_scanner_concurrency.py
+```
+
+---
+
+### T39 — Close the reachable half of the AST fence gaps
+- status: done
+- model: sonnet
+- independent: no
+
+**Brief.** The fence over the matching package missed several mutation forms, and the request-model
+walker read only already-constructed `APIRoute` objects. Fix what is reachable; document what is
+undecidable syntactically rather than pretending the fence is total.
+
+**Acceptance.** Newly-covered forms are caught with paired positive and negative controls; the two
+genuinely undecidable gaps are stated in the fence's own docstring with a test pinning that the
+first is still missed.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/matching/test_matcher.py tests/test_fences.py
+```
+
+---
+
+### T40 — Make configuration actually reach the container
+- status: done
+- model: sonnet
+- independent: yes
+
+**Brief.** `docker-compose.yml` forwarded 12 of 56 settings and had no `env_file`, so
+`.env.example`'s own "copy this to `.env`" instruction was false for 44 values — including both
+Kalshi credentials, which meant the dockerized deployment could not authenticate to Kalshi at all.
+Same `extra="ignore"` silence family, one layer out: the settings binding was clean; the deployment
+path dropped the value. Pin `celery-worker --concurrency=1` with a justification, not blindly.
+
+**Acceptance.** `env_file` added with topology-derived values kept as explicit `environment:`
+entries so a local `.env` cannot redirect the container at its own database; a structural test
+enumerates `Settings.model_fields` aliases and fails when one goes undocumented.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/test_env_example_coverage.py
+```
+
+---
+
+### T41 — Stop three beats reporting health while doing nothing
+- status: done
+- model: sonnet
+- independent: yes
+
+**Brief.** `sync-markets`, `sync-prices` and `reset-daily-stats` resolved to `# TODO` stubs
+returning `{"status": "success"}` — worse than erroring, because a dashboard shows three green
+beats. `/markets` also returned `{"markets": [...]}` while the frontend's `PaginatedResponse<T>`
+reads `{data: [...]}`, so the default tab would render empty the day listing was implemented.
+
+**Acceptance.** A stub reports its stub status rather than success; the `/markets` envelope matches
+its TypeScript consumer; README limitations verified against code, section not deleted.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/api/test_markets.py
+```
+
+---
+
+### T42 — Fence the two escape hatches the third red-team pass found
+- status: done
+- model: sonnet
+- independent: no
+
+**Brief.** `_lifecycle_findings`' `_writes_a_link` branch missed a mutation form, and the
+request-model walker skipped anything not already an `APIRoute` — a mounted sub-app carrying a
+permissive body model was invisible to it.
+
+**Acceptance.** Both forms caught, each proven red-green against a snapshot of the pre-fix walker.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/test_fences.py tests/matching/test_link_proposal_beat.py
+```
+
+---
+
+### T43 — Stop `reject_link` destroying the prior reviewer's notes
+- status: done
+- model: opus
+- independent: no
+
+**Brief.** `reject_link` overwrote the notes field with a 200 OK, losing an earlier reviewer's
+text. The memo's hard entry cap bounded entries but not the LOCK table, so the lock map grew
+unbounded.
+
+**Acceptance.** Notes merge rather than overwrite; the cap sweep covers the lock table; the 409
+states plainly that rejection is terminal on this API.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/api/test_links.py tests/venues/test_polymarket_adapter.py
+```
+
+---
+
+## Phase 6 — First-run readiness (added during execution, at dispatch time)
+
+The one gap named in HANDOFF.md as uncloseable: **nobody has run this system end to end.** Neither
+task closes it — GUARDRAILS §1.4 bars the venue network — but both make the first real run cheap
+instead of expensive. Dispatched in parallel; disjoint file sets.
+
+### T44 — Characterize adapter behaviour on divergent venue payloads
+- status: in-progress
+- model: opus
+- independent: yes
+
+**Brief.** Every fixture in this repo was hand-written to shapes pinned in PLAN.md §3. The first
+real payload will disagree somewhere: a renamed key, a null where a number was assumed, a
+string-encoded number, an unknown status. This repo's dominant failure mode is **silence** — three
+recorded instances (a request field discarded by `extra="ignore"`; the kill-switch bound to a wrong
+alias; a whole capability with no caller). So the question is not whether divergence happens but
+whether it **fails loudly or quietly produces a wrong number.** Characterize first, feeding
+divergent payloads through `MockTransport`; classify each as loud / quiet-safe / quiet-wrong; fix
+only the last class. Unknown extra keys must stay **tolerated** — an adapter that raises on any
+unexpected shape fails the first time a venue adds a harmless field, which is its own outage. Pay
+particular attention to Kalshi cents-vs-dollars: NOTES.md records `fee()` returning −$17,150 when
+that conversion was missed.
+
+**Files.** `app/venues/polymarket/adapter.py`, `app/venues/kalshi/adapter.py`, `app/venues/base.py`,
+`app/venues/types.py`, `tests/venues/`.
+
+**Acceptance.** A characterization table covering each divergence class per adapter; every
+quiet-and-wrong case now loud, each fix proven red-green; unknown extra keys still tolerated, with
+a test pinning that.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/venues/
+```
+
+---
+
+### T45 — A preflight command that checks everything checkable without a venue
+- status: in-progress
+- model: sonnet
+- independent: yes
+
+**Brief.** The deployment audit found 44 of 56 settings never reaching the container, and it was
+invisible until someone read the compose file against the settings model. A first run should not be
+the thing that discovers the next one of those. Build `python3 -m app.scripts.preflight`. GUARDRAILS
+§1.3 is absolute: report credential **presence and shape only, never a value**. §1.4 bars contacting
+any venue, so the command must state plainly **what it did not check** — venue connectivity first —
+so nobody reads a green preflight as "the venues work". Split fail from warn deliberately: a tool
+that fails on warnings gets ignored, and one that warns on failures gets trusted wrongly.
+
+**Files.** `app/scripts/preflight.py` (new), `backend/tests/`, README section.
+
+**Acceptance.** Checks trading mode and its fences, credential presence/shape, database
+reachability and migration drift, broker reachability; a test asserts no secret value appears in the
+output; exit status distinguishes fail from warn.
+
+**Verify.**
+```bash
+cd backend && python3 -m app.scripts.preflight; python3 -m pytest -q tests/scripts/
+```
+
+---
