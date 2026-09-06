@@ -5,13 +5,14 @@ import type {
   Order,
   OrderRequest,
   Position,
-  Trader,
-  TraderFollow,
   Strategy,
   Bot,
   Backtest,
   BacktestTrade,
-  ArbitrageOpportunity,
+  OpportunitiesResponse,
+  ScanResponse,
+  EdgeDecayReport,
+  TradingModeResponse,
   PaginatedResponse,
 } from '../types';
 
@@ -106,59 +107,44 @@ class ApiClient {
     return data.position;
   }
 
-  // Arbitrage
-  async getArbitrageOpportunities(minProfit?: number): Promise<{
-    opportunities: ArbitrageOpportunity[];
-  }> {
-    const { data } = await this.client.get('/arbitrage/opportunities', {
-      params: { min_profit: minProfit },
+  // Opportunities (PLAN.md D10, T19/T23) — GET /opportunities and
+  // POST /scan are discovery-only; see backend/app/api/routes/arbitrage.py's
+  // module docstring for why nothing here ever places or routes an order.
+  async getOpportunities(params?: {
+    minComposite?: number;
+    venue?: string;
+    nearResolution?: boolean;
+  }): Promise<OpportunitiesResponse> {
+    const { data } = await this.client.get<OpportunitiesResponse>('/arbitrage/opportunities', {
+      params: {
+        min_composite: params?.minComposite,
+        venue: params?.venue,
+        near_resolution: params?.nearResolution,
+      },
     });
     return data;
   }
 
-  async scanArbitrage(): Promise<{ status: string; opportunities_found: number }> {
-    const { data } = await this.client.post('/arbitrage/scan');
+  async triggerScan(strategies?: string[]): Promise<ScanResponse> {
+    const { data } = await this.client.post<ScanResponse>(
+      '/arbitrage/scan',
+      null,
+      strategies ? { params: { strategies } } : undefined
+    );
     return data;
   }
 
-  // Traders
-  async getTraders(params?: {
-    skip?: number;
-    limit?: number;
-    sort_by?: string;
-  }): Promise<PaginatedResponse<Trader>> {
-    const { data } = await this.client.get('/traders', { params });
+  // Backtesting — edge decay (PLAN.md D12, T22/T23)
+  async getEdgeDecay(backtestId: number): Promise<EdgeDecayReport> {
+    const { data } = await this.client.get<EdgeDecayReport>(
+      `/backtests/${backtestId}/edge-decay`
+    );
     return data;
   }
 
-  async getTrader(address: string): Promise<Trader> {
-    const { data } = await this.client.get(`/traders/${address}`);
-    return data;
-  }
-
-  async getTraderTrades(
-    address: string,
-    params?: { skip?: number; limit?: number }
-  ): Promise<{ trades: Trade[]; total: number }> {
-    const { data } = await this.client.get(`/traders/${address}/trades`, { params });
-    return data;
-  }
-
-  async followTrader(address: string): Promise<{ status: string }> {
-    const { data } = await this.client.post(`/traders/${address}/follow`);
-    return data;
-  }
-
-  async unfollowTrader(address: string): Promise<{ status: string }> {
-    const { data } = await this.client.delete(`/traders/${address}/follow`);
-    return data;
-  }
-
-  async getLeaderboard(params?: {
-    timeframe?: string;
-    limit?: number;
-  }): Promise<{ leaderboard: Trader[] }> {
-    const { data } = await this.client.get('/traders/leaderboard', { params });
+  // Trading mode (GUARDRAILS.md §1.2 — paper/live, read-only here)
+  async getTradingMode(): Promise<TradingModeResponse> {
+    const { data } = await this.client.get<TradingModeResponse>('/trading/mode');
     return data;
   }
 
@@ -258,7 +244,7 @@ class ApiClient {
   }
 }
 
-// Trade type for trader trades
+// Trade type for bot trades
 interface Trade {
   id: number;
   trade_id: string;

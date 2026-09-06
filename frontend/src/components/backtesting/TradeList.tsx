@@ -13,6 +13,25 @@ type SortDirection = 'asc' | 'desc';
 type SideFilter = 'all' | 'BUY' | 'SELL';
 type PnLFilter = 'all' | 'winners' | 'losers';
 
+interface SortIconProps {
+  field: SortField;
+  sortField: SortField;
+  sortDirection: SortDirection;
+}
+
+// Hoisted to module scope (not defined inside TradeList's render body):
+// a component re-created on every render is a new type each time, so
+// React unmounts/remounts it instead of reconciling, discarding any
+// state it holds and defeating the point of the sort-direction props.
+function SortIcon({ field, sortField, sortDirection }: SortIconProps) {
+  if (sortField !== field) return null;
+  return (
+    <span className="ml-1 inline-block">
+      {sortDirection === 'asc' ? '↑' : '↓'}
+    </span>
+  );
+}
+
 export function TradeList({ trades, isLoading }: TradeListProps) {
   const [sortField, setSortField] = useState<SortField>('entry_time');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
@@ -86,15 +105,6 @@ export function TradeList({ trades, isLoading }: TradeListProps) {
       setSortField(field);
       setSortDirection('desc');
     }
-  };
-
-  const SortIcon = ({ field }: { field: SortField }) => {
-    if (sortField !== field) return null;
-    return (
-      <span className="ml-1 inline-block">
-        {sortDirection === 'asc' ? '\u2191' : '\u2193'}
-      </span>
-    );
   };
 
   if (isLoading) {
@@ -180,7 +190,7 @@ export function TradeList({ trades, isLoading }: TradeListProps) {
                 onClick={() => handleSort('entry_time')}
               >
                 Entry Time
-                <SortIcon field="entry_time" />
+                <SortIcon field="entry_time" sortField={sortField} sortDirection={sortDirection} />
               </th>
               <th className="px-4 py-3 text-left text-sm font-medium">Market</th>
               <th
@@ -188,35 +198,35 @@ export function TradeList({ trades, isLoading }: TradeListProps) {
                 onClick={() => handleSort('side')}
               >
                 Side
-                <SortIcon field="side" />
+                <SortIcon field="side" sortField={sortField} sortDirection={sortDirection} />
               </th>
               <th
                 className="cursor-pointer px-4 py-3 text-right text-sm font-medium"
                 onClick={() => handleSort('entry_price')}
               >
                 Price
-                <SortIcon field="entry_price" />
+                <SortIcon field="entry_price" sortField={sortField} sortDirection={sortDirection} />
               </th>
               <th
                 className="cursor-pointer px-4 py-3 text-right text-sm font-medium"
                 onClick={() => handleSort('size')}
               >
                 Size
-                <SortIcon field="size" />
+                <SortIcon field="size" sortField={sortField} sortDirection={sortDirection} />
               </th>
               <th
                 className="cursor-pointer px-4 py-3 text-right text-sm font-medium"
                 onClick={() => handleSort('pnl')}
               >
                 P&L
-                <SortIcon field="pnl" />
+                <SortIcon field="pnl" sortField={sortField} sortDirection={sortDirection} />
               </th>
               <th
                 className="cursor-pointer px-4 py-3 text-right text-sm font-medium"
                 onClick={() => handleSort('pnl_pct')}
               >
                 P&L %
-                <SortIcon field="pnl_pct" />
+                <SortIcon field="pnl_pct" sortField={sortField} sortDirection={sortDirection} />
               </th>
             </tr>
           </thead>

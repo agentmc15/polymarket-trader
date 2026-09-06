@@ -10,7 +10,8 @@ import {
 } from 'recharts';
 import { cn } from '../../utils/cn';
 import { formatCurrency, formatPercent, formatNumber, formatDateTime } from '../../utils/format';
-import type { BacktestMetrics, EquityPoint, BacktestStatus } from '../../types';
+import { DepthSourceBadge, FillAtBadge } from './DepthBadges';
+import type { BacktestMetrics, BacktestReport, EquityPoint, BacktestStatus } from '../../types';
 
 interface BacktestResultsProps {
   status: BacktestStatus;
@@ -21,6 +22,11 @@ interface BacktestResultsProps {
   finalCapital?: number;
   errorMessage?: string;
   strategyName?: string;
+  //: GUARDRAILS.md §1.7: `depth_source`/`fill_at` are written into
+  //: EVERY completed run's report (`build_report()`,
+  //: backend/app/tasks/backtesting.py), not just a sweep's — this is
+  //: what an ordinary run's result must be labeled with.
+  report?: BacktestReport;
 }
 
 export function BacktestResults({
@@ -32,6 +38,7 @@ export function BacktestResults({
   finalCapital,
   errorMessage,
   strategyName,
+  report,
 }: BacktestResultsProps) {
   // Loading/Pending state
   if (status === 'PENDING' || status === 'RUNNING') {
@@ -120,6 +127,38 @@ export function BacktestResults({
 
   return (
     <div className="space-y-6">
+      {/* GUARDRAILS.md §1.7: every completed run's `depth_source`/
+          `fill_at` are labeled here, visibly, unconditionally — not
+          only for a sweep (that's `EdgeDecayTable`'s per-row labeling).
+          A missing `report` (a run recorded before report capture
+          existed) renders NOTHING here rather than a false "recorded"/
+          "next" default — see `BacktestReport`'s doc comment. */}
+      {report && (report.depth_source !== undefined || report.fill_at !== undefined) && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card p-3 text-sm">
+          {report.depth_source !== undefined && (
+            <>
+              <span className="text-muted-foreground">Depth source:</span>
+              <DepthSourceBadge depthSource={report.depth_source} />
+            </>
+          )}
+          {report.fill_at !== undefined && (
+            <>
+              <span className="text-muted-foreground">Fill at:</span>
+              <FillAtBadge fillAt={report.fill_at} />
+            </>
+          )}
+          {Array.isArray(report.unmarked_positions) && report.unmarked_positions.length > 0 && (
+            <span
+              className="rounded bg-warning/20 px-1.5 py-0.5 text-xs font-medium text-warning"
+              title={report.unmarked_positions.join(', ')}
+            >
+              {report.unmarked_positions.length} position(s) unmarked — equity curve partly
+              fictional
+            </span>
+          )}
+        </div>
+      )}
+
       {/* Key Metrics Cards */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <MetricCard
@@ -192,7 +231,10 @@ export function BacktestResults({
                   borderRadius: '8px',
                 }}
                 labelFormatter={(value) => formatDateTime(new Date(value))}
-                formatter={(value: number) => [formatCurrency(value), 'Equity']}
+                formatter={(value: number | undefined) => [
+                  formatCurrency(value ?? 0),
+                  'Equity',
+                ]}
               />
               <ReferenceLine
                 y={initialCapital}

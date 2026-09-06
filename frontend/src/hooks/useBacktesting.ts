@@ -92,6 +92,8 @@ export function useBacktest(backtestId: number | null) {
     progress: statusQuery.data?.progress ?? 0,
     metrics: statusQuery.data?.metrics,
     errorMessage: statusQuery.data?.error_message,
+    strategyName: statusQuery.data?.strategy_name,
+    report: statusQuery.data?.report,
     equityCurve: equityCurveQuery.data?.equity_curve ?? [],
     initialCapital: equityCurveQuery.data?.initial_capital ?? 0,
     finalCapital: equityCurveQuery.data?.final_capital,

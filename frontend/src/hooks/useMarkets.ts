@@ -1,6 +1,5 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { api } from '../services/api';
-import type { Market } from '../types';
 
 export function useMarkets(params?: {
   skip?: number;

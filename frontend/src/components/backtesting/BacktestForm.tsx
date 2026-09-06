@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { cn } from '../../utils/cn';
 import { formatCurrency } from '../../utils/format';
 import type { StrategyInfo, BacktestRequest, SlippageModel } from '../../types';
@@ -45,18 +45,26 @@ export function BacktestForm({
 
   // Dynamic strategy config
   const [strategyConfig, setStrategyConfig] = useState<Record<string, unknown>>({});
+  // Tracks which strategy `strategyConfig` was last reset for, so the
+  // reset below can detect a strategy change during render.
+  const [configForStrategy, setConfigForStrategy] = useState<string | null>(null);
 
   // Get selected strategy info
   const selectedStrategyInfo = strategies.find((s) => s.name === selectedStrategy);
 
-  // Update config when strategy changes
-  useEffect(() => {
-    if (selectedStrategyInfo?.default_config) {
-      setStrategyConfig({ ...selectedStrategyInfo.default_config });
-    } else {
-      setStrategyConfig({});
-    }
-  }, [selectedStrategy, selectedStrategyInfo]);
+  // Reset `strategyConfig` to the new strategy's defaults when
+  // `selectedStrategy` changes. Done synchronously during render (React's
+  // "adjusting state when a prop changes" pattern:
+  // https://react.dev/learn/you-might-not-need-an-effect) instead of in a
+  // `useEffect`, since a `setState` unconditionally called from an effect
+  // body triggers an extra, avoidable render pass. The `if` guard makes
+  // this a one-time adjustment per strategy change, not an infinite loop.
+  if (configForStrategy !== selectedStrategy) {
+    setConfigForStrategy(selectedStrategy);
+    setStrategyConfig(
+      selectedStrategyInfo?.default_config ? { ...selectedStrategyInfo.default_config } : {}
+    );
+  }
 
   const handleConfigChange = (key: string, value: unknown) => {
     setStrategyConfig((prev) => ({ ...prev, [key]: value }));

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { cn } from '../../utils/cn';
-import { formatCurrency, formatPercent, formatRelativeTime } from '../../utils/format';
+import { formatPercent, formatRelativeTime } from '../../utils/format';
 import {
   useStrategies,
   useRunBacktest,
@@ -11,6 +11,7 @@ import {
 import { BacktestForm } from './BacktestForm';
 import { BacktestResults } from './BacktestResults';
 import { TradeList } from './TradeList';
+import { EdgeDecayTable } from './EdgeDecayTable';
 import type { BacktestRequest } from '../../types';
 import type { BacktestListItem } from '../../services/backtestApi';
 
@@ -132,7 +133,15 @@ export function Backtesting() {
             initialCapital={backtest.initialCapital}
             finalCapital={backtest.finalCapital}
             errorMessage={backtest.errorMessage}
+            report={backtest.report}
           />
+
+          {backtest.status === 'COMPLETED' &&
+            (backtest.strategyName?.startsWith('sweep:') || Boolean(backtest.report?.edge_decay)) && (
+              <div className="rounded-lg border border-border bg-card p-4">
+                <EdgeDecayTable backtestId={currentBacktestId} />
+              </div>
+            )}
 
           {backtest.status === 'COMPLETED' && (
             <div className="rounded-lg border border-border bg-card p-4">
