@@ -245,6 +245,14 @@ async def test_a_run_with_no_usable_equity_curve_reports_none_not_zero(
     and every recomputed field has to come back `null`. Returning `0.0`
     would tell a reader this sweep had zero volatility, a zero drawdown
     and no winning trades, none of which was measured.
+
+    The SAME sweep-parent row also leaves `win_rate`/`sharpe_ratio`/
+    `max_drawdown` NULL in the database (T36): before T36 those three
+    were coerced with `backtest.win_rate or 0.0` and would have left
+    this endpoint as `0.0`, indistinguishable from a real zero win rate
+    on a run that never traded. `total_trades` is the one field that
+    genuinely IS `0`-or-more by construction (a `BacktestRun` column
+    with a non-null default), so it alone is asserted as a real number.
     """
     backtest_id = await _persist(
         test_session,
@@ -283,9 +291,14 @@ async def test_a_run_with_no_usable_equity_curve_reports_none_not_zero(
     ]
     assert recomputed_only == [None] * 11
 
-    # The four column-backed fields still come through, and the parent's
-    # own `total_trades` (summed across levels) is not overwritten by a
-    # recomputation that would have said 0.
+    # T36: the three NULL columns come through as `null`, not `0.0`.
+    assert trade["win_rate"] is None
+    assert risk["sharpe_ratio"] is None
+    assert risk["max_drawdown"] is None
+
+    # `total_trades` still comes through, and the parent's own value
+    # (summed across levels) is not overwritten by a recomputation that
+    # would have said 0.
     assert trade["total_trades"] == 17
 
 
@@ -326,6 +339,41 @@ async def test_a_run_with_no_closed_trades_reports_none_for_the_win_loss_ratios(
     # The equity curve is untouched, so the risk metrics are still real.
     assert risk["volatility"] == pytest.approx(2.50998008, rel=1e-6)
     assert risk["max_drawdown_pct"] == pytest.approx(20.0)
+
+
+async def test_a_run_with_genuine_zero_win_rate_sharpe_and_drawdown_reports_zero_not_none(
+    client: AsyncClient,
+    test_session: AsyncSession,
+) -> None:
+    """A MEASURED zero in the three column-backed fields must stay `0.0` (T36).
+
+    T36 stops `get_backtest_status` coercing a NULL `win_rate`/
+    `sharpe_ratio`/`max_drawdown` column with `... or 0.0` so that a
+    NULL column can finally report `null` (see the sibling
+    `..._reports_none_not_zero` test above). That change is only safe
+    if it does not ALSO turn a genuine `0.0` into `null` — `x or 0.0`
+    and a hypothetical `x if x else None` are both "falsy" checks that
+    would treat a real `0.0` the same as a missing value. This asserts
+    the pass-through the other direction: a run that genuinely measured
+    zero on all three reports exactly `0.0`, not `null`.
+    """
+    backtest_id = await _persist(
+        test_session,
+        _completed_run(win_rate=0.0, sharpe_ratio=0.0, max_drawdown=0.0),
+    )
+
+    response = await client.get(f"/api/v1/backtests/{backtest_id}")
+
+    assert response.status_code == 200, response.text
+    trade = response.json()["trade_metrics"]
+    risk = response.json()["risk_metrics"]
+
+    assert trade["win_rate"] == 0.0
+    assert trade["win_rate"] is not None
+    assert risk["sharpe_ratio"] == 0.0
+    assert risk["sharpe_ratio"] is not None
+    assert risk["max_drawdown"] == 0.0
+    assert risk["max_drawdown"] is not None
 
 
 async def test_an_unfinished_run_reports_no_metrics_block_at_all(

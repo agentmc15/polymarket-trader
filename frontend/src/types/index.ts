@@ -204,35 +204,40 @@ export interface SweepRequest extends BacktestRequest {
   capital_levels?: number[];
 }
 
-// `TradeMetrics` (backtesting.py). As of this writing,
-// `GET /backtests/{id}` only ever populates `total_trades` and
-// `win_rate` from `BacktestRun` columns — every other field here is a
-// real, typed part of the response, but currently always the pydantic
-// default `0`. Do not render one of those as if it were a measured
-// zero; `BacktestResults` only surfaces the two fields that are
-// actually populated today.
+// `TradeMetrics` (backtesting.py). `null` MEANS "NOT COMPUTED" and is
+// never interchangeable with a measured `0` (T33/T36, GUARDRAILS.md
+// §1.7): a sweep PARENT row has no equity curve of its own (results
+// live on its children) and reports every derived field `null`; a run
+// with only open fills has a real `0` `total_trades`/`winning_trades`
+// but no realized win to average, so `profit_factor`/`avg_win`/
+// `avg_loss`/`largest_win`/`largest_loss` come back `null` rather than
+// `0`. `total_trades` is the only field that can never be `null` — it
+// is a `BacktestRun` COLUMN, always a real (possibly `0`) count. Every
+// render path MUST treat `null` as "not computed" (e.g. `'-'`) and
+// MUST NOT let it reach arithmetic (`* 100`, `.toFixed()`) unguarded —
+// `null * 100` is `0` in JS, a silent false zero, not a compile error.
 export interface TradeMetrics {
   total_trades: number;
-  winning_trades: number;
-  losing_trades: number;
-  win_rate: number;
-  profit_factor: number;
-  avg_win: number;
-  avg_loss: number;
-  largest_win: number;
-  largest_loss: number;
+  winning_trades: number | null;
+  losing_trades: number | null;
+  win_rate: number | null;
+  profit_factor: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  largest_win: number | null;
+  largest_loss: number | null;
 }
 
-// `RiskMetrics` (backtesting.py). Same caveat as `TradeMetrics`: only
-// `sharpe_ratio` and `max_drawdown` are populated by
-// `GET /backtests/{id}` today.
+// `RiskMetrics` (backtesting.py). Same `null`-means-not-computed
+// contract as `TradeMetrics`, same reason, same guard-before-arithmetic
+// requirement.
 export interface RiskMetrics {
-  sharpe_ratio: number;
-  sortino_ratio: number;
-  max_drawdown: number;
-  max_drawdown_pct: number;
-  volatility: number;
-  var_95: number;
+  sharpe_ratio: number | null;
+  sortino_ratio: number | null;
+  max_drawdown: number | null;
+  max_drawdown_pct: number | null;
+  volatility: number | null;
+  var_95: number | null;
 }
 
 // `EquityCurvePoint` (backtesting.py) — one point of

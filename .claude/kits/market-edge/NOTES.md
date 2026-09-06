@@ -5177,3 +5177,119 @@ the right call: the fix order matters, and doing half of it is worse than neithe
 
 agent: T33 id=a3eb28c72e41e963a role=implementer model=opus
 outcome: T33 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T36
+
+Closed the pair T33 deliberately left open, in the order T33 prescribed: frontend nullability
+first, then the backend coercion removal, never the reverse.
+
+Step 1 widened `frontend/src/types/index.ts`'s `TradeMetrics`/`RiskMetrics` to `number | null` on
+every field except `total_trades` -- fourteen fields, not the eleven the brief named literally.
+The extra three (`win_rate`, `sharpe_ratio`, `max_drawdown`) are the ones step 2 was about to make
+genuinely nullable on the wire; widening only the eleven and leaving those three as bare `number`
+would have reintroduced the exact "the types are now false" problem the brief opened with, one
+task later, and it would have meant `BacktestResults.tsx`'s `max_drawdown * 100` and
+`sharpe_ratio > 1` sites were still unguarded at the moment the backend flipped. Since
+`frontend/src/**` was in scope regardless of which "step" a change served, doing all fourteen in
+step 1 was the only way step 2 could actually be safe.
+
+Every render path for those four column-backed fields (`BacktestResults.tsx`'s `MetricCard`s and
+its `MetricsGroup` array) now routes through a new `formatMetric(value, formatter)` helper added to
+`utils/format.ts`, which returns the existing `'-'` placeholder (already the codebase's convention
+for "not available" -- `Backtesting.tsx`'s `bt.sharpe_ratio?.toFixed(2) ?? '-'`, `TradeList.tsx`'s
+`trade.pnl !== null ? ... : '-'`) for `null` and only otherwise calls the formatter. `formatPercent`/
+`formatNumber`/`formatCurrency` themselves were deliberately left with a strict `number` parameter
+rather than widened to accept `null` internally: `null * 100` and `null / 100` are both `0` in JS,
+not a compile error and not `NaN`, so a formatter that "handled" null by accepting it and doing
+arithmetic would silently render `'0.00%'` for a `null` input -- the bug moved one level down
+instead of fixed. Keeping them strict means passing a possibly-null metric straight to them is a
+type error, and `formatMetric` is the only path around that error, so a future call site cannot
+skip the guard by accident. `max_drawdown === null` renders as `'-'`, via `formatMetric`, never via
+`* 100` -- the multiplication only ever runs on a value already known non-null inside the callback.
+The `isPositive`/`isNegative` color flags on the three `MetricCard`s got the same treatment
+(`riskMetrics.sharpe_ratio !== null && riskMetrics.sharpe_ratio > 1`, not a `?? 0` default) so a
+not-computed metric never reads as a colored positive or negative.
+
+Only after that landed and `tsc`/`lint` were reconfirmed clean did step 2 touch
+`backend/app/api/routes/backtesting.py`: `TradeMetrics.win_rate`, `RiskMetrics.sharpe_ratio`, and
+`RiskMetrics.max_drawdown` changed from `float = 0.0` to `float | None = None`, and the three
+`... or 0.0` coercions in `get_backtest_status` became plain column pass-throughs. The
+`BacktestRun` model already typed these three columns `float | None`, so this closes a gap between
+the ORM and the API schema rather than opening one. `BacktestListItem` (the list-view row) already
+reported these two nullable and was already rendered null-safely -- untouched.
+
+Tests, and the red-team proof both directions: on the frontend (no test runner exists in this repo
+-- `npm run lint`/`tsc` are the only wired checks, confirmed via `package.json`'s scripts and
+GUARDRAILS.md 2), `formatMetric` was exercised with esbuild bundling the real `utils/format.ts`
+file (no shim, no reimplementation) and asserting on its actual exports. Both directions were
+proven non-vacuous by mutation in a `$TMPDIR` copy of the whole `frontend/` tree: replacing the
+`null`-check body with `formatter(value ?? 0)` (the "reintroduce the bug one level down" failure
+the brief warned about) turned the two null-metric assertions RED while leaving the zero assertions
+green; restoring the real body turned both GREEN. Separately, replacing it with `value ? formatter
+(value) : '-'` (a falsy check, the mirror-image bug that would eat a genuine `0`) turned the two
+real-zero assertions RED without touching the null assertions -- proving the test suite catches
+both failure directions independently, not just one disguised as two. On the backend,
+`backend/tests/api/test_backtest_status_metrics.py` gained a new
+`test_a_run_with_genuine_zero_win_rate_sharpe_and_drawdown_reports_zero_not_none` (persists
+`win_rate=sharpe_ratio=max_drawdown=0.0` and asserts the response reports `0.0`, not `null`), and
+the existing sweep-parent test (`..._reports_none_not_zero`, which already persisted all three as
+`None` but had never checked the response for them -- a real gap, since before T36 that config
+would have silently passed through the `or 0.0` coercion) gained the three `is None` assertions
+that now actually exercise the fix. Reverting only the three `... or 0.0` coercions in a
+`$TMPDIR` copy of `backend/` turned the sweep-parent test RED (`assert 0.0 is None` on `win_rate`)
+while the new genuine-zero test stayed green (`0.0 or 0.0` is still `0.0`), confirming the two
+backend tests are not redundant with each other either. Restoring gave 783 passed (782 baseline +
+this one new test) in the real tree.
+
+Verification: `tsc -p tsconfig.app.json --noEmit` exit 0, `npm run lint` exit 0,
+`grep -rn ": any\b" frontend/src` empty, `cd backend && python3 -m pytest -q` 783 passed / 0
+failed, `ruff check app/api/routes/backtesting.py` and the same on the touched test file both
+clean. `mypy app/api/routes/backtesting.py` reports the same 3 errors (a missing arg annotation on
+an unrelated helper at line 137, and two `datetime | Any | None` timestamp args at what are now
+lines 901/957) as `git stash` shows on the pre-T36 file at the equivalent pre-shift line numbers
+901-8=893 and 957-8=949 -- confirmed byte-identical in content, not just count, so nothing here is
+a new regression. `git status --porcelain` shows exactly five files: the two frontend/backend
+files the brief named plus `frontend/src/utils/format.ts` (the new helper), plus one test file
+(`backend/tests/api/test_backtest_status_metrics.py`) that sits outside the brief's literal file
+list but was necessary to satisfy the brief's own explicit test requirement -- there is no
+backend/test-author role active on this task, and GUARDRAILS.md 5 places tests exactly there.
+
+### T36 adjudication (orchestrator)
+
+Verified: `formatNumber(value: number, ...)` and `formatPercent(value: number, ...)` are still STRICT,
+`formatMetric` is the null-aware wrapper, backend fields are `float | None = None`, `tsc` 0,
+`npm run lint` 0, `: any` empty, suite **783**.
+
+**THE DESIGN CALL IS BETTER THAN THE ONE I DESCRIBED.** I warned that a `formatPercent(null)` returning
+`"0.00%"` would reintroduce the bug at one remove, and implied the fix was to make the formatters
+null-aware. The implementer did the opposite, correctly: it kept `formatPercent`/`formatNumber`/
+`formatCurrency` typed `number`, NOT `number | null`, and added a separate `formatMetric(value,
+formatter)` wrapper. The reasoning is the load-bearing part -- **`null * 100` is `0` in JavaScript, not
+a compile error**, so a formatter that "handled" null internally would silently render `"0.00%"` and
+move the bug one level down where nothing catches it. Keeping the base formatters strict makes a
+MISSING GUARD A TYPE ERROR. Widening them would have made the whole change typecheck while preserving
+the defect.
+
+It also widened **14 fields, not the 11 I named** -- correctly, because `win_rate`/`sharpe_ratio`/
+`max_drawdown` were about to become genuinely nullable on the wire in step 2, and the ordering
+requirement means the frontend must already handle that BEFORE the backend flips. Following my count
+literally would have broken the very sequencing the task existed to respect.
+
+Red-green in BOTH directions, independently, which is what a null-vs-zero test needs:
+`formatter(value ?? 0)` turned the null-assertions red while the zero-assertions stayed green;
+`value ? formatter(value) : '-'` turned the ZERO-assertions red while the null-assertions stayed green.
+That second mutation is the subtle one -- `value ? ...` treats a genuine `0` as falsy and renders it as
+"not computed", destroying real data. Proving both directions separately is what distinguishes a real
+guard from one that just suppresses everything.
+
+No frontend test runner exists in this repo (`package.json` confirms), so `format.ts` was exercised by
+bundling the REAL module with esbuild in a `$TMPDIR` copy and asserting on its actual exports -- not a
+reimplementation. And it found a pre-existing gap: the sweep-parent test persisted nulls but never
+asserted on the RESPONSE, which the old `or 0.0` coercion had been masking.
+
+Scope note handled correctly: `backend/tests/api/test_backtest_status_metrics.py` sits outside the
+literal file list I gave, but the brief demanded tests and no test-author was dispatched. It said so
+explicitly rather than silently expanding scope.
+
+agent: T36 id=a308f5b2cd009ce8e role=implementer model=sonnet
+outcome: T36 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5

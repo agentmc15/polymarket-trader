@@ -24,6 +24,24 @@ export function formatPercent(value: number, decimals = 2): string {
   }).format(value / 100);
 }
 
+// T36: `TradeMetrics`/`RiskMetrics` (types/index.ts) use `null` to mean
+// "not computed", never interchangeable with a measured `0`.
+// `formatPercent`/`formatNumber`/`formatCurrency` above deliberately
+// keep a strict `number` parameter rather than widening to
+// `number | null` internally — a `null` reaching `value / 100` (in
+// `formatPercent`) or an `Intl.NumberFormat` call is coerced to `0` by
+// JS, not rejected, so a formatter that "handled" null internally
+// would render it as `'0.00%'`/`'0.00'`: the exact bug this exists to
+// prevent, one level down. Keeping them strict makes that a compile
+// error instead, and callers route a possibly-null metric through
+// `formatMetric` instead, which branches BEFORE any arithmetic runs.
+export function formatMetric(
+  value: number | null,
+  formatter: (value: number) => string
+): string {
+  return value === null ? '-' : formatter(value);
+}
+
 export function formatCompact(value: number): string {
   return new Intl.NumberFormat('en-US', {
     notation: 'compact',

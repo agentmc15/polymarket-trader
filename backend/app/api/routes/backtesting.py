@@ -196,9 +196,9 @@ class TradeMetrics(BaseModel):
     """Trade statistics for one COMPLETED run.
 
     `None` MEANS "NOT COMPUTED", AND IS THE ONLY HONEST WAY TO SAY IT
-    (T33, GUARDRAILS.md §1.7). Before T33 every field here defaulted to
-    `0.0` and `get_backtest_status` populated two of them, so a metric
-    that had never been computed left this endpoint as a `0.0`
+    (T33/T36, GUARDRAILS.md §1.7). Before T33 every field here defaulted
+    to `0.0` and `get_backtest_status` populated two of them, so a
+    metric that had never been computed left this endpoint as a `0.0`
     indistinguishable from a measured zero — which is exactly why the
     frontend refused to render seven of these nine fields at all. The
     unpopulated fields are now nullable and are filled from
@@ -207,12 +207,15 @@ class TradeMetrics(BaseModel):
     `_recompute_metrics`); when that is not possible they stay `None`
     rather than becoming a zero.
 
-    `total_trades` and `win_rate` keep their non-null types and come
-    from the `BacktestRun` COLUMNS, as before — those are the numbers
-    the run itself recorded, and for a sweep PARENT row (whose
+    `total_trades` is the only field that keeps a non-null type: it
+    comes from the `BacktestRun` COLUMN, always a real (possibly `0`)
+    count the run itself recorded, and for a sweep PARENT row (whose
     `equity_curve`/`trades_list` are empty because the results live on
     its children) the column is the only meaningful `total_trades`
-    there is.
+    there is. `win_rate` (T36) is also column-backed but IS nullable:
+    the column itself is `NULL` on exactly that same sweep-parent row,
+    and reporting `0.0` there would claim a measured 0% win rate that
+    was never computed.
 
     Attributes:
         profit_factor: Gross profit / gross loss. `999.99` is
@@ -224,7 +227,7 @@ class TradeMetrics(BaseModel):
     total_trades: int = 0
     winning_trades: int | None = None
     losing_trades: int | None = None
-    win_rate: float = 0.0
+    win_rate: float | None = None
     profit_factor: float | None = None
     avg_win: float | None = None
     avg_loss: float | None = None
@@ -236,10 +239,12 @@ class RiskMetrics(BaseModel):
     """Risk statistics for one COMPLETED run.
 
     Same `None`-means-not-computed contract as `TradeMetrics`, same
-    reason. `sharpe_ratio`/`max_drawdown` come from the `BacktestRun`
-    columns; the other three are recomputed by `_recompute_metrics` and
-    are `None` when the persisted equity curve cannot support the
-    calculation.
+    reason. `sharpe_ratio`/`max_drawdown` (T36) are column-backed, same
+    as `win_rate` above, and nullable for the same reason: the columns
+    are `NULL` on a sweep parent, and `0.0` would claim a measured zero
+    Sharpe ratio / drawdown that was never computed. The other three are
+    recomputed by `_recompute_metrics` and are `None` when the persisted
+    equity curve cannot support the calculation.
 
     Attributes:
         sortino_ratio: `calculate_metrics` leaves this at `0.0` when
@@ -251,9 +256,9 @@ class RiskMetrics(BaseModel):
             `-0.02` = -2%). Negative for any run that had a losing day.
     """
 
-    sharpe_ratio: float = 0.0
+    sharpe_ratio: float | None = None
     sortino_ratio: float | None = None
-    max_drawdown: float = 0.0
+    max_drawdown: float | None = None
     max_drawdown_pct: float | None = None
     volatility: float | None = None
     var_95: float | None = None
@@ -738,19 +743,22 @@ async def get_backtest_status(
     risk_metrics = None
 
     if backtest.status == BacktestRunStatus.COMPLETED:
-        # T33: the four fields `BacktestRun` persists as columns still
-        # come from the columns (they are what the run itself recorded);
-        # the other eleven are recomputed from the same persisted
-        # `equity_curve`/`trades_list` the run's own metrics came from,
-        # and are `None` — never `0.0` — when that is not possible. See
-        # `_recompute_metrics` and `TradeMetrics`' docstring.
+        # T33/T36: the four fields `BacktestRun` persists as columns
+        # still come from the columns (they are what the run itself
+        # recorded), and, as of T36, come through AS PERSISTED — a
+        # `NULL` column (a sweep parent) reports `None`, never a
+        # coerced `0.0`. The other eleven are recomputed from the same
+        # persisted `equity_curve`/`trades_list` the run's own metrics
+        # came from, and are likewise `None` when that is not possible.
+        # See `_recompute_metrics` and `TradeMetrics`'/`RiskMetrics`'
+        # docstrings.
         recomputed = _recompute_metrics(backtest)
         derived = recomputed.metrics if recomputed is not None else None
         closed = recomputed.has_closing_trades if recomputed is not None else False
 
         trade_metrics = TradeMetrics(
             total_trades=backtest.total_trades,
-            win_rate=backtest.win_rate or 0.0,
+            win_rate=backtest.win_rate,
             winning_trades=derived.winning_trades if derived else None,
             losing_trades=derived.losing_trades if derived else None,
             profit_factor=derived.profit_factor if derived and closed else None,
@@ -761,8 +769,8 @@ async def get_backtest_status(
         )
 
         risk_metrics = RiskMetrics(
-            sharpe_ratio=backtest.sharpe_ratio or 0.0,
-            max_drawdown=backtest.max_drawdown or 0.0,
+            sharpe_ratio=backtest.sharpe_ratio,
+            max_drawdown=backtest.max_drawdown,
             sortino_ratio=derived.sortino_ratio if derived else None,
             max_drawdown_pct=derived.max_drawdown_pct if derived else None,
             volatility=derived.volatility if derived else None,

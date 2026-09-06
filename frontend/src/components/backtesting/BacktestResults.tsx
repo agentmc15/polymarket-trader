@@ -9,7 +9,13 @@ import {
   ReferenceLine,
 } from 'recharts';
 import { cn } from '../../utils/cn';
-import { formatCurrency, formatPercent, formatNumber, formatDateTime } from '../../utils/format';
+import {
+  formatCurrency,
+  formatPercent,
+  formatNumber,
+  formatDateTime,
+  formatMetric,
+} from '../../utils/format';
 import { DepthSourceBadge, FillAtBadge } from './DepthBadges';
 import type {
   BacktestReport,
@@ -196,9 +202,12 @@ export function BacktestResults({
           populates today (`total_return`/`total_return_pct` top-level,
           `risk_metrics.sharpe_ratio`/`max_drawdown`,
           `trade_metrics.win_rate`/`total_trades`) — see `TradeMetrics`/
-          `RiskMetrics`'s doc comments in types/index.ts for why the
-          rest of those pydantic models isn't rendered as if it were a
-          measured number. */}
+          `RiskMetrics`'s doc comments in types/index.ts. Every one of
+          these except `total_trades` is `number | null` — `null` means
+          "not computed" (a sweep parent, or a column the DB never
+          filled) and MUST render as `'-'` via `formatMetric`, never as
+          if it had run through `* 100`/`.toFixed()` unguarded (that
+          coerces `null` to a silent `0` in JS). */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <MetricCard
           label="Total Return"
@@ -209,20 +218,20 @@ export function BacktestResults({
         />
         <MetricCard
           label="Sharpe Ratio"
-          value={formatNumber(riskMetrics.sharpe_ratio, 2)}
-          isPositive={riskMetrics.sharpe_ratio > 1}
-          isNegative={riskMetrics.sharpe_ratio < 0}
+          value={formatMetric(riskMetrics.sharpe_ratio, (v) => formatNumber(v, 2))}
+          isPositive={riskMetrics.sharpe_ratio !== null && riskMetrics.sharpe_ratio > 1}
+          isNegative={riskMetrics.sharpe_ratio !== null && riskMetrics.sharpe_ratio < 0}
         />
         <MetricCard
           label="Max Drawdown"
-          value={formatPercent(riskMetrics.max_drawdown * 100)}
-          isNegative={riskMetrics.max_drawdown > 0}
+          value={formatMetric(riskMetrics.max_drawdown, (v) => formatPercent(v * 100))}
+          isNegative={riskMetrics.max_drawdown !== null && riskMetrics.max_drawdown > 0}
         />
         <MetricCard
           label="Win Rate"
-          value={formatPercent(tradeMetrics.win_rate * 100)}
+          value={formatMetric(tradeMetrics.win_rate, (v) => formatPercent(v * 100))}
           subValue={`${tradeMetrics.total_trades} trades`}
-          isPositive={tradeMetrics.win_rate > 0.5}
+          isPositive={tradeMetrics.win_rate !== null && tradeMetrics.win_rate > 0.5}
         />
       </div>
 
@@ -315,9 +324,18 @@ export function BacktestResults({
           title="Trading"
           metrics={[
             { label: 'Total Trades', value: tradeMetrics.total_trades.toString() },
-            { label: 'Win Rate', value: formatPercent(tradeMetrics.win_rate * 100) },
-            { label: 'Sharpe Ratio', value: formatNumber(riskMetrics.sharpe_ratio, 2) },
-            { label: 'Max Drawdown', value: formatPercent(riskMetrics.max_drawdown * 100) },
+            {
+              label: 'Win Rate',
+              value: formatMetric(tradeMetrics.win_rate, (v) => formatPercent(v * 100)),
+            },
+            {
+              label: 'Sharpe Ratio',
+              value: formatMetric(riskMetrics.sharpe_ratio, (v) => formatNumber(v, 2)),
+            },
+            {
+              label: 'Max Drawdown',
+              value: formatMetric(riskMetrics.max_drawdown, (v) => formatPercent(v * 100)),
+            },
           ]}
         />
       </div>
