@@ -460,19 +460,197 @@ def _is_the_proposed_value(kw: ast.keyword) -> bool:
     )
 
 
+def _attribute_targets(target: ast.expr) -> list[ast.Attribute]:
+    """Every `ast.Attribute` an assignment target ultimately binds.
+
+    A plain `existing.status = ...` target IS the attribute. A tuple/list
+    target — `existing.status, existing.reviewed_by = ...` — binds several
+    at once, and a walk that only inspected `node.targets` at the top
+    level (the pre-T39 rule) never looked inside the tuple, so a
+    multi-assign was a free bypass (T39 F3, form 2).
+    """
+    if isinstance(target, ast.Attribute):
+        return [target]
+    if isinstance(target, ast.Tuple | ast.List):
+        return [attr for elt in target.elts for attr in _attribute_targets(elt)]
+    return []
+
+
+def _dict_literal_lifecycle_keys(node: ast.expr) -> list[str]:
+    """Lifecycle column names appearing as literal keys in a dict literal.
+
+    Only literal string keys are visible here — `{lifecycle_var: value}`
+    (the key itself computed) is exactly the undecidable case this fence
+    admits it cannot see; see `test_the_matching_package_cannot_write_a_
+    lifecycle_value`'s docstring.
+    """
+    if not isinstance(node, ast.Dict):
+        return []
+    return [
+        key.value
+        for key in node.keys
+        if isinstance(key, ast.Constant) and key.value in LIFECYCLE_COLUMNS
+    ]
+
+
+def _is_dunder_dict_update(func: ast.expr) -> bool:
+    """Whether `func` is `<anything>.__dict__.update` (T39 F3, form 4)."""
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "update"
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == "__dict__"
+    )
+
+
+def _docstring_constant_ids(tree: ast.Module) -> set[int]:
+    """`id()` of every module/class/function docstring's `Constant` node.
+
+    So the literal-`"approved"` rule does not fire on the word appearing
+    in prose (this very docstring says it), only on the value appearing
+    as data.
+    """
+    return {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(
+            node,
+            ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+        )
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)
+    }
+
+
+def _lifecycle_findings(tree: ast.Module, filename: str) -> list[str]:
+    """Every lifecycle-write spelling this fence knows how to see.
+
+    T39 F3: a red-team pass appended seven different syntactic spellings
+    of a lifecycle write to a COPY of `persist.py`, and the pre-T39
+    version of this fence (`ast.Assign` to a bare `ast.Attribute` target;
+    an `EventLink(...)`/`.values(...)` keyword with a non-`None` `arg`;
+    the bare constant `"approved"`) found none of them, because every one
+    of the seven sourced its value from `get_args(EventLinkStatus)[1]`
+    rather than the literal string, and used a syntactic shape rule 2/3
+    never looked at. Six of the seven are closed here:
+
+    1. `setattr(existing, "status", _CLEARED)`
+    2. `existing.status, existing.reviewed_by = _CLEARED, who` (tuple target)
+    3. `existing.status: str = _CLEARED` (`ast.AnnAssign`, not `ast.Assign`)
+    4. `existing.__dict__.update({"status": _CLEARED, ...})`
+    6. `session.execute(update(EventLink), [{"id": i, "status": _CLEARED}])`
+       (an executemany params list, no `.values()` call to match on)
+    7. `EventLink(**{"status": _CLEARED, ...})` (`keyword(arg=None)`)
+
+    THE ONE THIS FENCE CANNOT SEE, ON PURPOSE, ADMITTED RATHER THAN
+    HIDDEN: form 5, `for column, value in payload.items(): setattr(
+    existing, column, value)`. The written-to name is a runtime value —
+    it might be `"status"` on some iteration and never on another — and
+    no static walk over the source can decide that without running it.
+    An AST fence is a syntactic check; a fully dynamic write like
+    `setattr(obj, name_from_config, value_from_db)` is undecidable by
+    construction, not merely unhandled. This fence closes every
+    spelling that names its target lifecolumn as source-level text and
+    stops there — the runtime guards (`persist_proposals`'s `ValueError`
+    refusal of any non-`PROPOSED` row, and `LinkBook` reading only
+    reviewed links) are what still stand between form 5 and a trade, and
+    they are unaffected by anything here.
+
+    Args:
+        tree: A parsed module.
+        filename: Name to prefix each finding with (`path.name`, so a
+            finding reads the same whether `path` is a real source file
+            or a `tmp_path` copy carrying appended bypass forms).
+
+    Returns:
+        list[str]: One entry per violation found, empty if none.
+    """
+    docstrings = _docstring_constant_ids(tree)
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and node.value == "approved"
+            and id(node) not in docstrings
+        ):
+            findings.append(f"{filename}:{node.lineno}: literal 'approved'")
+
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                for attr in _attribute_targets(target):
+                    if attr.attr in LIFECYCLE_COLUMNS:
+                        findings.append(
+                            f"{filename}:{node.lineno}: assigns .{attr.attr}"
+                        )
+
+        if isinstance(node, ast.AnnAssign):
+            for attr in _attribute_targets(node.target):
+                if attr.attr in LIFECYCLE_COLUMNS:
+                    findings.append(
+                        f"{filename}:{node.lineno}: annotated-assigns .{attr.attr}"
+                    )
+
+        if isinstance(node, ast.Call):
+            func = node.func
+
+            if _writes_a_link(node):
+                for kw in node.keywords:
+                    if kw.arg in LIFECYCLE_COLUMNS and not _is_the_proposed_value(kw):
+                        findings.append(
+                            f"{filename}:{node.lineno}: writes {kw.arg}="
+                            f"{ast.dump(kw.value)[:40]}"
+                        )
+                    elif kw.arg is None:
+                        for key in _dict_literal_lifecycle_keys(kw.value):
+                            findings.append(
+                                f"{filename}:{node.lineno}: **dict unpack "
+                                f"writes {key}="
+                            )
+
+            if isinstance(func, ast.Name) and func.id == "setattr" and len(
+                node.args
+            ) >= 2:
+                name_arg = node.args[1]
+                if (
+                    isinstance(name_arg, ast.Constant)
+                    and name_arg.value in LIFECYCLE_COLUMNS
+                ):
+                    findings.append(
+                        f"{filename}:{node.lineno}: setattr(..., "
+                        f"{name_arg.value!r}, ...)"
+                    )
+
+            if _is_dunder_dict_update(func):
+                for arg in node.args:
+                    for key in _dict_literal_lifecycle_keys(arg):
+                        findings.append(
+                            f"{filename}:{node.lineno}: __dict__.update writes "
+                            f"{key}="
+                        )
+
+            if isinstance(func, ast.Attribute) and func.attr == "execute":
+                for arg in node.args:
+                    if isinstance(arg, ast.List | ast.Tuple):
+                        for elt in arg.elts:
+                            for key in _dict_literal_lifecycle_keys(elt):
+                                findings.append(
+                                    f"{filename}:{node.lineno}: bulk execute(...) "
+                                    f"params write {key}="
+                                )
+
+    return findings
+
+
 def test_the_matching_package_cannot_write_a_lifecycle_value() -> None:
     """A source fence, so this cannot rot back in silently.
 
-    Two AST rules over `app/services/matching/` and the beat module:
-
-    1. No non-docstring string constant reads `"approved"` — the value
-       itself may not appear as data anywhere in the proposing code.
-    2. No assignment to a persisted row's `status`/`reviewed_by`/
-       `reviewed_at` anywhere.
-    3. No `EventLink(...)`/`.values(...)` call passing a lifecycle
-       column, except `status=PROPOSED` on a brand-new row. Mutating
-       those columns is a review decision, and review decisions live in
-       `app/api/routes/links.py`.
+    See `_lifecycle_findings` for exactly which spellings of a lifecycle
+    write this catches (six, closed by T39 F3) and the one it admits it
+    cannot (form 5, a fully dynamic `setattr`) — stated there rather than
+    implied here, because a fence that does not say what it cannot see
+    reads as complete when it is not.
     """
     paths = sorted((APP_ROOT / "services" / "matching").glob("*.py"))
     paths.append(APP_ROOT / "tasks" / "matching.py")
@@ -480,44 +658,123 @@ def test_the_matching_package_cannot_write_a_lifecycle_value() -> None:
 
     findings: list[str] = []
     for path in paths:
-        tree = ast.parse(path.read_text())
-        docstrings = {
-            id(node.body[0].value)
-            for node in ast.walk(tree)
-            if isinstance(
-                node,
-                ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
-            )
-            and node.body
-            and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-            and isinstance(node.body[0].value.value, str)
-        }
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Constant)
-                and node.value == "approved"
-                and id(node) not in docstrings
-            ):
-                findings.append(f"{path.name}:{node.lineno}: literal 'approved'")
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if (
-                        isinstance(target, ast.Attribute)
-                        and target.attr in LIFECYCLE_COLUMNS
-                    ):
-                        findings.append(
-                            f"{path.name}:{node.lineno}: assigns .{target.attr}"
-                        )
-            if isinstance(node, ast.Call) and _writes_a_link(node):
-                for kw in node.keywords:
-                    if kw.arg in LIFECYCLE_COLUMNS and not _is_the_proposed_value(kw):
-                        findings.append(
-                            f"{path.name}:{node.lineno}: writes {kw.arg}="
-                            f"{ast.dump(kw.value)[:40]}"
-                        )
+        findings.extend(_lifecycle_findings(ast.parse(path.read_text()), path.name))
 
     assert findings == [], findings
+
+
+def _pre_t39_findings(tree: ast.Module, filename: str) -> list[str]:
+    """The rule set this fence ran BEFORE T39, reproduced verbatim.
+
+    Kept only so `test_the_extended_fence_catches_the_bypass_spellings_
+    the_old_one_missed` can show it found nothing against the seven
+    bypass forms — the red half of that test's red/green proof. Not
+    derived from `_lifecycle_findings`; if it were, "the old rules" could
+    accidentally regain the new coverage the day someone refactors.
+    """
+    docstrings = _docstring_constant_ids(tree)
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and node.value == "approved"
+            and id(node) not in docstrings
+        ):
+            findings.append(f"{filename}:{node.lineno}: literal 'approved'")
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr in LIFECYCLE_COLUMNS
+                ):
+                    findings.append(
+                        f"{filename}:{node.lineno}: assigns .{target.attr}"
+                    )
+        if isinstance(node, ast.Call) and _writes_a_link(node):
+            for kw in node.keywords:
+                if kw.arg in LIFECYCLE_COLUMNS and not _is_the_proposed_value(kw):
+                    findings.append(
+                        f"{filename}:{node.lineno}: writes {kw.arg}="
+                        f"{ast.dump(kw.value)[:40]}"
+                    )
+    return findings
+
+
+def test_the_extended_fence_catches_the_bypass_spellings_the_old_one_missed(
+    tmp_path: Path,
+) -> None:
+    """T39 F3's own red/green proof, against a COPY, never the tracked file.
+
+    The seven forms from the red-team pass are appended to a copy of the
+    real `persist.py` under `tmp_path`. RED: `_pre_t39_findings` (the
+    rule set before this task) finds NOTHING in it — the exact false
+    confidence the finding described. GREEN: `_lifecycle_findings` (what
+    `test_the_matching_package_cannot_write_a_lifecycle_value` now runs)
+    flags all six closable forms by line, and — proving the admission in
+    its docstring is a fact and not just a claim — flags NEITHER line of
+    form 5, the one spelling this fence cannot and does not pretend to
+    catch.
+    """
+    source = (APP_ROOT / "services" / "matching" / "persist.py").read_text()
+    bypass = '''
+
+async def _t39_f3_bypass_forms(existing, who, payload, session, i):
+    """Seven spellings of a lifecycle write.
+
+    None sources its value from the literal string "approved" -- exactly
+    as in the real red-team probe, every one instead reads
+    `get_args(EventLinkStatus)[1]`, so a rule that only looked for the
+    bare literal would find nothing here either way.
+    """
+    _CLEARED = get_args(EventLinkStatus)[1]
+    setattr(existing, "status", _CLEARED)                                    # form 1
+    existing.status, existing.reviewed_by = _CLEARED, who                    # form 2
+    existing.status: str = _CLEARED                                         # form 3
+    existing.__dict__.update({"status": _CLEARED, "reviewed_by": who})       # form 4
+    for column, value in payload.items():                                   # form 5
+        setattr(existing, column, value)                                    # form 5 (undecidable)
+    await session.execute(update(EventLink), [{"id": i, "status": _CLEARED}])  # form 6
+    EventLink(**{"status": _CLEARED, "reviewed_by": who})                   # form 7
+'''
+    copy_path = tmp_path / "persist.py"
+    copy_path.write_text(source + bypass)
+    tree = ast.parse(copy_path.read_text())
+
+    # RED: the pre-T39 rules see none of the seven forms.
+    assert _pre_t39_findings(tree, copy_path.name) == []
+
+    # GREEN: the extended rules see six of the seven, by line.
+    findings = _lifecycle_findings(tree, copy_path.name)
+    appended_lines = {
+        i
+        for i, line in enumerate(
+            copy_path.read_text().splitlines(), start=1
+        )
+        if "form 1" in line
+        or "form 2" in line
+        or "form 3" in line
+        or "form 4" in line
+        or "form 6" in line
+        or "form 7" in line
+    }
+    flagged_lines = {
+        int(finding.split(":")[1]) for finding in findings
+    }
+    assert appended_lines, "the six closable forms must be present in the fixture"
+    assert appended_lines <= flagged_lines, (appended_lines - flagged_lines, findings)
+
+    form_5_lines = {
+        i
+        for i, line in enumerate(
+            copy_path.read_text().splitlines(), start=1
+        )
+        if "form 5" in line
+    }
+    assert len(form_5_lines) == 2
+    assert not (form_5_lines & flagged_lines), (
+        "form 5 is the admitted, undecidable case -- it must NOT be flagged "
+        "by a rule that got lucky, or the docstring's honesty claim is false"
+    )
 
 
 # ---------------------------------------------------------------------------
