@@ -2,22 +2,32 @@
 
 Provides clients for fetching data from Polymarket's various APIs
 and methods for syncing data to the database.
+
+`collect_books` (T21, PLAN.md D6/D10) is the one method on this class
+that talks to a venue through the `app.venues.base.MarketDataAdapter`
+seam rather than through `GammaAPIClient`/`CLOBDataClient` — it is the
+only method here that runs on BOTH venues, since `BookSnapshot` depth is
+needed on both Polymarket and Kalshi for a recorded-book backtest.
 """
-from datetime import datetime, timedelta
-from typing import Any
 import asyncio
 import logging
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from typing import Any
 
 import httpx
-from sqlalchemy import select, and_
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
+from app.models.book_snapshot import BookSnapshot
 from app.models.market import Market
 from app.models.price_history import PriceHistory
-from app.models.trade_history import TradeHistory, TradeSide, TradeOutcome
-from app.models.tracked_trader import TrackedTrader
-
+from app.models.trade_history import TradeHistory, TradeOutcome, TradeSide
+from app.strategies.base import outcome_key
+from app.venues.base import MarketDataAdapter, VenueError
+from app.venues.types import OrderBook, VenueId, VenueMarket
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +36,30 @@ logger = logging.getLogger(__name__)
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 CLOB_API_BASE = "https://clob.polymarket.com"
 DATA_API_BASE = "https://data-api.polymarket.com"
+
+
+def _book_collection_volume(market: VenueMarket) -> float:
+    """Return the best available 24h-volume proxy for `collect_books` ranking.
+
+    Mirrors `app.services.scanner._volume` exactly: `VenueMarket` has no
+    normalized `volume_24h` field, but both real venues' raw payloads
+    carry a `"volume"` key (`tests/fixtures/polymarket/gamma_markets.json`,
+    `tests/fixtures/kalshi/markets.json`), so this reads
+    `VenueMarket.raw["volume"]` rather than inventing a second, competing
+    ranking key for the same "top-N markets by volume" purpose.
+
+    Args:
+        market: The market to rank.
+
+    Returns:
+        float: `market.raw["volume"]` coerced to `float`; `0.0` if the
+            key is absent or not numeric.
+    """
+    raw_volume = market.raw.get("volume")
+    try:
+        return float(raw_volume)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class GammaAPIClient:
@@ -254,7 +288,7 @@ class CLOBDataClient:
         client = await self._get_client()
 
         try:
-            response = await client.get(f"/price", params={"token_id": token_id})
+            response = await client.get("/price", params={"token_id": token_id})
             if response.status_code == 404:
                 return None
             response.raise_for_status()
@@ -412,15 +446,14 @@ class CLOBDataClient:
 
 
 class PolymarketDataClient:
-    """Client for Polymarket Data API (leaderboard and trader data).
+    """Client for Polymarket Data API (public trade tape).
 
-    The Data API provides historical trade data, leaderboards,
-    and trader analytics.
+    The Data API provides historical trade data for markets. Per-wallet
+    endpoints (ranked wallet standings, individual wallet profile/trades/
+    positions) supporting copy-trading were removed deliberately: see the
+    `DataCollector` docstring below.
 
     Endpoints:
-        GET /leaderboard - Top traders
-        GET /traders/{address} - Trader profile
-        GET /traders/{address}/trades - Trader trade history
         GET /markets/{id}/trades - Market trade history
     """
 
@@ -456,89 +489,6 @@ class PolymarketDataClient:
         """Close the HTTP client."""
         if self._client and not self._client.is_closed:
             await self._client.aclose()
-
-    async def get_leaderboard(
-        self,
-        period: str = "all",
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        """Fetch trader leaderboard.
-
-        Args:
-            period: Time period ('day', 'week', 'month', 'all').
-            limit: Maximum traders to return.
-            offset: Pagination offset.
-
-        Returns:
-            List of trader dictionaries sorted by PnL.
-        """
-        client = await self._get_client()
-
-        try:
-            response = await client.get(
-                "/leaderboard",
-                params={
-                    "period": period,
-                    "limit": limit,
-                    "offset": offset,
-                },
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Failed to fetch leaderboard: {e}")
-            return []
-
-    async def get_trader(self, address: str) -> dict[str, Any] | None:
-        """Fetch trader profile.
-
-        Args:
-            address: Wallet address.
-
-        Returns:
-            Trader data or None.
-        """
-        client = await self._get_client()
-
-        try:
-            response = await client.get(f"/traders/{address}")
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Failed to fetch trader {address}: {e}")
-            return None
-
-    async def get_trader_trades(
-        self,
-        address: str,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        """Fetch trader's trade history.
-
-        Args:
-            address: Wallet address.
-            limit: Maximum trades to return.
-            offset: Pagination offset.
-
-        Returns:
-            List of trade dictionaries.
-        """
-        client = await self._get_client()
-
-        try:
-            response = await client.get(
-                f"/traders/{address}/trades",
-                params={"limit": limit, "offset": offset},
-            )
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Failed to fetch trades for {address}: {e}")
-            return []
 
     async def get_market_trades(
         self,
@@ -583,31 +533,19 @@ class PolymarketDataClient:
             logger.error(f"Failed to fetch trades for market {market_id}: {e}")
             return []
 
-    async def get_trader_positions(self, address: str) -> list[dict[str, Any]]:
-        """Fetch trader's current positions.
-
-        Args:
-            address: Wallet address.
-
-        Returns:
-            List of position dictionaries.
-        """
-        client = await self._get_client()
-
-        try:
-            response = await client.get(f"/traders/{address}/positions")
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Failed to fetch positions for {address}: {e}")
-            return []
-
 
 class DataCollector:
     """Orchestrates data collection from all Polymarket APIs.
 
-    Provides high-level methods for syncing market data,
-    collecting price snapshots, and tracking traders.
+    Provides high-level methods for syncing market data and collecting
+    price snapshots. Copy-trading support (mirroring a tracked wallet's
+    trades, sourced from a ranked-standings feed of past performance) was
+    removed deliberately: on prediction markets a single wallet's realized
+    trades are too few, too correlated (same events, same news), and too
+    survivorship-selected (a ranked-standings view shows winners after
+    the fact) to distinguish skill from variance, and a copier also pays
+    the latency and slippage the leader did not. `TradeHistory` (the
+    public trade tape) is unaffected and remains in use by replay/backfill.
 
     Example:
         ```python
@@ -852,7 +790,7 @@ class DataCollector:
         logger.info("Collecting prices for all active markets...")
 
         # Get all active markets
-        query = select(Market).where(Market.is_active == True)
+        query = select(Market).where(Market.is_active)
         result = await self.session.execute(query)
         markets = result.scalars().all()
 
@@ -866,7 +804,7 @@ class DataCollector:
             tasks = [self.collect_price_snapshot(mid) for mid in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for mid, result in zip(batch, results):
+            for mid, result in zip(batch, results, strict=True):
                 if result is True:
                     collected += 1
                 elif isinstance(result, Exception):
@@ -879,6 +817,218 @@ class DataCollector:
 
         logger.info(f"Collected {collected} price snapshots")
         return collected
+
+    async def collect_books(
+        self,
+        adapters: Mapping[VenueId, MarketDataAdapter],
+        market_ids_per_venue: Mapping[VenueId, Sequence[str]],
+        session: AsyncSession,
+    ) -> int:
+        """Record order-book depth for the top-N-by-volume markets, per venue.
+
+        `PriceHistory`/`collect_price_snapshot` above record only
+        top-of-book for Polymarket; this method is the other half of
+        PLAN.md D6/D10 — it records the REAL, full order book so
+        `app.services.backtesting.data_replay.DataReplayer` can attach a
+        `depth_source="recorded"` book instead of always falling back to
+        `app.execution.fill_engine.synthesize_book`'s fabricated one.
+        Unlike every other method on this class it runs over BOTH
+        venues, through the `app.venues.base.MarketDataAdapter` seam
+        (never `GammaAPIClient`/`CLOBDataClient`), because Kalshi depth
+        is exactly as necessary as Polymarket depth for a cross-venue
+        backtest.
+
+        For each venue in `adapters`: fetches `VenueMarket` for every id
+        in `market_ids_per_venue[venue]` (candidates the CALLER selects —
+        e.g. every currently-open market on that venue; this method does
+        not enumerate a venue's market list itself), ranks the markets
+        that resolved by the same volume proxy
+        `app.services.scanner._volume` uses
+        (`VenueMarket.raw["volume"]`, `0.0` if absent/non-numeric), and
+        keeps the top `settings.book_collection_top_n`. For EACH of those
+        markets' `outcomes` — every outcome the venue payload carries,
+        not only `"YES"`/`"NO"` (T21 carry-forward 1: a multi-outcome
+        bundle market needs a book per named outcome, e.g. a candidate in
+        an election market) — fetches `adapter.get_book(market_id,
+        outcome)` and persists one `BookSnapshot` row.
+
+        A single market's `get_market` failing, or a single outcome's
+        `get_book` failing (`VenueError` — a 404, a rate limit, a
+        malformed payload), is logged and skipped; it never aborts the
+        whole call the way one bad market must not blank out an entire
+        venue's collection.
+
+        Idempotent: re-running this over data that has not moved writes
+        no duplicate row. `_upsert_book_snapshot` does this by
+        CHECK-THEN-INSERT (query the natural key `(venue, market_id,
+        outcome, ts)`, skip if a row is already there) rather than a
+        database-native `ON CONFLICT` clause — SQLAlchemy's
+        `postgresql.insert(...).on_conflict_do_update` (already used by
+        `_upsert_market` above) has no equivalent that compiles on
+        SQLite, and GUARDRAILS.md/T21 require this method to pass on
+        SQLite too. A second collection run reading the SAME book (e.g.
+        `tests.venues.fixture_adapter.FixtureAdapter`, whose `get_book`
+        is deliberately static) reports the identical `(venue, market_id,
+        outcome, ts)` and is therefore a genuine no-op, not a duplicate
+        row.
+
+        Commits once at the end of the call (matching
+        `collect_price_snapshot`/`collect_all_prices` above, unlike
+        `app.services.scanner.scan`'s "caller commits" convention) so the
+        rows this call wrote are durable even when the caller opens a
+        fresh session on its next invocation, as
+        `app.scripts.collect_prices`'s loop does.
+
+        Args:
+            adapters: One READ-ONLY `MarketDataAdapter` per venue —
+                exactly `app.services.scanner.scan`'s own `adapters`
+                parameter, obtained from
+                `app.venues.registry.get_read_adapter`/
+                `app.api.deps.get_market_data_adapters`, never
+                `get_adapter`, so this can never acquire an
+                order-placing adapter (GUARDRAILS.md §1.1).
+            market_ids_per_venue: Candidate market ids to consider, per
+                venue. A venue absent from `adapters` is skipped with a
+                warning rather than raising.
+            session: Session to persist `BookSnapshot` rows on. This
+                call commits it once at the end (see above) — it is a
+                parameter, not `self.session`, so a caller already
+                holding its own session (e.g. one shared with a price
+                collection pass in the same loop iteration) can reuse
+                it.
+
+        Returns:
+            int: Number of NEW `BookSnapshot` rows written (duplicates
+                skipped by the idempotency check are not counted).
+        """
+        written = 0
+        for venue, market_ids in market_ids_per_venue.items():
+            adapter = adapters.get(venue)
+            if adapter is None:
+                logger.warning(
+                    f"collect_books: no adapter registered for venue "
+                    f"{venue!r}; skipping {len(market_ids)} candidate market(s)",
+                    extra={"venue": venue},
+                )
+                continue
+
+            markets: list[VenueMarket] = []
+            for market_id in market_ids:
+                try:
+                    markets.append(await adapter.get_market(market_id))
+                except VenueError as exc:
+                    logger.warning(
+                        f"collect_books: get_market failed for {market_id}: {exc}",
+                        extra={"venue": venue, "market_id": market_id},
+                    )
+
+            top_markets = sorted(
+                markets, key=_book_collection_volume, reverse=True
+            )[: settings.book_collection_top_n]
+
+            for market in top_markets:
+                for outcome in market.outcomes:
+                    try:
+                        book = await adapter.get_book(market.market_id, outcome)
+                    except VenueError as exc:
+                        logger.debug(
+                            f"collect_books: get_book failed for "
+                            f"{market.market_id}/{outcome}: {exc}",
+                            extra={
+                                "venue": venue,
+                                "market_id": market.market_id,
+                                "outcome": outcome,
+                            },
+                        )
+                        continue
+                    if await self._upsert_book_snapshot(session, book, market):
+                        written += 1
+
+        await session.commit()
+        logger.info(f"Collected {written} new book snapshot(s)")
+        return written
+
+    async def _upsert_book_snapshot(
+        self,
+        session: AsyncSession,
+        book: OrderBook,
+        market: VenueMarket,
+    ) -> bool:
+        """Insert one `BookSnapshot` row unless its natural key already exists.
+
+        See `collect_books`'s docstring for why this is a check-then-
+        insert rather than a database-native `ON CONFLICT` clause: the
+        pattern must work identically on SQLite (tests) and Postgres
+        (production), and SQLAlchemy's async ORM session has no single
+        `ON CONFLICT` construct that compiles on both without a dialect
+        branch. The `SELECT` executed here also triggers SQLAlchemy's
+        autoflush of any row `session.add()`-ed earlier in this same
+        call, so two outcomes of the same market (or a duplicate id
+        appearing twice in one candidate list) cannot double-insert
+        within a single `collect_books` call either.
+
+        `book.outcome` is canonicalized through
+        `app.strategies.base.outcome_key()` before either the existence
+        check or the insert: a concrete adapter's `get_book` echoes back
+        whatever casing the CALLER passed it (Polymarket's real payload
+        spells outcomes `"Yes"`/`"No"`, not `"YES"`/`"NO"`) — so a
+        `BookSnapshot` row keyed by the raw casing would never match the
+        outcome `data_replay.py`'s lookup actually asks for.
+
+        T21d defect 6: this used `normalize_outcome()`, which
+        canonicalizes `"YES"`/`"NO"` and NOTHING ELSE, so the module
+        docstring's guarantee that a lookup "can never miss a row purely
+        because of a casing mismatch between two venues' payloads" held
+        for exactly the binary case that did not need it. Four
+        collections of the SAME book at the SAME `ts`, spelled
+        `"Trump"`/`"TRUMP"`/`"trump"`/`"Trump "`, wrote FOUR rows past a
+        unique constraint that was supposed to make that impossible, and
+        a replay asking for any one spelling found depth for none of the
+        others. `outcome_key()` strips and case-folds every label, so
+        the check-then-insert below now actually dedupes what the
+        constraint says it dedupes.
+
+        Args:
+            session: Session to check against and (on a miss) add to.
+            book: The `OrderBook` just read from the venue.
+            market: The book's parent market, for `tick_size`/`min_size`.
+
+        Returns:
+            bool: `True` if a new row was added, `False` if the natural
+                key `(venue, market_id, outcome, ts)` already existed.
+        """
+        outcome = outcome_key(book.outcome)
+        existing = await session.execute(
+            select(BookSnapshot.id).where(
+                BookSnapshot.venue == book.venue,
+                BookSnapshot.market_id == book.market_id,
+                BookSnapshot.outcome == outcome,
+                BookSnapshot.ts == book.ts,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            return False
+
+        session.add(
+            BookSnapshot(
+                venue=book.venue,
+                market_id=book.market_id,
+                outcome=outcome,
+                ts=book.ts,
+                bids=[
+                    {"price": level.price, "size": level.size}
+                    for level in book.bids
+                ],
+                asks=[
+                    {"price": level.price, "size": level.size}
+                    for level in book.asks
+                ],
+                tick_size=market.tick_size,
+                min_size=market.min_size,
+                depth_source="recorded",
+            )
+        )
+        return True
 
     async def backfill_historical_data(
         self,
@@ -1008,131 +1158,6 @@ class DataCollector:
         )
 
         self.session.add(trade)
-
-    async def update_trader_leaderboard(
-        self,
-        min_pnl: float = 10000.0,
-        min_trades: int = 50,
-        limit: int = 100,
-    ) -> int:
-        """Update tracked traders from leaderboard.
-
-        Args:
-            min_pnl: Minimum PnL to track.
-            min_trades: Minimum trades to track.
-            limit: Maximum traders to fetch.
-
-        Returns:
-            Number of traders updated.
-        """
-        logger.info("Updating trader leaderboard...")
-
-        leaderboard = await self.data.get_leaderboard(
-            period="all",
-            limit=limit,
-        )
-
-        updated = 0
-
-        for trader_data in leaderboard:
-            address = trader_data.get("address") or trader_data.get("wallet")
-            if not address:
-                continue
-
-            total_pnl = float(trader_data.get("pnl") or trader_data.get("profit", 0))
-            total_trades = int(trader_data.get("trades") or trader_data.get("trade_count", 0))
-
-            # Apply filters
-            if total_pnl < min_pnl or total_trades < min_trades:
-                continue
-
-            # Calculate win rate
-            wins = int(trader_data.get("wins") or trader_data.get("winning_trades", 0))
-            win_rate = wins / total_trades if total_trades > 0 else 0
-
-            # Upsert trader
-            stmt = insert(TrackedTrader).values(
-                address=address.lower(),
-                name=trader_data.get("username") or trader_data.get("name"),
-                total_pnl=total_pnl,
-                win_rate=win_rate,
-                total_trades=total_trades,
-                is_active=True,
-                copy_multiplier=1.0,
-            )
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["address"],
-                set_={
-                    "total_pnl": stmt.excluded.total_pnl,
-                    "win_rate": stmt.excluded.win_rate,
-                    "total_trades": stmt.excluded.total_trades,
-                    "updated_at": datetime.utcnow(),
-                },
-            )
-
-            await self.session.execute(stmt)
-            updated += 1
-
-        await self.session.commit()
-        logger.info(f"Updated {updated} tracked traders")
-
-        return updated
-
-    async def get_whale_trades(
-        self,
-        min_pnl: float = 50000.0,
-        lookback_hours: int = 24,
-    ) -> list[dict[str, Any]]:
-        """Get recent trades from whale wallets.
-
-        Args:
-            min_pnl: Minimum total PnL to be considered whale.
-            lookback_hours: Hours to look back.
-
-        Returns:
-            List of whale trade dictionaries.
-        """
-        # Get whale wallets
-        query = select(TrackedTrader).where(
-            and_(
-                TrackedTrader.is_active == True,
-                TrackedTrader.total_pnl >= min_pnl,
-            )
-        )
-        result = await self.session.execute(query)
-        whales = result.scalars().all()
-
-        all_trades = []
-
-        for whale in whales:
-            trades = await self.data.get_trader_trades(
-                address=whale.address,
-                limit=20,
-            )
-
-            cutoff = datetime.utcnow() - timedelta(hours=lookback_hours)
-
-            for trade in trades:
-                trade_time = self._parse_datetime(trade.get("timestamp"))
-                if trade_time and trade_time >= cutoff:
-                    trade["whale_address"] = whale.address
-                    trade["whale_stats"] = {
-                        "address": whale.address,
-                        "total_pnl": whale.total_pnl,
-                        "win_rate": whale.win_rate,
-                        "total_trades": whale.total_trades,
-                    }
-                    all_trades.append(trade)
-
-            await asyncio.sleep(0.1)
-
-        # Sort by timestamp
-        all_trades.sort(
-            key=lambda t: t.get("timestamp", ""),
-            reverse=True,
-        )
-
-        return all_trades
 
     def _parse_datetime(self, value: Any) -> datetime | None:
         """Parse datetime from various formats.

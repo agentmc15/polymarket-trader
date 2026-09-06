@@ -1,12 +1,13 @@
 """Base bot class."""
 import asyncio
+import contextlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from app.strategies.base import BaseStrategy, Signal
+from app.strategies.base import BaseStrategy, Signal, SignalType
 
 
 class BotStatus(str, Enum):
@@ -104,10 +105,8 @@ class BaseBot(ABC):
 
         if self._task:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
 
         await self.config.strategy.cleanup()
         self.state.status = BotStatus.STOPPED
@@ -122,30 +121,62 @@ class BaseBot(ABC):
                 self.state.last_error = str(e)
                 # Log error but continue running
 
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
                     self._stop_event.wait(),
                     timeout=self.config.trading_interval,
                 )
-            except asyncio.TimeoutError:
-                pass
 
     @abstractmethod
     async def _tick(self) -> None:
         """Execute one trading cycle."""
         pass
 
-    @abstractmethod
     async def execute_signal(self, signal: Signal) -> bool:
-        """Execute a trading signal.
+        """Execute a trading signal by routing it through `OrderRouter`.
+
+        Normalizes the one-leg `signal` into an `Intent`
+        (`Signal.to_intent()`, PLAN.md D7 back-compat) and submits it
+        through the SAME app-scoped `OrderRouter` the API layer uses
+        (`app.api.deps.get_router`) — the only path from an intent to a
+        venue order (PLAN.md D4). A bot never calls
+        `adapter.place_order`/`cancel_order` directly (GUARDRAILS.md
+        §1.1); `tests/test_fences.py` confines both to `app/execution/`
+        and `app/venues/`, and `app/bots/` is neither.
+
+        The `get_router` import below is deliberately LOCAL to this
+        method, not at module scope: `app.api.deps` sits behind
+        `app.api`'s package `__init__`, which imports the entire FastAPI
+        route tree (`app/api/routes/*.py`) as a side effect of being
+        imported at all. That is the same reason
+        `app/venues/registry.py` defers ITS adapter imports to
+        first-call time rather than module scope — a bot module that
+        only ever computes signals (under test, or inside a Celery
+        worker that never serves HTTP) should not have to pay for that
+        import merely by being imported.
 
         Args:
-            signal: Signal to execute.
+            signal: Signal to execute. A `HOLD` signal is not an order
+                (`Signal.to_intent()` has no representation for one) and
+                is reported as unsuccessful without reaching the router.
 
         Returns:
-            bool: True if execution was successful.
+            bool: `True` if the intent was not rejected before
+                placement (`RoutedIntent.status` is `"pending"` or
+                `"executed"`) — i.e. at least one attempt reached the
+                venue. `False` if a pre-flight check (risk limits,
+                capital) rejected it, if everything placed and nothing
+                filled (`"expired"`), or if `signal` was `HOLD`.
         """
-        pass
+        if signal.type == SignalType.HOLD:
+            return False
+
+        from app.api.deps import get_router
+
+        intent = signal.to_intent()
+        order_router = await get_router()
+        routed = await order_router.submit(intent, strategy=self.config.strategy.name)
+        return routed.status in ("pending", "executed")
 
     def can_trade(self) -> bool:
         """Check if bot can execute trades.
@@ -157,9 +188,7 @@ class BaseBot(ABC):
             return False
         if self.state.trades_today >= self.config.max_daily_trades:
             return False
-        if abs(self.state.pnl_today) >= self.config.max_daily_loss:
-            return False
-        return True
+        return abs(self.state.pnl_today) < self.config.max_daily_loss
 
     def reset_daily_stats(self) -> None:
         """Reset daily statistics."""

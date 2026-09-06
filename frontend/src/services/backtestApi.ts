@@ -1,13 +1,12 @@
 import axios from 'axios';
 import type { AxiosInstance } from 'axios';
 import type {
-  Backtest,
+  BacktestReport,
   BacktestRequest,
   BacktestTrade,
   BacktestMetrics,
   EquityPoint,
   StrategiesResponse,
-  StrategyInfo,
   BacktestStatus,
 } from '../types';
 
@@ -28,6 +27,16 @@ export interface BacktestStatusResponse {
   completed_at?: string;
   error_message?: string;
   metrics?: BacktestMetrics;
+  //: Registry name the run used, e.g. `"catalyst_momentum"` or, for a
+  //: capital sweep's parent run (T22), `"sweep:<name>"` — `Backtesting`
+  //: uses the `sweep:` prefix to decide whether to render
+  //: `EdgeDecayTable`.
+  strategy_name?: string;
+  //: Trustworthiness/coverage payload (GUARDRAILS.md §1.7). Carries
+  //: `depth_source`/`fill_at` on every completed run (not just a
+  //: sweep's `edge_decay`) — `BacktestResults` labels an ordinary run
+  //: with these; `EdgeDecayTable` labels a sweep's rows.
+  report?: BacktestReport;
 }
 
 export interface EquityCurveResponse {

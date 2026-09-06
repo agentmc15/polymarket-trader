@@ -3,11 +3,10 @@
 Trades pairs of correlated markets to profit from
 temporary divergences while hedging systematic risk.
 """
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from app.strategies.base import BaseStrategy, MarketSnapshot, Signal, SignalType
-
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # Minimum correlation to consider markets related
@@ -120,7 +119,7 @@ class CorrelationHedgingStrategy(BaseStrategy):
 
         correlated = []
 
-        for other_id, other_history in self._price_history.items():
+        for other_id, _other_history in self._price_history.items():
             if other_id == market_id:
                 continue
 
@@ -166,7 +165,7 @@ class CorrelationHedgingStrategy(BaseStrategy):
 
         numerator = sum(
             (a - mean_a) * (b - mean_b)
-            for a, b in zip(prices_a, prices_b)
+            for a, b in zip(prices_a, prices_b, strict=True)
         )
 
         var_a = sum((a - mean_a) ** 2 for a in prices_a)

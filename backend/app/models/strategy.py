@@ -1,11 +1,10 @@
 """Strategy model."""
+import enum
+
 from sqlalchemy import Boolean, Enum, Float, String, Text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base, TimestampMixin
-
-import enum
+from app.models.base import Base, JSONDict, TimestampMixin
 
 
 class StrategyType(str, enum.Enum):
@@ -15,7 +14,6 @@ class StrategyType(str, enum.Enum):
     MOMENTUM = "MOMENTUM"
     MEAN_REVERSION = "MEAN_REVERSION"
     MARKET_MAKING = "MARKET_MAKING"
-    COPY_TRADING = "COPY_TRADING"
     CUSTOM = "CUSTOM"
 
 
@@ -30,8 +28,8 @@ class Strategy(Base, TimestampMixin):
 
     # Strategy configuration
     strategy_type: Mapped[StrategyType] = mapped_column(Enum(StrategyType), nullable=False)
-    parameters: Mapped[dict] = mapped_column(JSONB, default=dict)
-    default_parameters: Mapped[dict] = mapped_column(JSONB, default=dict)
+    parameters: Mapped[dict] = mapped_column(JSONDict, default=dict)
+    default_parameters: Mapped[dict] = mapped_column(JSONDict, default=dict)
 
     # Risk settings
     max_position_size: Mapped[float] = mapped_column(Float, default=1000.0)
@@ -55,4 +53,4 @@ class Strategy(Base, TimestampMixin):
     class_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     # Metadata
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_data: Mapped[dict] = mapped_column("extra_data", JSONDict, default=dict)

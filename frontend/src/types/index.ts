@@ -102,47 +102,8 @@ export interface Position {
   closed_at?: string;
 }
 
-// Trader types
-export interface Trader {
-  id: number;
-  address: string;
-  username?: string;
-  display_name?: string;
-  bio?: string;
-  avatar_url?: string;
-  total_trades: number;
-  winning_trades: number;
-  losing_trades: number;
-  win_rate: number;
-  total_profit: number;
-  total_volume: number;
-  avg_position_size: number;
-  first_trade_at?: string;
-  last_trade_at?: string;
-  is_tracked: boolean;
-  track_priority: number;
-}
-
-export interface TraderFollow {
-  id: number;
-  trader_id: number;
-  trader_address: string;
-  is_active: boolean;
-  copy_percentage: number;
-  max_position_size: number;
-  min_position_size: number;
-  copy_buys: boolean;
-  copy_sells: boolean;
-  excluded_markets: string[];
-  included_categories: string[];
-  delay_seconds: number;
-  max_slippage: number;
-  total_copied_trades: number;
-  total_profit: number;
-}
-
 // Strategy types
-export type StrategyType = 'ARBITRAGE' | 'MOMENTUM' | 'MEAN_REVERSION' | 'MARKET_MAKING' | 'COPY_TRADING' | 'CUSTOM';
+export type StrategyType = 'ARBITRAGE' | 'MOMENTUM' | 'MEAN_REVERSION' | 'MARKET_MAKING' | 'CUSTOM';
 
 export interface Strategy {
   id: number;
@@ -323,17 +284,158 @@ export interface BacktestTrade {
   confidence?: number;
 }
 
-// Arbitrage types
-export interface ArbitrageOpportunity {
+// Trading mode (backend/app/config.py `Settings.trading_mode`;
+// `GET /api/v1/trading/mode`, backend/app/api/routes/trading.py)
+export type TradingMode = 'paper' | 'live';
+
+export interface TradingModeResponse {
+  mode: TradingMode;
+  kill_switch: boolean;
+}
+
+// Opportunity-discovery types (PLAN.md D10, T19/T23).
+//
+// Mirrors `app.services.scoring.OpportunityScore` (backend/app/services/
+// scoring.py) and `app.api.routes.arbitrage.OpportunityOut` — read those
+// before changing shape here, this is not a guess.
+
+// One leg of a scored opportunity, as `arbitrage.py`'s `_leg_out` emits
+// it field-by-field from `app.strategies.base.Leg`.
+export interface OpportunityLeg {
+  venue: string;
+  market_id: string;
+  outcome: string;
+  side: OrderSide;
+  limit_price: number;
+  size_contracts: number | null;
+  size_usd: number | null;
+}
+
+// The seven scoring components (`net_edge` .. `composite`) plus the two
+// GUARDRAILS.md §1.7 labels (`link_status`, `depth_source`) every reader
+// of a score must carry along wherever it displays a number derived
+// from it.
+export interface OpportunityScore {
+  net_edge: number;
+  annualized_return: number;
+  hours_to_resolution: number;
+  fill_confidence: number;
+  resolution_risk: number;
+  capital_lockup_usd: number;
+  composite: number;
+  link_status: string | null;
+  depth_source: string;
+}
+
+// `OpportunityOut` (`GET /api/v1/arbitrage/opportunities`,
+// `POST /api/v1/arbitrage/scan`) — an `OpportunityScore` plus enough
+// identity/legs for a caller to act on the row.
+export interface Opportunity {
   id: string;
-  type: 'CROSS_MARKET' | 'INTERNAL' | 'EVENT';
-  markets: string[];
-  expected_profit: number;
-  expected_profit_pct: number;
-  required_capital: number;
-  confidence: number;
-  expires_at?: string;
-  created_at: string;
+  strategy: string;
+  kind: string;
+  status: string;
+  mode: TradingMode;
+  created_at: string | null;
+  legs: OpportunityLeg[];
+  net_edge: number;
+  annualized_return: number;
+  hours_to_resolution: number;
+  fill_confidence: number;
+  resolution_risk: number;
+  capital_lockup_usd: number;
+  composite: number;
+  link_status: string | null;
+  depth_source: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface OpportunitiesResponse {
+  opportunities: Opportunity[];
+  count: number;
+}
+
+export interface ScanResponse {
+  status: string;
+  mode: TradingMode;
+  opportunities_found: number;
+  opportunities: Opportunity[];
+}
+
+// Edge-decay / capital-sweep types (PLAN.md D12, T22/T23).
+//
+// Mirror `capital_row_to_dict`/`edge_decay_report_to_dict` in
+// backend/app/services/backtesting/sweep.py — those functions define
+// the JSON keys, not the `CapitalRow`/`EdgeDecayReport` dataclass field
+// names (they happen to match here, but the dict builders are the
+// contract).
+
+// backend/app/services/backtesting/engine.py: `ResultDepthSource`/`FillAt`.
+export type ResultDepthSource = 'synthetic' | 'recorded' | 'mixed';
+export type FillAt = 'same' | 'next';
+
+export interface EdgeDecayRow {
+  capital: number;
+  net_return: number;
+  annualized: number;
+  fill_rate: number;
+  avg_slippage_bps: number;
+  pct_intents_downsized: number;
+  capital_utilization: number;
+  trades: number;
+  depth_source: ResultDepthSource;
+  fill_at: FillAt;
+  tick_unvalidated_fills: number;
+  // Non-empty means part of this row's equity curve is a position marked
+  // at its entry price for want of an observed market price (T21d) — the
+  // row's `net_return`/`annualized` is then partly not a market number.
+  unmarked_positions: string[];
+  rejection_reasons: Record<string, number>;
+  // `null` when `trades > 0`. `"no_signal"` is a genuine no-edge-at-this-
+  // size reading; a `"structural: ..."` string means the strategy could
+  // never be FILLED by this backtester at this level — not evidence
+  // about edge at all (see `EdgeDecayReport.unmeasurable_note`).
+  zero_trades_cause: string | null;
+  downsize_trackable_intents: number;
+}
+
+export interface EdgeDecayReport {
+  rows: EdgeDecayRow[];
+  edge_dies_at: number | null;
+  depth_source: ResultDepthSource;
+  fill_at: FillAt;
+  // PLAN.md D12: ALWAYS populated, and must be PRINTED/DISPLAYED by any
+  // caller showing `edge_dies_at`, not just persisted.
+  sweep_ceiling_note: string;
+  // Non-null means `edge_dies_at` is anchored to a zero-trade row whose
+  // cause is structural, not a shrinking edge.
+  unmeasurable_note: string | null;
+}
+
+// `BacktestRun.report` (backend/app/api/routes/backtesting.py
+// `BacktestStatusResponse.report`) carries far more than modeled here
+// (intent counters, settlement/coverage census); only the fields read by
+// a caller are added as they're needed.
+//
+// `depth_source`/`fill_at` are written by `build_report()`
+// (backend/app/tasks/backtesting.py) into EVERY completed run's report,
+// not just a sweep's — GUARDRAILS.md §1.7 requires both to be labeled
+// wherever the run's numbers are shown, so `BacktestResults` (an
+// ordinary, non-sweep run) reads them too, not only `EdgeDecayTable`.
+// An empty `{}` report (a run that predates report capture) means both
+// are simply absent, not `"recorded"`/`"next"` — do not default them.
+//
+// `unmarked_positions` is NOT currently written to a single run's
+// top-level report by `build_report()` (T21d only threads it through
+// `edge_decay.rows[].unmarked_positions` for a sweep, see
+// backend/app/services/backtesting/sweep.py) — modeled optionally here
+// so a caller can surface it defensively without a backend change, and
+// without reaching for `any` to read a field the type doesn't declare.
+export interface BacktestReport {
+  depth_source?: ResultDepthSource | string;
+  fill_at?: FillAt | string;
+  unmarked_positions?: string[];
+  edge_decay?: EdgeDecayReport;
 }
 
 // API response types

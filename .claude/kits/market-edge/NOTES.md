@@ -1,0 +1,4088 @@
+# market-edge — NOTES
+
+Execution log for `/polytropos:execute market-edge`.
+Run id for this invocation: `2026-09-05-3bd5`.
+Dials read at setup: `autonomy: advisory`, `budget: max-dispatches=110 max-escalations=8 max-consults=10`,
+`roles: test-author red-team second-verifier security-auditor`.
+
+## Ledger
+
+agent: T01 id=af3203a5299259f60 role=implementer model=sonnet
+
+### T01 — notes
+
+Verify command run by the orchestrator: exit 0. `extra_data` count = 9. `ensure_aware` raises
+`ValueError: naive datetime` on a naive input. Full suite: "no tests ran" (0 collected) — expected,
+the harness arrives in T02.
+
+Implementer went slightly beyond the named brief in two places, both defensible and both recorded
+here so the reviewer can adjudicate at the phase boundary:
+- Added `ForeignKey("traders.id")` to `TraderFollow.trader_id` — a second missing FK the brief did
+  not name, but which the brief's own "check every other `relationship(` the same way" instruction
+  covers. `configure_mappers()` failed without it.
+- Fixed pre-existing baseline ruff findings inside the verify command's path scope
+  (`models/__init__.py` import order; unused imports in `price_history.py`, `database.py`,
+  `base.py`). PLAN.md 2 forbids repo-wide ruff cleanup; these were confined to the three paths the
+  T01 verify command itself scans, which would otherwise have failed red on baseline debt.
+  Flagged for the P0 reviewer rather than adjudicated here.
+
+Role-hook skips for T01, with reasons (both roles start at the task where they can actually bite):
+- `test-author` SKIPPED: the test harness does not exist yet. `conftest.py` is unrunnable
+  (`aiosqlite` missing, `AsyncClient(app=app)` removed in httpx 0.27, unsupported `event_loop`
+  fixture) and pytest collects 0 items. Any test written now could not run. Starts at T02, which
+  builds the harness.
+- `second-verifier` SKIPPED: its declared lens is financial correctness (sign, units, rounding,
+  per-leg sizing, settlement off-by-one). T01 is model plumbing with no money math. Starts at T05,
+  the first fee-model task.
+
+agent: T01 id=aa864aab69109fba2 role=verifier model=sonnet findings=0 confirmed=0 marginal=0 result=accepted
+
+Verifier PASS, no findings. It independently reconstructed the pre-T01 blobs from `git show HEAD:...`
+in $TMPDIR and confirmed the ruff-baseline excursion: exactly 7 real baseline findings existed, all
+inside the T01 verify command's three path roots, all dead-import/order fixes with no behavior
+change. The scope question flagged above is therefore ADJUDICATED as in-bounds; the P0 reviewer
+does not need to re-open it. Dual-dialect portability confirmed directly: sync `sqlite://` engine
++ `create_all` builds all 14 tables, and `CreateTable` against the postgresql dialect still renders
+JSONB. That is the claim T02 depends on.
+
+agent: T01 id=aa8b108876986bdac role=red-team model=sonnet findings=6 confirmed=5 marginal=5 result=revised
+defect: T01 kind=underspecified-json-semantics
+
+Red-team found 6 demonstrated breaks; 5 adjudicated confirmed, all 5 marginal (verifier raised 0,
+test-author and second-verifier were skipped for T01, so no earlier layer saw any of them).
+
+CONFIRMED, fixed in the T01 retry:
+1. `data_replay.py:209` still calls `market.metadata.get("resolution_rules")`. `metadata` is always
+   present on DeclarativeBase, so this does NOT fail loudly - it resolves to the schema MetaData
+   object, `.get()` raises AttributeError, and the enclosing `except Exception` swallows it. The
+   whole dict literal (token_id, question, category, end_date) aborts to `{}` and is memoized empty
+   for the rest of the run. Silent total loss of market metadata in the replayer.
+2. JSON columns are not mutation-tracked: in-place `row.extra_data["k"]=v` + commit produces NO
+   UPDATE and no error. Silent lost write.
+3. `Mapped[dict]` is None before flush (`default=dict` fires at INSERT-compile, not `__init__`), so
+   construct-then-mutate raises TypeError and the non-Optional type hint lies.
+4. Explicit `None` bypasses NOT NULL: SQLAlchemy JSON defaults to `none_as_null=False`, storing the
+   4-byte text `'null'`, which the constraint cannot see. Reads back as None and crashes `.get()`.
+6. `ensure_aware` raises AttributeError, not the documented ValueError, for None/str/date input -
+   its own docstring contract. Latent today (T08 wires the first caller).
+
+NOT confirmed (working exactly as the brief specified, no artifact):
+5. `JSONDict` vs `JSONList` enforce nothing - both are literally
+   `JSON().with_variant(JSONB(), "postgresql")`. The brief defined them that way, so this is a
+   naming/documentation signal, not an implementer defect. Left for the P0 reviewer.
+
+Carry-forward for T02: SQLite does not enforce FKs without `PRAGMA foreign_keys=ON`; red-team
+inserted a MarketPrice with `market_id=999999` against a bare engine with no error. T02's engine
+config should enable it.
+
+The `defect:` line above is against the ARCHITECT's brief, not the implementer: the brief pinned the
+column definition (`mapped_column("extra_data", JSONDict, default=dict)`) without specifying
+mutation-tracking or null semantics, and findings 2/3/4 all follow from that under-specification.
+
+
+### T01-retry — notes
+
+Fixed the 5 confirmed red-team defects:
+1. `data_replay.py:209` — `market.metadata.get(...)` -> `market.extra_data.get(...)`. Grepped the
+   whole `backend/app` tree for `.metadata.get(`/`.metadata[`/`getattr(..., "metadata")`/`"metadata"`
+   dict keys/`metadata=` kwargs. Every remaining hit (`signal.metadata`, `snapshot.metadata`,
+   `pos.metadata`, `ExecutionResult(metadata=...)`) is a plain `@dataclass` field (`Signal`,
+   `MarketSnapshot`, `Position`, `TradeRecord`, `ExecutionResult` in `strategies/base.py` /
+   `services/backtesting/engine.py` / `bots/executor.py`), not an ORM instance — unrelated to the
+   rename, left unchanged.
+2. `models/base.py`: `JSONDict`/`JSONList` wrapped with `MutableDict.as_mutable(...)` /
+   `MutableList.as_mutable(...)`; verified in-place mutation + commit + `expire_all()` + refetch now
+   persists.
+3. `Base.__init__` override added (reimplements SQLAlchemy's default declarative constructor rather
+   than calling `super().__init__(**kwargs)` — once a class defines its own `__init__`, the MRO's
+   next `__init__` is `object`'s, which rejects kwargs). It eagerly invokes each column's callable
+   `mapped_column(default=...)` for any attribute not explicitly passed, so a freshly constructed,
+   un-flushed instance gets `{}`/`[]`, not `None`. Confirmed `mapped_column(default=dict)` alone does
+   NOT populate the attribute at `__init__` (only at flush) in SQLAlchemy 2.0.34 — this mixin-level
+   `__init__` eager-default is necessary, not optional.
+4. `JSONDict`/`JSONList` base type now `JSON(none_as_null=True).with_variant(JSONB(none_as_null=True),
+   "postgresql")`. Verified in isolation (a column with NO python-side default): `Model(extra_data=None)`
+   + commit raises `IntegrityError` as prescribed.
+5. `ensure_aware` now raises `TypeError` for non-`datetime` input (`None`, `str`, `date`) and keeps
+   `ValueError` for a genuine naive `datetime`; docstring updated to document both and the
+   `isinstance(dt, datetime)` vs `isinstance(date_obj, datetime)` direction.
+
+defect: T01 kind=contradictory-acceptance
+
+DEFECT 3 ("keep `default=dict`, add a construction-time default") and DEFECT 4 ("explicit `None`
+raises `IntegrityError`") cannot both hold for the SAME column under SQLAlchemy 2.0.34's ORM flush
+path. Root cause, confirmed against the installed SQLAlchemy source
+(`orm/mapper.py:2733-2751`, `orm/persistence.py::_collect_insert_commands`): a column is excluded
+from the INSERT `params` whenever `value is None and not col.type.should_evaluate_none` — this test
+fires whether the attribute was never touched or was explicitly assigned `None`; it does not look at
+whether `col.default` is set. When the column also carries a Python-side `default` (every real
+`extra_data`/`token_ids`/`outcomes`/... column in this codebase does, per T01, unchanged here),
+`Model(extra_data=None)` + commit silently flushes the column DEFAULT (`{}`), not an `IntegrityError`
+and not the old JSON `'null'` text either. Demonstrated in the scratch script (see report): a column
+with NO python-side default correctly raises `IntegrityError`; the real column shape (`JSONDict` +
+`default=dict`, matching `Market.extra_data`) does not.
+
+Not fixed, and deliberately not improvised around: doing so would require either (a) stripping
+`default=dict`/`default=list` from every model file (`market.py`, `trade.py`, `trader.py`,
+`position.py`, `strategy.py`, `backtest.py`, `backtest_run.py` — 15 call sites, out of scope for
+this retry's named file list), or (b) mutating `Column.default` at class-configure time to make
+`Base.__init__`'s eager default the sole source of truth (changes real flush-time behavior for bulk
+inserts / Core-level writes that bypass `__init__`, an architectural change beyond the brief). Either
+is a design change, not a bugfix, so left for the P0 reviewer/architect to adjudicate rather than
+decided unilaterally here. The underlying production risk from the original DEFECT 4 report (a
+silently stored `'null'` that crashes `.get()` on readback) is closed either way — `none_as_null=True`
+means an explicit `None` never becomes stored JSON text again — it just resolves to the column
+default instead of a raised error, for columns that have one.
+
+agent: T01 id=aa8d7d23565c8ea75 role=implementer model=sonnet
+outcome: T01 model=sonnet attempts=2 result=retry-pass review=revised run=2026-09-05-3bd5
+
+T01 CLOSED. Orchestrator re-ran the verify command (exit 0) and an independent 11-assertion script
+in $TMPDIR: construct-time `{}` default, explicit kwargs still honored, bogus kwarg still raises
+TypeError (the custom `Base.__init__` did not break declarative construction), in-place mutation
+persists across commit/expire/refetch, no `'null'` text ever stored, and all four `ensure_aware`
+guard cases correct.
+
+On the D3/D4 contradiction the implementer reported rather than improvised: it is real. Under
+SQLAlchemy 2.0.34 a column carrying `default=dict` never raises on an explicit None - the default
+replaces it - so "verify the NOT NULL constraint fires" was unsatisfiable while keeping `default=`.
+The resulting behavior is nonetheless SAFER than the acceptance line asked for: explicit None now
+lands as `{}`, so there is no path that stores `'null'` text and no path that reads back None. The
+silent-corruption bug is closed by construction rather than by constraint. Accepted as-is; the
+`defect: T01 kind=contradictory-acceptance` line above is charged to the retry brief (mine), not to
+the implementer.
+
+Surviving `.metadata.get(` hits in `app/strategies/*.py` are plain @dataclass fields
+(`Signal.metadata`, `MarketSnapshot.metadata`), NOT ORM instances - unaffected by the reserved-name
+rule and correctly left alone. (`whale_copy_trading.py` among them is deleted in T03 regardless.)
+
+agent: T02 id=af767be5576c281d4 role=implementer model=sonnet
+defect: T02 kind=contradictory-acceptance
+
+### T02 — notes
+
+Primary verify command run by orchestrator: exit 0, `5 passed`. Harness is live for the first time.
+
+CONTRADICTION CONFIRMED INDEPENDENTLY (this one is charged to the architect's brief, not the
+implementer, and not to me - it is in TASKS.md as written):
+- acceptance 1 wants `pytest -q` to exit 0;
+- acceptance 2 wants `pytest -q -W error::DeprecationWarning tests/test_smoke.py` not to fail on the
+  repo's own code;
+- the brief's escape hatch says to mark test (d) `xfail(strict=True, reason="T08")` if it fails for
+  the naive-datetime reason.
+All three cannot hold. Measured: normal run = 5 passed; `-W error::DeprecationWarning` = 1 failed on
+`DeprecationWarning: datetime.datetime.utcnow() is deprecated`, raised from the repo's own
+`app/services/backtesting/engine.py`. Adding `xfail(strict=True)` then makes the NORMAL run fail with
+`XPASS(strict)`, breaking acceptance 1. The implementer left the test unmarked and passing, satisfied
+acceptance 1 + the primary Verify command, and reported the gap instead of suppressing the warning.
+Correct call - accepted.
+
+ROOT CAUSE PINNED FOR T08 (exact, re-measured by orchestrator - the implementer's report said
+"~325 and ~366", the true second site is 373):
+- `backend/app/services/backtesting/engine.py:325` -> `start_time = datetime.utcnow()`
+- `backend/app/services/backtesting/engine.py:373` -> `end_time=datetime.utcnow(),`
+T08 must replace both with `app.utils.time.utcnow()`. Once it does, acceptance 2 becomes satisfiable
+and test (d) can carry `-W error::DeprecationWarning` cleanly.
+
+Out-of-brief edit by the implementer, flagged for the P0 reviewer: `app/api/routes/backtesting.py`
+pydantic v1 `class Config: from_attributes = True` -> `model_config = ConfigDict(from_attributes=True)`.
+Two-line non-behavioral v2 migration; it was tripping acceptance 2's DeprecationWarning-as-error on
+the repo's own code. Defensible, but it is a file T02's brief does not list.
+
+Carry-forward: `tests/helpers.py::make_book` returns a plain dict
+(venue/market_id/outcome/bids/asks, levels `{"price","size"}`). T05 replaces it when `OrderBook` lands.
+
+agent: T02 id=aaab37a06fe214acc role=test-author model=sonnet findings=4 confirmed=3 marginal=2 result=accepted
+
+Test-author added `backend/tests/test_harness_contract.py` (11 tests). Suite now 15 passed, 1 skipped.
+Adjudication of its 4 numbered claims:
+- #1 acceptance-2 fails on `engine.py` `datetime.utcnow()` - CONFIRMED but NOT marginal; the
+  implementer and the orchestrator had both already raised it (recorded above).
+- #2 `Settings.trading_mode` does not exist until T11-T13 - CONFIRMED, marginal. This is a defect in
+  MY test-author brief (I asked it to assert on a field that does not exist yet). It wrote a
+  skip-guarded test that begins asserting the moment T11 adds the field, rather than faking a pass.
+- #3 `make_snapshot(ts=<naive>)` passes a naive datetime through unvalidated (no `ensure_aware`
+  call); `snapshot.timestamp.tzinfo is None` afterwards - CONFIRMED, marginal. Genuine latent gap.
+- #4 its own test-construction correction (aiosqlite auto-selects StaticPool for `:memory:` even
+  with no `poolclass`, so the contrast case needed `NullPool`) - NOT a claim about T02, not counted
+  as confirmed. Useful byproduct: `conftest.py`'s explicit `poolclass=StaticPool` is confirmed
+  correct and defensive rather than load-bearing against a broken default.
+
+DECISION on #3, and the reasoning, so a later task does not re-litigate it: NOT fixed by a T02 retry.
+Hard-validating `ts` inside `make_snapshot` would block legitimate NEGATIVE tests - T08 needs to
+construct naive snapshots deliberately to prove the engine REJECTS them, and a helper that raises
+first makes that untestable. Carried to T06 (CORRECTED - see P0 reviewer finding 8; `MarketSnapshot.__post_init__` gains
+`ensure_aware` in T06, not T08). T06 decides between a strict helper plus an escape hatch, or an explicit `make_snapshot(..., allow_naive=True)`.
+Recorded here rather than spending a retry dispatch.
+
+`red-team` SKIPPED for T02, with reason: test-author's 11 contract tests already exercised the exact
+surface red-team would attack on a test harness - cross-test isolation, pool behavior and the private-DB
+contrast, FK-pragma enforcement, client/session shared-database binding, and naive-datetime
+passthrough. A red-team pass here would substantially duplicate work already done rather than attack
+new ground. Red-team resumes at T05, the first task carrying real money math.
+
+agent: T02 id=a7e4406dfc847255e role=verifier model=sonnet findings=3 confirmed=2 marginal=1 result=accepted
+outcome: T02 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T02 CLOSED. Verifier PASS. Adjudication of its 3 claims:
+- #1 acceptance-2 reproduces on `engine.py:325`/`:373` - CONFIRMED, not marginal (already recorded).
+  Verifier independently re-measured both line numbers as exact.
+- #2 the out-of-brief pydantic `Config`->`ConfigDict` edit in `api/routes/backtesting.py` -
+  CONFIRMED and MARGINAL. This OVERTURNS the earlier note above: the verifier reconstructed the
+  pre-edit file and showed acceptance-2 then fails at COLLECTION time with
+  `PydanticDeprecatedSince20` (a DeprecationWarning subclass) raised at class-definition during
+  `app.main` import - before any test body runs. The edit is therefore load-bearing for T02's own
+  acceptance line to be evaluable at all, not scope creep. Reclassified: in-bounds, no reviewer
+  action needed.
+- #3 `data_replay.py` shows modified in the tree - correctly identified as T01's rename propagation,
+  NOT a T02 defect. Not counted as confirmed.
+
+Fences proven rather than read (both matter for GUARDRAILS 1):
+- `TRADING_MODE=paper` ordering holds EMPIRICALLY. Verifier instrumented a scratch copy of
+  `app/config.py`, unset the var in the parent shell, imported `tests.conftest` fresh, and observed
+  the config module read 'paper' at execution time. `Settings` is lru_cached, so a late write would
+  have been a silent no-op - the fence would have looked right while doing nothing.
+  Caveat: `Settings` has no `trading_mode` FIELD yet (T11 adds it), so the fence guards a future
+  footgun, not a live one.
+- `client` fixture's `get_async_session` override is removed even when a test using it FAILS
+  (teardown is not gated on success). A leaked override would poison every later test in the kit.
+- Suite is stable across consecutive runs (15 passed, 1 skipped, twice, identical).
+- The test-author's runtime probe route does not leak: a later-ordered scratch test got 404.
+
+agent: T03 id=ad2b071a6ed815f8e role=implementer model=sonnet
+defect: T03 kind=contradictory-acceptance
+defect: T03 kind=stale-pin
+outcome: T03 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T03 CLOSED. Mimicry is gone. Orchestrator-verified: 7 files deleted, registry exactly 9 with
+`whale_copy_trading` absent, `alembic heads` = `002 (head)`, offline SQL emits 3 DROP TABLEs, suite
+`15 passed, 1 skipped`. The acceptance-1 grep is CLEAN across `backend/app`, `frontend/src`,
+`.claude/skills`, `.claude/commands`, `.claude/agents`, `CLAUDE.md`, `README.md`.
+
+TWO UNSATISFIABLE ACCEPTANCE LINES, both charged to the architect's brief, both verified by me:
+1. `contradictory-acceptance` - acceptance 1 greps `.claude`, which CONTAINS THIS KIT. 24 matches
+   live in `.claude/kits/market-edge/{TASKS,PLAN,NOTES}.md`, 18 of them in the very TASKS.md that
+   specifies the grep. The kit is the record of WHY the deletion happened; scrubbing it to pass a
+   check about the deletion would destroy the reasoning. Implementer correctly left
+   `.claude/kits/` and `.claude/agents/` untouched. Note this is the SAME SHAPE as T01's ruff
+   `defect:` shape — an acceptance line whose path scope sweeps in the kit or the baseline it lives beside.
+2. `stale-pin` - acceptance 6 (`npx tsc -p tsconfig.app.json --noEmit` exits 0) assumes a clean
+   TypeScript baseline that NEVER EXISTED. Measured: exit 2, 8 errors in 4 files, and I confirmed
+   via `git status` that all 4 are UNMODIFIED by T03. PLAN.md 3 itself records that
+   `frontend/node_modules` was never installed and there is no `typecheck` script - so tsc had
+   never been run on this repo and its baseline was never established.
+   I checked the one erroring file T03 DID edit (`StrategySelector.tsx`, unused `categoryIcons`):
+   `git show HEAD:` proves `categoryIcons` was already declared-and-unread before T03, and T03's
+   diff removes only the two `copy_trading` map entries. Inherited dead code, not a regression.
+
+CARRY-FORWARD FOR T23 (the frontend task) - do not rediscover this:
+The tsc baseline is 8 errors across 4 files, ALL pre-existing:
+  Backtesting.tsx(3,10)      TS6133 unused `formatCurrency`
+  BacktestResults.tsx(195,17) TS2322 Formatter<number,"Equity"> vs (value:number)=>[string,"Equity"]
+                              - `number | undefined` not assignable to `number` (a REAL type bug,
+                                not just an unused import)
+  StrategySelector.tsx(19,7) TS6133 unused `categoryIcons`
+  useMarkets.ts(1,20/1,33/3,1) TS6133 unused `useMutation`, `useQueryClient`, `Market`
+  backtestApi.ts(4,3/10,3)   TS6196 unused `Backtest`, `StrategyInfo`
+T23 must either fix these or scope its typecheck to the files it owns. Seven are trivial unused
+symbols; BacktestResults.tsx(195) is a genuine nullability bug worth fixing properly.
+
+`result=pass` recorded deliberately: the task's WORK is complete and independently verified. The
+failing clause is an acceptance line that cannot be satisfied inside the brief's own scope
+(PLAN.md 2 confines frontend work to T23/T24 and forbids repo-wide lint fixes), and that failure is
+carried by the two `defect:` lines above rather than by a false `blocked`.
+
+--- PHASE 0 COMPLETE (T01, T02, T03) ---
+
+agent: P0 id=ab5540f8b88d50309 role=security-auditor model=sonnet findings=3 confirmed=3 marginal=2 result=accepted
+
+PHASE 0 SECURITY AUDIT: ZERO BLOCKING FINDINGS. All GUARDRAILS 1 fences hold. Phase 1 is clear to
+dispatch on security grounds.
+
+- 1.1 CONFIRMED, marginal. Legacy order-placement code exists and predates this kit
+  (`services/polymarket/client.py` create_order/post_order/cancel_order; `bots/executor.py`
+  execute_signal/cancel_order), but the auditor traced every path and NONE is reachable: the
+  trading and bots routes are `# TODO` stubs that never import the executor, `BaseBot` is an ABC
+  with no concrete subclass anywhere, the Celery tasks are zeroed stubs, and the module-level
+  `clob_client = ClobClientWrapper()` only sets two fields to None in `__init__` - `initialize()`
+  is never called. Zero reachable path to transmit a real order today. Becomes live-relevant at
+  T11-T15, which build `app/venues/*/live.py` and rewire `routes/trading.py`.
+- 1.2 CONFIRMED, NOT marginal - `TRADING_MODE` is set by conftest but read by nothing (no
+  `trading_mode` field on Settings until T11). Already raised by test-author and the T02 verifier;
+  the auditor reproduced it independently and agrees.
+- 5.1 CONFIRMED, MARGINAL - NEW, and no earlier layer found it. T01's custom `Base.__init__`
+  filters kwargs with `hasattr(cls_, key)` rather than against `__mapper__.column_attrs`, so it is
+  "any class attribute", not "only mapped columns". Demonstrated: `Market(bogus_field_xyz=...)` is
+  correctly rejected, but `Market(metadata="not-a-metadata-object")` SUCCEEDS (because
+  DeclarativeBase itself exposes `metadata`), and all four relationships
+  (prices/trades/orders/positions) are settable by kwarg. This is a mass-assignment shape.
+  It reproduces SQLAlchemy's own stock `_declarative_constructor` behavior, so T01 did not
+  introduce it, and it is INERT today (grep found zero `Model(**untrusted_dict)` call sites; every
+  DB-facing route is still a stub).
+  Note this is exactly the boundary T01's red-team did NOT test: red-team proved a BOGUS kwarg
+  raises TypeError; nobody had tested that a VALID-but-non-column attribute is silently accepted.
+
+HARD CONSTRAINT FOR T15 (and any later task that builds a DB-writing POST route):
+Construct models field-by-field from a validated pydantic schema. NEVER
+`Model(**request.model_dump())` or any splat of caller-controlled data - this constructor will
+accept `metadata=` and relationship kwargs. Put this in T15's dispatch brief.
+
+Also confirmed clean: no secret in the working tree or in ANY of the 3 commits of git history;
+`.gitignore` still fences `.env`/`*.pem`/`*.key`/`secrets/`; `.env.example` holds only blank
+placeholders; no logging call emits a secret; no test references a venue host; no import-time
+socket (all three client `__init__`s only set fields, never dial); no eval/exec/subprocess, no
+f-string SQL, no `dangerouslySetInnerHTML`. Migration 002 touches only `tracked_traders`,
+`trader_follows`, `traders` - verified line-for-line against 001.
+
+reviewer: P0 model=opus findings=10 confirmed=10 result=accepted
+
+PHASE 0 REVIEW: 10 findings, all confirmed. VERDICT: Phase 1 may proceed - no finding touches money
+math, the venue seam, or the backtest public surface Phase 1 builds on.
+
+Confirmed clean by the reviewer: backtest `__init__.py` public surface byte-identical (13 exported
+names intact); registry exactly 9, no tenth strategy, no sportsbook code; migration 002 faithful
+column-for-column against 001; mimicry genuinely deleted, not renamed (it grepped
+`trader|wallet_addr|follow|mirror|mimic|shadow|imitat|smart.?money|top.?perform` - all 12 surviving
+hits are the product name or prose about retail traders); and `JSONDict`/`JSONList` now GENUINELY
+enforce shape under the mutable wrapper (a list assigned to `extra_data` raises), which retires
+T01 red-team finding #5.
+
+ACTIONED NOW (P0 remediation dispatch):
+- #1 `Base.__init__` eager defaults destroy persisted JSON through `session.merge()`. Demonstrated:
+  merging a detached Market wipes `outcomes` -> `[]` and `extra_data` -> `{}`; stock DeclarativeBase
+  with identical columns preserves them. Latent (no `.merge(` in `app/` today) but T15/T16 are the
+  upsert tasks that reach for it. This is a behavior change introduced by MY T01 retry instruction.
+- #2 `models/base.py:44-48` docstring states two things the phase itself disproved: that
+  construction equals the flushed value (false for scalar/enum defaults - `Market().is_active` is
+  None, `Order().status` is None) and that an explicit None is left untouched (false for every JSON
+  column, since all carry `default=`). Every Phase 1-3 implementer will read this as contract.
+- #4 `.claude/skills/trading-strategies/SKILL.md` section numbering now reads 1 -> 3 -> 4.
+- #6 `tests/conftest.py:60` docstring still cites `trader_id`, deleted in T03.
+
+DECIDED, not dispatched:
+- #9 Three Phase-1 verify commands fail red on untouched baseline ruff debt (T05: 2 in
+  `app/config.py`; T06: 2 in `app/strategies/base.py`; T08: 10 across `services/backtesting`).
+  ORCHESTRATOR DECISION: authorize fixing the baseline findings in exactly the files each task's own
+  verify command already scans - 14 findings total, overwhelmingly unused imports. This does NOT
+  breach PLAN 2's ban on repo-wide ruff cleanup (baseline is 139 findings); it makes three
+  acceptance lines satisfiable instead of recording the same defect shape three more times. Each
+  affected dispatch will carry the explicit list.
+- #3 The `data_collector.py` docstrings are HONEST but unsearchable: the same rationale reads
+  "leaderboards show winners after the fact" in the migration (outside the grep scope) and
+  "a ranked-standings view shows winners after the fact" in `backend/app` (inside it). Root cause is
+  upstream - PLAN 1 "Done is checkable" item 3 bans the WORD `leaderboard` in `backend/app`
+  permanently, turning a check about deleted CODE into a standing censor on DOCUMENTATION. Third
+  instance of this defect shape (T01 ruff scope, T03 `.claude` scope, this). Phase 4 must amend that
+  criterion to exclude `kits` / scope to real source, or the headline done-check can never go green.
+- #5 Lint cleanup reached a fourth unnamed file (`data_replay.py`). Non-behavioral; noted, not reverted.
+- #7 + #8 T06 DISPATCH REQUIREMENT: `tests/test_harness_contract.py:263-280`
+  (`test_make_snapshot_naive_ts_is_passed_through_unvalidated`) asserts the exact behavior T06 must
+  change. When T06 adds `ensure_aware` to `MarketSnapshot.__post_init__`, line 273 raises BEFORE any
+  assertion, so T06 presents as breaking an unrelated test. T06 must delete or invert that test in
+  the same task. (#8: my earlier carry-forward said T08 - corrected above, it is T06.)
+- #10 T04 DISPATCH REQUIREMENT: `tests/helpers.py::make_snapshot` has two traps aimed at Phase 1's
+  arbitrage math. (a) `no` defaults to 0.5 independent of `yes`, so `make_snapshot(yes=0.6)` yields
+  yes+no = 1.10 - a FABRICATED 10% complement edge that binary-complement tests would silently
+  consume. (b) `yes_ask = yes + spread/2` is unclamped, so `make_snapshot(yes=0.99, spread=0.05)`
+  gives 1.015, which T04's own `OrderBook`/`BookLevel` validators must reject. Fix both when T04
+  rewrites `make_book`.
+
+WATCH ITEM for GUARDRAILS 6 in later phases: `TradeHistory` (kept by D2 as the public tape) carries
+`maker_address`/`taker_address` plus `Index("ix_trade_history_maker_taker")` - a per-wallet lookup
+index with no consumer - `data_replay.py:289-290` hands both addresses to strategies, and
+`services/polymarket/client.py:173-187` still exposes `get_trades(market, maker_address)`, an
+arbitrary-wallet query in a file T03's brief never named. None of this is copy-trading today;
+together it is everything needed to rebuild it without tripping the grep.
+
+agent: P0 id=a4c44081afb3c9b50 role=implementer model=sonnet
+
+P0 REMEDIATION CLOSED. Suite 19 passed / 1 skipped (was 15/1); ruff, mypy clean; `002 (head)`.
+
+FIX 1 resolved by DROPPING GOAL (A) and removing the custom `Base.__init__` entirely. (A) and (B)
+are genuinely mutually exclusive, and the implementer proved WHY from SQLAlchemy 2.0.34 source:
+`ColumnProperty.merge()` decides whether to overwrite a persisted attribute purely via
+`self.key in source_dict`, where `source_dict` IS `instance.__dict__`. It has no visibility into how
+or when the key was set, so history/committed-state tracking is irrelevant. Three mechanisms tested
+and all failed (B): plain `setattr`; `self.__dict__[key]=` (the avenue I suggested - it fails (B)
+AND breaks MutableDict coercion, silently dropping post-flush in-place mutations, so it was dead on
+two counts); and `attributes.set_committed_value`. No SQLAlchemy event fires between construction
+and `Session._merge()`'s per-property loop, so nothing can strip the keys back out first.
+My dispatch's tie-break governed: silent data loss (B) outranks the ergonomic fix (A), because (A)'s
+failure mode is a loud TypeError at construction while (B)'s is a silently corrupted row.
+
+ACCEPTED CONSEQUENCE, recorded so no later task "re-fixes" it: T01 red-team finding #3 is back BY
+DESIGN. `Mapped[dict]` reads None before flush, so the non-Optional type hint is imprecise, and
+mutating an unset JSON column raises TypeError. That is now the documented contract in
+`models/base.py`'s rewritten docstring. Do NOT reintroduce eager defaults - it silently destroys
+persisted JSON on `merge()`, and T15/T16 are the upsert tasks that would hit it.
+
+Orchestrator-verified independently (8 assertions): merge preserves persisted `outcomes`/`extra_data`
+while still applying the fields it did set; un-flushed JSON is None; mutating unset JSON raises
+TypeError; bogus kwarg still raises TypeError (stock `_declarative_constructor` retained); T01 D2
+post-flush in-place mutation still persists; T01 D4 and D5 intact.
+
+--- PHASE 0 CLOSED. Suite 19 passed / 1 skipped. ---
+
+agent: T04 id=a1703c4090f2926e7 role=implementer model=sonnet
+agent: T04 id=a6050be4fe4c044c5 role=second-verifier model=sonnet findings=1 confirmed=1 marginal=1 result=accepted
+agent: T04 id=ab2a386c0f15ee834 role=red-team model=sonnet findings=3 confirmed=3 marginal=2 result=revised
+
+### T04 — role findings
+
+Second-verifier (financial lens): money math CLEAN. One confirmed finding - `_check_size` accepts
+NaN because `float('nan') < 0` is False, while `_check_price` correctly rejects it because
+`0.0 <= nan <= 1.0` is False. Asymmetry confirmed by orchestrator. Also recorded as NO-defect, and
+worth keeping: T04 does ZERO rounding (grep found no round/ceil/floor/Decimal), so rounding
+direction is entirely T05's and T11/T12's responsibility; `Position.size` correctly forbids negative
+size, which makes a naked short INEXPRESSIBLE - closing the exact bug class PLAN 3 records as why
+`cross_platform_arbitrage` was broken; every datetime field routes through `ensure_aware`, which
+RAISES on naive rather than assuming UTC (the loud failure mode, correct for D10 time-ranking).
+
+Red-team: 3 demonstrated breaks.
+- #1 MARGINAL. Frozen is SHALLOW. `book.venue = ...` raises FrozenInstanceError but
+  `book.bids.append(BookLevel(price=0.01, size=1e9))` succeeds - depth fabricated after validation
+  passed. Same for `VenueMarket.raw`, `outcomes`, `outcome_ids` (token id mutated in place).
+  T07's fill engine is built to trust a validated book.
+- #2 NOT marginal - second-verifier raised the NaN half first (pipeline order:
+  verifier -> second-verifier -> red-team). Red-team EXTENDED it materially: `+Infinity` passes too,
+  and Python's `json.loads` accepts the literal tokens `NaN`/`Infinity`/`-Infinity` BY DEFAULT, so a
+  malformed venue payload carries them straight into Balance/Fill/Position/BookLevel with no
+  adversary required.
+- #3 MARGINAL. `walk()` with a NaN requested size drains the WHOLE book: `remaining <= 0` never
+  becomes true and `min(level.size, nan)` always yields `level.size`.
+
+Red-team investigated and cleared (recorded so nobody re-litigates): `dataclasses.replace`,
+`deepcopy`, and pickling all still route through `__post_init__` (it crafted a `__reduce__` that
+tried to rebuild `BookLevel(1.5, -50.0)` and got ValueError); `object.__setattr__` does bypass
+validation but that is inherent to every Python frozen dataclass, not a T04 defect; crossed books
+construct and `mid()` returns 0.5 unflagged, which is CORRECT at the type layer (arb detection is a
+later task); `registry.get_adapter` raises plain KeyError, documented, though not under the
+`VenueError` hierarchy so `except VenueError` will not catch it - design note for T11/T12/T14;
+`VenuePayloadError.raw` is not included in `str`/`repr`/`logger.exception`, so no leak today, but a
+future `f"{err.raw}"` in a log line would be one.
+
+ORCHESTRATOR DECISION on the unsorted-book hazard (red-team flagged it "outside acceptance,
+orchestrator's call"): FIX IT IN T04. Red-team demonstrated `asks=[(0.90,100),(0.10,100)]` walking 50
+returns `[(0.90,50)]`, ignoring the cheaper level - a too-EXPENSIVE fill here, but the mirror case
+produces a too-CHEAP one, which is fabricated profit. `OrderBook`'s docstring currently disclaims
+ordering ("callers are responsible"). That is the wrong default for a normalized domain type in a
+money system: it pushes the burden onto every adapter, and the first one that forgets produces edges
+that do not exist. `OrderBook` will SORT on construction rather than raise - venues may legitimately
+return unsorted books, and normalizing order is precisely what a normalized type is for.
+
+agent: T04 id=a36e878fe2db4ca8e role=test-author model=sonnet findings=2 confirmed=2 marginal=2 result=revised
+defect: T04 kind=stale-pin
+
+Test-author wrote 49 tests across `test_walk_contract.py` (22) and `test_helpers_are_neutral.py` (27).
+Suite went to 103 passed / 1 FAILED / 1 skipped - the single failure is a real defect, not a bad test.
+
+- #1 CONFIRMED, MARGINAL. `walk()` leaves a phantom dust level. Asks
+  `[(0.10,0.1),(0.20,0.2),(0.30,5.0)]`, request `0.1+0.2` (float `0.30000000000000004`): expected 2
+  levels, observed 3, the third being `(0.3, 2.7755575615628914e-17)`. Naive sequential float
+  subtraction leaves `remaining = 2.78e-17` and the loop bites the next level.
+  WHY THIS IS THE INTERESTING ONE: second-verifier tested this EXACT input class (sizes 0.1/0.2
+  requesting 0.3) and CLEARED it, because it asserted on the SUM - and conservation does hold
+  (`0.1+0.2+2.78e-17` is correct). Only a level-COUNT assertion exposes it. Same input, different
+  assertion, opposite verdict. In T07 that dust becomes a phantom position at a real price that can
+  never be filled or closed.
+- #2 CONFIRMED, MARGINAL, and it is a defect in MY dispatch brief (hence the `defect:` line above,
+  kind `stale-pin`): I asked for a test that `make_book` clamps `yes`/`spread` to [0,1], but
+  `make_book(bids, asks, venue, market_id, outcome, ts)` has no such parameters - the clamping lives
+  in `make_snapshot`. Test-author tested the property where it actually lives (7 extreme cases, all
+  pass) and separately established `make_book`'s real property: it is FAIL-CLOSED, raising
+  ValueError via `BookLevel` rather than silently clamping. Correct handling of a wrong brief.
+
+Methodology caveat the test-author volunteered, recorded because it affects how one property should
+be weighted: before writing, it read `tests/venues/test_types.py` (T04's own acceptance tests, not
+`types.py`) far enough to see the `walk`/`mid`/`best_bid`/`best_ask` assertions. Its `mid()`-on-a-
+one-sided-book expectation (None) was reasoned from first principles but coincides with what it had
+glimpsed, so that ONE property is corroborated rather than blind. Everything else - conservation,
+monotonicity, last-level-only-partial, side correctness, empty book, float dust, depth_at - was
+designed from PLAN D3 and the dispatch brief before running any code. Self-reported; not something
+I asked for.
+
+Side correctness explicitly CLEARED: an asymmetric book (bid 0.10x40 vs ask 0.90x999) confirms
+`walk("buy")` consumes ASKS and `walk("sell")` consumes BIDS. No sign error - which would have made
+every arbitrage calculation profitable on paper.
+
+T04 RETRY DISPATCHED with 5 changes: shallow-freeze (tuples + MappingProxyType), non-finite
+rejection in `_check_size` (NaN AND +-inf, with the `json.loads` vector documented), walk epsilon
+guard for the dust level, walk validates its own `size` argument, and OrderBook sorts on
+construction. attempts=2.
+
+agent: T04 id=a877641f49e361dbb role=implementer model=sonnet
+outcome: T04 model=sonnet attempts=2 result=retry-pass review=revised run=2026-09-05-3bd5
+
+T04 CLOSED. Suite 159 passed / 1 skipped (was 55/1 at first pass, then 103 passed / 1 failed once
+test-author's evidence landed). Orchestrator verified all five fixes independently (9 assertions):
+book sequences immutable post-construction; NaN/+inf/-inf rejected across size, USD and rate fields;
+no dust level on the `0.1+0.2` walk; `walk` rejects non-finite and negative requested size; unsorted
+books normalize so `walk`/`best_bid`/`best_ask` are order-independent; original acceptance intact.
+
+Epsilon chosen for the dust fix: `remaining <= max(1e-9, 1e-9 * requested)` - combined absolute and
+relative, justified as many orders of magnitude above observed float64 chained-subtraction noise
+(~1e-17..1e-16) and far below any realistic `min_size` (both venues trade whole or low-decimal
+contracts). Pure-absolute fails for huge requests, pure-relative for tiny ones; hence the max().
+
+BEYOND THE BRIEF, correctly: the implementer audited every float field and found `FeeSchedule
+.taker_rate`/`maker_rate`, `Fill.fee`, and `Balance.available`/`locked` each carried their OWN inline
+`< 0` check with the identical NaN/Inf hole. It routed all three through `_check_size` rather than
+patching only the field I named. `outcome_ids`/`raw` are MappingProxyType over a PRIVATE COPY, so
+mutating the caller's original dict after construction cannot leak through either - a hole I did not
+think to specify.
+
+### T05 — dispatch notes
+
+ACCEPTANCE LINE 2 DISCHARGED by the orchestrator (the brief asks for the count to be recorded here):
+6 fee-literal hits in `app/strategies/`, measured 2026-09-05:
+  multi_outcome_bundle_arbitrage.py:16   "fee_rate": 0.0
+  binary_complement_arbitrage.py:16      "fee_rate": 0.0
+  cross_platform_arbitrage.py:16         "polymarket_fee_rate": 0.0
+  cross_platform_arbitrage.py:18         "kalshi_fee_rate": 0.07
+  cross_platform_arbitrage.py:236,238    the two read sites
+Two of the three arbitrage strategies therefore compute edges assuming ZERO fees, and the third has
+Polymarket at zero while correctly giving Kalshi 0.07. T10 removes all six.
+
+GUARDRAILS CONFLICT RESOLVED AT DISPATCH (not a defect line - caught before it could cause a
+violation): T05's brief instructs the implementer to write "Re-confirmed against <URL> on <date>" in
+the `KalshiFeeModel` docstring, with a fallback if the page is unreachable. GUARDRAILS 1.4 is
+ABSOLUTE and forbids contacting `kalshi.com`/`kalshi.co`, stating vendor docs were fetched once by
+the architect and pinned in PLAN 3, "cite those, do not re-fetch". GUARDRAILS 1 wins. The dispatch
+instructs the implementer to take the fallback branch WITHOUT attempting any fetch, writing the
+verbatim string `NOT re-confirmed on 2026-09-04; 0.07 is Kalshi's historically published standard
+taker rate`. Had this not been resolved in the brief, the natural reading ("MUST say Re-confirmed")
+would have pushed an implementer straight into a network call to a venue.
+
+Baseline ruff in T05's verify scope, authorized per the P0 reviewer's finding 9: exactly 2
+pre-existing F401s at `app/config.py:5` (`PostgresDsn`, `RedisDsn`, both unused). Implementer fixes
+those two only.
+
+agent: T05 id=ad97a5a62982bd977 role=implementer model=sonnet
+
+### T05 — fee models landed. Suite 175 passed / 1 skipped (+16).
+
+ORCHESTRATOR CORRECTION, recorded so it is not mistaken for a defect: my first probe reported the
+Kalshi 1@0.99 worked example as FAILING (0.01 vs 0.000693). That was MY error - I called with the
+default `round_net_to_cents=True`, which applies the non-direct-member $0.01 floor, while the worked
+example isolates the 6dp ceiling. The implementer's own test correctly passes
+`round_net_to_cents=False`. Implementation is right; re-verified: 0.000693 exactly.
+
+FLOAT BUG THE IMPLEMENTER FOUND AND FIXED UNPROMPTED: `100*0.07*0.5*0.5` evaluates to
+`1.7500000000000002` in float64, and BOTH naive ceilings mis-round it - `math.ceil(x*1e6)/1e6` gives
+1.750001, and `Decimal(str(x))` without pre-rounding gives 1.76. It rounds to 9dp (past float noise,
+well past the 6dp/2dp targets) before an exact Decimal quantize. A fabricated fee of $0.000001 per
+fill is small; a fabricated $0.01 is not, and both are the wrong SIGN for a trader.
+
+ECONOMIC FINDING - MEASURED, and it changes cross-venue sizing near resolution (feeds T07/T18/T20):
+Polymarket's `p*(1-p)` fee collapses toward zero at the tails, but Kalshi's $0.01 per-fill floor does
+NOT. Measured, 1 contract taker:
+    p=0.500   PM $0.012500 (2.500% of notional)   KS $0.0200 (4.000%)
+    p=0.900   PM $0.004500 (0.500%)               KS $0.0100 (1.111%)
+    p=0.980   PM $0.000980 (0.100%)               KS $0.0100 (1.020%)
+    p=0.995   PM $0.000249 (0.025%)               KS $0.0100 (1.005%)
+At p=0.995 that is a 40x cost difference on the same trade. Consequences:
+  1. The near-resolution bucket (D10, the user's "culminating soon") is structurally CHEAP on
+     Polymarket and FLOORED on Kalshi. A cross-venue arb there must size UP the Kalshi leg to
+     amortize the cent floor, or the floor eats the edge silently.
+  2. Fill fragmentation is expensive on Kalshi because the ceiling is PER FILL. Verified: two
+     1-contract fills cost $0.0200 where a single 2-contract call costs $0.0100. T07's
+     depth-walking fill engine GENERATES that fragmentation by design, so it must call `fee()` once
+     per fill and sum - never once on an order's aggregate size. T18's arb sizing must model it.
+
+`test-author` SKIPPED for T05, reason: the implementer's 16 tests already ARE hand-computed worked
+examples with the expected number stated in a comment (GUARDRAILS 5's requirement), including
+symmetry, max-at-0.5, and per-fill-vs-per-order. Test-author's marginal value is highest where tests
+are absent or where acceptance lines need independent derivation; here it would restate the same four
+worked examples. second-verifier and red-team dispatched instead - the two lenses that can actually
+disagree with a fee number.
+
+agent: T05 id=a1b255ec7f8c8f558 role=second-verifier model=sonnet findings=2 confirmed=2 marginal=2 result=revised
+
+Second-verifier (financial lens) on T05. Money math clean on signs, units, maker/taker selection,
+non-negativity for IN-DOMAIN inputs, category-table transcription, and the per-fill ceiling. Two real
+findings, both orchestrator-confirmed:
+
+- #1 CONFIRMED, MARGINAL. `category_rate()` override precedence is broken BY CASE.
+  `fees.py:85-90` lowercases the INCOMING category but nothing normalizes the override dict's own
+  keys, and `app/config.py` has no validator for it. PLAN 3 spells categories capitalized
+  ("Crypto", "Geopolitics") - the venue's natural convention and exactly the shape that breaks.
+  Measured: `POLYMARKET_TAKER_FEE_OVERRIDES='{"Geopolitics": 0.02}'` -> `category_rate("Geopolitics")`
+  returns 0.0 (table default), override silently discarded; the lowercase key returns 0.02 correctly.
+  NOTE: the falsy-0.0 bug I predicted in the dispatch is NOT present - the code uses `in`, not
+  truthiness, so an explicit override of 0.0 is honored. Same bug class, different door.
+- #2 CONFIRMED, MARGINAL, and it is the most dangerous finding of the run so far. `fee()` performs
+  NO domain validation on `price`/`size_contracts` - unlike `FeeSchedule`'s own fields, which route
+  through `_check_price`/`_check_size` in types.py. Out-of-domain input returns a NEGATIVE fee,
+  violating the FeeModel ABC's own documented "always >= 0" contract. Measured:
+      price=1.5, size=100      -> -3.75
+      price=0.5, size=-100     -> -1.25
+      price=50.0, size=100     -> -17150.00   (Kalshi, rate 0.07)
+  THE REALISTIC TRIGGER: PLAN 3 records that older Kalshi payloads carry integer CENTS. An adapter
+  that forgets the /100 hands `price=50.0` to the fee model, which returns -$17,150 instead of
+  $1.75 - the system CREDITS the trader, and an arbitrage scorer reads that as free money on every
+  leg it touches. T12 writes that adapter. Second-verifier flagged this as adjacent-to-its-lens and
+  routed it to red-team rather than claiming it; recording it as its finding since it demonstrated it.
+
+DESIGN RISK, not a defect, for T07/T18 (second-verifier's finding 3, not counted as a defect):
+`fee()`'s signature is `size_contracts: float` with no type-level distinction between "one fill" and
+"an order's blended total". Nothing prevents or warns a caller that passes an aggregate. For an order
+filling in N pieces, an aggregate call understates cost by up to Nx (10-fill order: correct $0.10 vs
+wrongly-aggregated $0.01). T07's per-fill loop and T18's sizing are the named consumers.
+
+Second-verifier also CLEARED, with evidence, the 9dp pre-round risk I raised: it swept ~2,000,000
+realistic Kalshi combinations (cent-quantized prices 0.01-0.99, sizes derived by division from
+$0.01-$200 notional, rate 0.07) looking for a genuine residual in the 0..5e-10 danger window where
+the pre-round could push a fee DOWN across a 6dp boundary. Zero occurrences; every naive hit was
+float-representation noise ~1e-19, which the pre-round is designed to squash. Theoretically
+reachable, empirically not, and bounded at 5e-10 per fee if it were. Not a defect.
+
+agent: T05 id=a20d985e9092649b8 role=red-team model=sonnet findings=6 confirmed=5 marginal=4 result=revised
+
+Red-team on T05: 6 demonstrated breaks, 5 confirmed.
+- #1 negative fee on out-of-range price/size - NOT marginal (second-verifier raised it first;
+  pipeline order is second-verifier -> red-team). Red-team independently reproduced it.
+- #2 NaN price or size -> NaN fee, silently. MARGINAL.
+- #3 `price=inf` DIVERGES BY VENUE: Polymarket returns `-inf` (fabricated infinite credit), Kalshi
+  raises `decimal.InvalidOperation`. Same bad input, two different broken behaviors. MARGINAL.
+- #4 `size_contracts=1e300` or inf: Kalshi raises uncaught `decimal.InvalidOperation` (quantizing
+  ~1.25e298 to 1e-6 needs ~304 significant digits, past Decimal's 28-digit context); Polymarket
+  silently returns 1.25e+298. MARGINAL.
+- #5 the 9dp pre-round CAN undercharge by one 6dp tick - see the adjudication below. MARGINAL.
+- #6 `POLYMARKET_CATEGORY_TAKER_RATES` is a plain mutable module dict; an importer can mutate it
+  process-wide. Demonstrated a 100-contract @$0.60 crypto fee dropping $1.68 -> $0.00. `types.py`
+  already wraps every comparable collection in MappingProxyType/tuple; this table got no guard.
+  MARGINAL. (Red-team restored the value in-process and confirmed the on-disk default is untouched.)
+
+Red-team explicitly RULED OUT, with evidence: maker/taker inversion via malformed `liquidity`
+("MAKER", "Taker", "", None, 0, 1 all fall through to the TAKER branch - safe); the zero-size cent
+floor (0 contracts -> $0.00, 1000 empty fills accrue nothing); the falsy-0.0 override bug; and fuzzy
+category matching ("GEOPOLITICS" and " geopolitics " map to 0.0; "geo-politics" correctly does not).
+
+ORCHESTRATOR ADJUDICATION - the two roles CONTRADICTED each other on #5, and I settled it by measuring:
+  second-verifier swept ~2,000,000 combinations with rate FIXED at 0.07 and cent-quantized prices ->
+    zero genuine undercharges, concluded "theoretically possible, empirically unreachable".
+  red-team swept 500,000 with rate drawn CONTINUOUSLY from [0.04,0.07] -> 243 genuine undercharges
+    (~0.05%), one of which amplified to a full $0.01 through the cent floor.
+  Both were honest; they had different ideas of "realistic". I swept 300,000 with the rates the
+  venues ACTUALLY publish (0.04 / 0.05 / 0.07), cent-tick prices, and whole contracts, comparing
+  against exact Decimal ground truth: ZERO undercharges. Red-team's repro requires
+  `taker_rate=0.04053802336689357`, which no venue publishes - reachable only through a hand-typed
+  `polymarket_taker_fee_overrides` value.
+  VERDICT: not a live defect at published rates, but the door is real because overrides accept
+  arbitrary floats. Retry tightens the pre-round 9dp -> 12dp (three orders of magnitude smaller
+  discard window, still far above float64 noise ~1e-16) rather than rewriting the hot loop in Decimal.
+
+T05 RETRY DISPATCHED. attempts=2. The single validation fix (routing `fee()`'s own `price`/
+`size_contracts` through the existing `_check_price`/`_check_size`) closes negative, NaN, +-inf and
+overflow at once; plus override key normalization, MappingProxyType on the table, and the 12dp
+pre-round.
+
+agent: T05 id=ad50db44aea97ec5c role=implementer model=sonnet
+outcome: T05 model=sonnet attempts=2 result=retry-pass review=revised run=2026-09-05-3bd5
+
+T05 CLOSED. Suite 190 passed / 1 skipped; 31 fee tests. Orchestrator verified independently:
+all 9 out-of-domain cases now raise ValueError (including the `price=50.0` cents mistake that
+previously returned -$17,150); 40,000 randomized in-domain fees produced zero negative/NaN/inf
+results; the category table raises TypeError on mutation; a capitalized `Geopolitics` override now
+resolves to 0.02; and all four worked examples are unchanged.
+
+MY DISPATCH CLAIM WAS PARTLY WRONG, and the implementer caught it because I told it to verify rather
+than assume. I asserted that routing `fee()` through `_check_price`/`_check_size` would close
+negative, NaN, +-inf AND overflow "at once". It closes the first three. It does NOT close
+`size_contracts=1e300`, because 1e300 is finite and >= 0 - a perfectly valid size by the domain rule.
+That failure is a Decimal CONTEXT-PRECISION overflow (quantizing ~1.25e298 to 1e-6 needs ~304
+significant digits against a 28-digit context), a different failure class entirely. The implementer
+measured this before patching, then wrapped the quantize step in `try/except InvalidOperation ->
+ValueError` rather than inventing an upper bound inside `_check_size` that would not belong there.
+Polymarket's non-Decimal path returns a large finite positive number for the same input, which
+satisfies the never-negative/NaN/inf contract, so it was correctly left alone.
+
+Override normalization implemented as a pydantic `field_validator` on
+`Settings.polymarket_taker_fee_overrides` (lowercases and strips keys once at load) rather than at
+the lookup site - one normalization point instead of one per caller.
+
+### T06 — notes
+
+defect: T06 kind=unrunnable-verify
+
+T06's exact verify command includes `test -z "$(grep -n 'xfail' tests/test_smoke.py)"`, meant to
+confirm acceptance criterion 3 ("if it was `xfail(strict)` for tz reasons, it now must pass - remove
+the xfail"). `tests/test_smoke.py` never carried an `@pytest.mark.xfail` decorator (T02's smoke test
+was written to pass outright, per its own docstring - "It is NOT marked `xfail`..."), so there was
+nothing to remove. But that same T02 docstring prose literally contains the substring "xfail" twice
+(explaining why no xfail applies), so the literal grep is non-empty and `test -z ...` fails -
+regardless of anything T06 does - because the verify command can't distinguish a `pytest.mark.xfail`
+decorator from English prose discussing one. Confirmed by checking the exact failure: `grep -n
+'xfail' tests/test_smoke.py` matches only lines 104 and 106 (docstring text), not a decorator; `grep
+-n '@pytest.mark.xfail\|pytest.mark.xfail(' tests/test_smoke.py` (the acceptance criterion's actual
+intent) returns nothing, and `python3 -m pytest -q tests/test_smoke.py` passes outright (4 passed).
+Left `tests/test_smoke.py` untouched rather than rewording its docstring to dodge a literal grep -
+that would be optimizing for the verify command's letter, not its intent, and the docstring's own
+prose is accurate. Flagged here per GUARDRAILS.md §3.4 rather than silently editing around it or
+declaring the task done despite the mechanical exit code 1.
+
+Everything else in T06's own verify command ran clean: `pytest -q tests/strategies/test_intent.py`
+(37 passed), `ruff check app/strategies/base.py` (clean), `mypy app/strategies/base.py` (clean), and
+the full suite (see implementer's final report for the exact count) all green.
+
+agent: T06 id=a0fcfeeef10e8fafa role=implementer model=sonnet
+outcome: T06 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T06 CLOSED. Suite 227 passed / 1 skipped (+37). Orchestrator verified the full Intent validation
+matrix independently - complement (2 legs, same market, {YES,NO}) accepts and rejects correctly,
+cross_venue requires different venues, bundle requires >=3 distinct outcomes, zero legs rejected,
+confidence 1.5 rejected - and confirmed the R9 tripwire is ARMED: `MarketSnapshot` with a naive
+timestamp raises `ValueError("naive datetime")`.
+
+DEFECT KIND CORRECTED by the orchestrator: the implementer logged this as `tautological-verify`,
+which is backwards - that kind means a clause that can never FAIL. This clause can never PASS.
+Reclassified `unrunnable-verify`. The verify command contains
+`test -z "$(grep -n 'xfail' tests/test_smoke.py)"`, and I confirmed the two matches are DOCSTRING
+PROSE at `tests/test_smoke.py:104` and `:106` explaining why the test is NOT marked xfail. Grepping
+for a real marker (`@pytest.mark.xfail`) returns nothing. The implementer correctly left the prose
+alone rather than rewording documentation to dodge a literal grep - the same call T03's implementer
+faced with the `.claude` scope.
+
+THIS IS THE FOURTH INSTANCE OF ONE DEFECT SHAPE, and it should be the headline of the end-of-run
+architect feedback:
+  T01  `ruff check` path scope swept in pre-existing baseline debt
+  T03  acceptance grep over `.claude` swept in the kit's own files (24 hits, 18 in the TASKS.md
+       that specifies the grep)
+  T05  (caught at dispatch before harm) "MUST say Re-confirmed against <URL>" would have driven an
+       implementer into a venue network call that GUARDRAILS 1.4 absolutely forbids
+  T06  grep 'xfail' matches prose ABOUT xfail
+  Pattern: a verify clause that greps a scope containing its own documentation, its own kit, or
+  pre-existing debt. The fix in the next kit is not more careful greps - it is to anchor acceptance
+  on the CONSTRUCT (`@pytest.mark.xfail`, a symbol, a count) rather than a bare WORD, and to scope
+  every path list to files the task actually owns.
+
+Design notes carried forward from T06 (implementer-reported):
+- `_leg_to_signal` in `engine.py` is an explicit pre-T08 bridge; T08 replaces `_process_snapshot`'s
+  single-leg execution with real per-leg fills and REMOVES that helper.
+- `Intent.legs` is a plain mutable `list[Leg]`. T08/T14 should decide whether `OrderRouter` needs it
+  immutable - note T04's books were made immutable for exactly this reason.
+- `Signal.timestamp` still defaults to a NAIVE `datetime.utcnow()`. Out of T06's scope, but it is a
+  live naive-datetime spot the moment anything compares it against an aware value. T08 owns the
+  engine's tz work and should close it.
+- The multi-leg warning fires with `extra={"leg_count", "intent_kind"}` and is caplog-tested,
+  including a negative test that a single-leg Signal does NOT trigger it.
+
+---
+
+## T07 implementer notes (`SimulatedFillEngine`)
+
+Three brief-vs-repo gaps, all resolved ADDITIVELY (nothing renamed, no alternative design):
+`defect: T07 kind=underivable-requirement` x3.
+
+1. The brief writes `OrderBook.metadata["depth_source"]` and `Fill.metadata["latency_ms"]`, but
+   T04's `OrderBook`/`Fill` have no `metadata` field (PLAN.md D3 does not list one). Added
+   `metadata: Mapping[str, Any] = field(default_factory=dict)` to BOTH, frozen to
+   `MappingProxyType` like every other mapping in `types.py`. `OrderBook.__post_init__` defaults
+   `metadata["depth_source"]` to `"recorded"` and REJECTS any value outside the new
+   `DepthSource = Literal["recorded","synthetic"]` - a typo there would mislabel fabricated depth
+   as real (GUARDRAILS 1.7). Also added `OrderBook.depth_source` (property) and exported
+   `DepthSource`/`DEPTH_SOURCE_KEY` from `app.venues`. Purely additive: every existing construction
+   is keyword-based and the field is last with a default; T04's 96 type tests still pass.
+2. `fill(order, book, now)` must "respect `tick_size` and `min_size`", but both live on
+   `VenueMarket` and the signature has no market. Added keyword-only `market: VenueMarket | None
+   = None`. When it is `None` those two constraints are NOT enforced - the engine will not guess a
+   venue microstructure it was not told, and defaulting to a 0.01 tick would have made T08 raise on
+   any replayed off-cent price. T13/T14 have a `VenueMarket` from `get_market()` and should pass it.
+3. `synthesize_book(snapshot, liquidity_fraction)` is specified to use `no_*` "for outcome NO", but
+   `MarketSnapshot` carries no outcome field. Added keyword-only `outcome: str = "YES"`; the
+   brief's two-argument call still works.
+
+Formula divergence (deliberate, brief wins): PLAN.md D6 writes synthetic size as
+`liquidity_fraction x volume_24h`; the T07 brief writes `... / price`. Implemented the brief's -
+`volume_24h` is USD and a book level is contracts, so the division is a unit conversion. The
+`1/price` blow-up is FLOORED at one cent (the divisor only, never the level's price), bounding
+invented depth at `100 x liquidity_fraction x volume_24h` contracts, with
+`metadata["synthetic_price_floor_applied"]` recording when it bit.
+
+Suite 281 passed / 1 skipped (+54). `alembic heads` = `002 (head)`, untouched.
+
+agent: T07 id=ade6052ea7470ab5c role=implementer model=opus
+defect: - kind=stale-plan-decision
+
+T07 landed. Suite 227 -> 281 passed / 1 skipped (+49 fill-engine, +5 types). Orchestrator verified
+10 money-critical assertions independently: avg_price is size-weighted (0.4033333333, NOT the naive
+0.405); limit stops the walk at the right level; FOK is genuinely all-or-nothing; the per-fill Kalshi
+fee is $4.24 vs $4.20 for a single aggregate call (i.e. $0.04 understated on ONE 3-level order if
+done wrong); total_fee equals the sum of per-fill fees; `FillResult` REJECTS `filled` with
+remaining>0 at construction; and the `depth_source` tag rides from `synthesize_book` onto every Fill.
+
+ARCHITECT DEFECT - PLAN.md AND TASKS.md CONTRADICT EACH OTHER, and PLAN.md is the wrong one:
+  PLAN.md:230   size = liquidity_fraction x volume_24h
+  TASKS.md:331  size = liquidity_fraction x volume_24h / price   contracts
+`volume_24h` is USD; a book level is CONTRACTS; dollars/(dollars per contract) = contracts. The
+`/price` form is dimensionally correct and PLAN's is a units error that would inflate synthetic depth
+by 1/price - about 2x at even money, 100x at a penny, i.e. worst exactly where real books are
+thinnest. The implementer followed the brief, implemented the correct form, and documented the
+divergence rather than silently picking one. Recorded against the kit (task token `-`) since it is a
+PLAN-level inconsistency, not a T07 defect. PLAN.md 230 should be corrected in Phase 4.
+
+DESIGN CALLS THE IMPLEMENTER MADE, all sound, recorded so later tasks do not undo them:
+- Reused `OrderBook.walk()` rather than writing a second walk loop: it filters the book to
+  limit-eligible levels via `dataclasses.replace` and hands the restricted book to the untouched
+  `walk()`. Equivalent because eligible levels are always a PREFIX of the best-first order (guaranteed
+  by T04's construction-time normalization), and it keeps ONE depth-consuming primitive in the repo.
+  It also matched walk()'s epsilon shape exactly - a different tolerance would let walk() call a
+  request satisfied while the engine still reported a dust "partial".
+- The status invariant is enforced in `FillResult.__post_init__`, so it holds for ANY producer, not
+  just this engine.
+- `price -> 0` synthetic depth: the DIVISOR (never the level price) is floored at 0.01 = one cent =
+  both venues' minimum tick, bounding invented depth at 100 x liquidity_fraction x volume_24h.
+  Unfloored, an ask at 0.001 with $50k volume and fraction 0.02 would rest 1,000,000 contracts - a
+  million dollars of notional conjured onto a market that traded fifty thousand. `price=0.0` would
+  have been a ZeroDivisionError. `metadata["synthetic_price_floor_applied"]` records when it bit.
+- Book/order identity is checked strictly (venue + market_id exact, outcome case-insensitive):
+  filling against another market's depth is a silent money error, so it raises.
+- A missing FeeModel for a venue RAISES rather than defaulting to a free fill.
+
+Three brief-vs-repo gaps the implementer resolved additively (it logged `underivable-requirement`):
+`OrderBook.metadata`/`Fill.metadata` did not exist (added, frozen like every other mapping);
+`tick_size`/`min_size` live on `VenueMarket`, which `fill()` never received (added keyword-only
+`market=None`, and when None those two constraints are deliberately NOT enforced, because defaulting
+to a 0.01 tick would make T08 raise on any replayed off-cent price); `synthesize_book` had no
+outcome parameter despite being specified to use `no_*` for NO (added keyword-only, default "YES").
+
+FOR T08 (implementer-reported, carry into its brief): call `fill()` with NO `market` unless a real
+`VenueMarket` exists - replayed snapshot prices are frequently off any fixed tick grid and would
+raise. `min_size` gates the FILLED quantity, not the residual. `FillResult.fills` is a tuple. Each
+Fill's `metadata` carries depth_source/latency_ms/market_id/outcome - `Fill` has no market field, so
+key positions as f"{venue}:{market_id}:{outcome}". `BacktestResult.depth_source` should aggregate to
+"mixed" when both appear. `latency_ms` does NOT move `Fill.ts`; `fill_at="next"` is the real
+look-ahead defense.
+
+agent: T07 id=a3990aed037cb3601 role=red-team model=sonnet findings=6 confirmed=6 marginal=6 result=revised
+
+Red-team on T07: 6 demonstrated breaks, all 6 confirmed and all 6 marginal (none covered by T07's 49
+tests; second-verifier had not yet reported). THREE fabricate profit directly.
+
+- #3 CROSSED BOOK IS WALKED WITH NO DETECTION. Orchestrator-reproduced: bids=[(0.60,100)],
+  asks=[(0.55,100)], BUY 100 @ limit 0.55 -> status=filled, avg_price=0.55. The engine bought at
+  0.55 while that same book bids 0.60 - an instant riskless $5.00 mark-to-market gain on a 100-lot,
+  reported as an ordinary fill. Nothing in `OrderBook.__post_init__`, `fill()`, or `MarketSnapshot`
+  rejects or flags it. FABRICATES PROFIT.
+- #4 `synthesize_book` propagates a crossed MarketSnapshot straight into a crossed OrderBook
+  (yes_bid=0.60, yes_ask=0.40 -> best_bid > best_ask). Compounds with #3: any stale or bad
+  top-of-book row in `PriceHistory` - a real possibility - becomes a synthetic book the engine fills
+  at the free-money spread. FABRICATES PROFIT.
+- #6 `schedules()`'s RETURN VALUE is trusted with zero validation. A callable returning
+  `FeeSchedule(taker_rate=0.0, ...)` - the shape of a market-keying bug resolving to a fee waiver -
+  produces total_fee=$0.0000 where the correct schedule gives $1.8047. The engine ALREADY refuses
+  the functionally identical outcome on the sibling path, raising
+  "no FeeModel configured for venue 'polymarket'; refusing to simulate a fill with an unknown
+  (implicitly free) fee". Same invariant, defended on one input path and not the other.
+  UNDERSTATES COST / FABRICATES EDGE.
+- #2 off-tick limit fills silently when `market=None`. Deliberate and documented - but the docstring
+  ALSO says the backtester "generally cannot" supply a VenueMarket, so the one caller it names is
+  structurally exposed to filling orders at prices no venue would accept. Outside acceptance,
+  orchestrator's call. FABRICATES TRADES.
+- #1 `post_only` unfilled is byte-for-byte identical to a no-liquidity unfilled; the only signal is
+  a transient log line. T14's router retrying "unfilled" turns a post_only order into an infinite
+  loop. Outside acceptance, orchestrator's call.
+- #5 `synthesize_book(volume_24h=0)` yields a phantom zero-SIZE level rather than an empty side, so
+  `best_ask() is not None` for a market that traded nothing. `fill()` is unaffected, but any consumer
+  testing presence rather than `.size` reads a dead market as quotable.
+
+Red-team RULED OUT with evidence: `rng_seed` is fully inert (identical results across 5 seeds -
+matches the docstring's own admission, so a misleading API rather than a bug); negative order size
+cannot reach `fill()` (rejected by `OrderRequest.__post_init__`); whitespace-padded outcome raises
+(casefold does not trim - fails loud); zero-size order returns "unfilled" without calling `fee()`.
+
+PROCESS LESSON, CHARGED TO ME: in T04 I adjudicated red-team's crossed-book finding as "CORRECT at
+the type layer (arb detection is a later task)". That ruling was right - venues do briefly show
+crossed books and the normalized type should not reject them. But I deferred the check WITHOUT
+naming an owner, and three tasks later the fill engine walks straight through a cross and books free
+money. A "correct here, handle it downstream" decision needs an explicit owning task written into
+NOTES at the moment it is made, or it evaporates. I am recording the general rule here because it
+will recur: T14's router and T18's arb detector will both face the same class of deferral.
+
+agent: T07 id=acbedc713b1cc7032 role=second-verifier model=sonnet findings=2 confirmed=2 marginal=2 result=accepted
+
+Second-verifier on T07: money math CLEAN in its lens, no financial-correctness defects. It
+independently re-derived and agreed with all four findings the orchestrator had already established,
+and resolved three open questions the dispatch posed:
+
+- THE `/price` RULING IS CONFIRMED WITH EVIDENCE I DID NOT HAVE. It traced `volume_24h` to
+  Polymarket's Gamma API `volume24hr` field via `data_collector.py:623` and established it is USD
+  notional, not a contract count. So `size = liquidity_fraction x volume_24h / price` is
+  dimensionally correct and PLAN.md:230 is definitively the wrong one. My `stale-plan-decision`
+  defect line above stands.
+- THE NO-SIDE INVERSION I WORRIED ABOUT DOES NOT EXIST, and it checked the right thing rather than
+  the obvious thing: `synthesize_book` reads `no_bid`/`no_ask` VERBATIM instead of deriving them, so
+  it cannot introduce an inversion itself. It then traced the actual producer -
+  `data_collector.py:728-729` does `no_bid = 1 - yes_ask` and `no_ask = 1 - yes_bid`, the CORRECT
+  cross. It also checked the second producer (`data_replay.py:475-484`), whose different-looking
+  formula is algebraically identical under its symmetric-spread construction - correct, if
+  coincidentally so.
+- The 0.01 divisor floor uses `<` not `<=` at the boundary (price exactly 0.01 is NOT floored -
+  correct), and the floor alters only the divisor, never the level's quoted price.
+
+Its 2 findings, both confirmed and actioned in the retry:
+- #1 The `total_fee` convention is never stated: it is a positive cost the caller must SUBTRACT, and
+  it is NOT netted into `avg_price`. Discoverable from the code, never written down, and T08 + T14
+  both consume it next. Double-counting or free fees are the two failure modes.
+- #2 `synthesize_book` has no safeguard against a future `MarketSnapshot` producer using the wrong
+  no_bid/no_ask convention - a silent dependency rather than a bug today, since both current
+  producers are correct.
+
+It also verified SELL-side direction explicitly, which nobody had: bids `(0.50,100),(0.48,100)` for
+150 gives avg 0.4933333..., i.e. a SELL correctly receives LESS as it walks deeper, mirroring a BUY
+paying more. An engine that averaged a sell's proceeds upward would manufacture edge on every
+multi-level exit.
+
+Honest scope note it volunteered: it ran only `tests/execution/` (49 passed), not the full suite,
+since it was a scoped read-only second opinion. Orchestrator ran the full suite separately: 281.
+
+T07 RETRY DISPATCHED (opus). attempts=2. One design change - a machine-readable `reason` field on
+FillResult - closes red-team #1 (post_only indistinguishable from no-liquidity, T14 infinite-retry
+hazard) and carries the crossed-book decline. Crossed books DECLINE rather than raise, because T08
+replays real history and raising would abort a whole run on one bad row; a counted, labeled skip is
+itself a data-quality signal. Zero fee rates must be DECLARED (Geopolitics is legitimately 0.0 and
+Kalshi waivers are real), so the rule is "explicit and traceable", not "forbidden".
+
+agent: T07 id=aaf9d3ad43f2ac2f7 role=implementer model=opus
+defect: T07 kind=contradictory-acceptance
+outcome: T07 model=opus attempts=2 result=retry-pass review=revised run=2026-09-05-3bd5
+
+T07 CLOSED. Suite 281 -> 320 passed / 1 skipped; 88 fill-engine tests (49 original, unmodified, plus
+39). Orchestrator verified all six fixes independently (10 assertions): crossed book DECLINES with
+`reason="crossed_book"` and zero fill; a LOCKED book (bid == ask) still fills; skips are counted on a
+public `engine.crossed_book_skips`; post_only is now distinguishable from no-liquidity; `schedules()`
+returning None raises a typed ValueError; an undeclared zero rate fills but is recorded in
+`engine.undeclared_zero_fee_markets` while a declared one (`fee_waiver`) is not; `volume_24h=0`
+yields an empty side with `best_ask() is None`; a crossed snapshot is tagged `crossed_quotes=True`;
+and `market=None` tags `tick_validated=False`.
+
+CONTRADICTORY-ACCEPTANCE IN MY OWN RETRY BRIEF, caught by the implementer and charged to me: my
+acceptance line 3 said "a free fill is impossible unless explicitly declared" while the brief BODY
+said warn-don't-raise. Those cannot both hold. It followed the body, implemented the weaker but
+correct guarantee - an undeclared free fill is impossible SILENTLY - and asked me to rule rather than
+picking quietly. This is the same failure mode I have now recorded four times against the architect's
+briefs, appearing in mine.
+
+ORCHESTRATOR RULING: keep warn-and-record. Raising would abort an entire replay on one
+mis-resolved market, which is the same reasoning that makes a crossed book decline rather than throw.
+But the record must be SURFACED, not merely available.
+=> HARD REQUIREMENT FOR T08: `BacktestResult` must carry `undeclared_zero_fee_markets` the same way
+it carries `depth_source`. A backtest whose fees silently resolved to zero is not a trustworthy
+result, and GUARDRAILS 1.7's rule is that unverifiable assumptions are LABELED, never hidden.
+
+Design decisions worth preserving:
+- `FillReason` is a 6-value vocabulary split by what a router should DO: structural/non-retryable
+  (`crossed_book`, `post_only_taker_engine`, `zero_size_order`) vs retryable market conditions
+  (`no_eligible_levels`, `below_min_size`, `fok_insufficient_depth`). `FillResult.__post_init__`
+  enforces the correspondence BOTH ways - an "unfilled" with no reason is now a ValueError, and a
+  filled/partial may not carry one - so T14 branches on `reason is None`. The implementer added
+  `zero_size_order` beyond the five I named, because a zero-size order was previously
+  indistinguishable from no liquidity.
+- Crossed is STRICTLY greater, with a 1e-12 epsilon so a lock reconstructed through float arithmetic
+  is never misread as a one-ulp cross. `_is_crossed()` also honors an upstream
+  `metadata["crossed_quotes"] is True`, so T21's recorded books can flag a cross the surviving levels
+  no longer show.
+- The zero-rate policy is PROVENANCE-based, not value-based: a 0.0 taker rate is silently fine from
+  `fee_waiver`/`category_table`/`clob_market` and warns from anything else. Value-based would have
+  been wrong - Polymarket's Geopolitics category is genuinely 0.0 and Kalshi waivers are real.
+  Warned once per market, because a replay calls this per snapshot and 100k identical warnings are as
+  unreadable as none.
+- Negative `liquidity_fraction` RAISES (it cannot come from data, only from a mis-set setting, and a
+  config error should be fixed rather than absorbed) while 0.0 is legal and yields an empty book.
+- `rng_seed` kept but documented as never consulted, guarded by a 5-seed determinism test.
+
+agent: T08 id=a0296cf33dd3b953a role=implementer model=opus
+outcome: T08 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T08 CLOSED. Suite 320 -> 326 passed / 1 skipped. THE BACKTEST IS NOW HONEST. Orchestrator verified
+independently, not by re-running their tests:
+- `datetime.utcnow` is gone from all four named scopes; `_leg_to_signal` and its stale pre-T08
+  warning are both removed; all 7 public backtesting names still import, and so do the API route and
+  the Celery task.
+- `BacktestResult` carries all 9 self-reporting fields including the two I ruled mandatory at T07's
+  close (`undeclared_zero_fee_markets`, `crossed_book_skips`) plus `tick_unvalidated_fills`.
+- LOOK-AHEAD INVARIANCE, my own adversarial construction: two streams identical through index 6,
+  then violently divergent (yes 0.45 -> 0.99, no -> 0.005, spread -> 0.30, volume 500k -> 5).
+  `binary_complement_arbitrage` produced SIX IDENTICAL TRADES before the cutoff in both streams while
+  total trades diverged 14 vs 7 after it. 14 intents generated, 13 executed, 1 expired.
+- NEXT-SNAPSHOT PRICING, measured directly: snapshot 0 ask 0.455, snapshot 1 ask 0.405.
+  `fill_at="same"` transacts at 0.455 (the price that GENERATED the signal - look-ahead) and stamps
+  every trade `diagnostic_same_snapshot=True`; `fill_at="next"` transacts at 0.405 (the price
+  actually available afterwards). The engine also logs an explicit warning that "same" is a
+  diagnostic carrying look-ahead.
+
+METHOD NOTE ON MY OWN VERIFICATION, recorded because it is the same defect class I keep charging to
+the briefs: my FIRST look-ahead test passed VACUOUSLY - zero trades in both streams, so `0 == 0`
+proved nothing. The cause is T04's own fix: `make_snapshot` now defaults `no = 1 - yes`, so the
+default snapshot is arbitrage-neutral and the arb strategy correctly finds nothing. I had to
+construct a DELIBERATE complement violation (yes=0.45, no=0.45, sum 0.90) in the shared prefix to
+make the test non-trivial. A passing test that exercises nothing is worse than no test, and I nearly
+recorded one as evidence.
+
+Design decisions the implementer made, worth preserving:
+- Legs are SIMULATED first (`_plan_legs` builds a `_LegPlan` per leg touching no portfolio state),
+  then committed. `all_or_none` blocks on any unfilled leg or any leg short of
+  `size x (1 - partial_tolerance)`, commits nothing, and records the reason from T07's existing
+  six-value vocabulary rather than inventing a parallel one.
+- SELL legs are capped at the held position size, so a naked short degrades to `zero_size_order`
+  rather than fabricating proceeds - the same impossible-trade class PLAN 3 records as the reason
+  `cross_platform_arbitrage` was broken.
+- Sizing splits a USD budget as `size_usd / sum(leg limit prices)` so every leg gets the same CONTRACT
+  count; equal dollars would leave a naked residual.
+- Pending intents key on `(venue, market_id)` per leg and fill against the FIRST snapshot of that
+  market to arrive after queueing - not a later fresher one - so a cross-venue result does not depend
+  on how far apart the two venue streams run. TTL is checked BEFORE the arriving snapshot is applied.
+- Exits now walk the book (`min(price, best_bid)` minus the FIXED pad, partial fills leave the
+  remainder open, no bid means no exit). `_close_all_positions` deliberately does NOT walk - it marks
+  to market at last price with a modeled taker fee and tags `mark_to_market=True`, because a
+  valuation is not a fill and settlement belongs to T09.
+- FLAGGED BY THE IMPLEMENTER, worth watching: `_size_intent` builds a "sizing probe" Signal from
+  `legs[0]` because `BaseStrategy.calculate_position_size` takes a Signal. It is never executed and
+  its result applies to all legs - a different thing from the deleted bridge, but similar in shape.
+
+agent: T09 id=a0296cf33dd3b953a role=implementer model=opus
+outcome: T09 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T09 CLOSED. Suite 326 -> 333 passed / 1 skipped. `alembic heads` = `003 (head)`; offline SQL emits
+`ALTER TABLE backtest_runs ADD COLUMN report JSONB DEFAULT '{}' NOT NULL`. ruff + mypy clean on all
+three gated paths. Served by the SAME WARM AGENT as T08 (warm cluster T08->T09 per the TASKS
+preamble) - one opus spawn covered both, engine.py context reused rather than re-read.
+
+THE ARBITRAGE THESIS NOW HAS ARITHMETIC. Orchestrator computed it independently from the repo's own
+fee models and settings, for a Polymarket complement YES 0.45 + NO 0.48 (0.93 for a guaranteed 1.00):
+   contracts   gross    fees     gas      NET      net/contract
+           1  0.0700  0.0249    0.10  -0.0549       -0.054855
+           2  0.1400  0.0497    0.10  -0.0097       -0.004855
+           5  0.3500  0.1243    0.10   0.1257        0.025145
+         100  7.0000  2.4855    0.10   4.4145        0.044145
+       10000  700.00  248.55    0.10  451.35         0.045135
+Two conclusions that should shape T18/T19/T20/T22:
+ 1. GAS IS A ROUNDING ERROR AT SCALE; THE TAKER FEE IS THE WHOLE STORY. At 100 contracts the fee is
+    $2.4855 against a $7.00 gross edge - 35% of the edge - and it scales linearly forever while gas
+    stays fixed at $0.10.
+ 2. MINIMUM TRADEABLE COMPLEMENT VIOLATION IS ~2.5%. Measured break-even by bisection:
+      1 contract   -> need yes+no <= 0.8754 (12.46% edge)
+      10 contracts -> need yes+no <= 0.9650 (3.50%)
+      100          -> need yes+no <= 0.9740 (2.60%)
+      1000         -> need yes+no <= 0.9749 (2.51%)
+    It asymptotes at ~2.5% because `0.05 x p(1-p)` is ~1.25c per contract per leg at mid-range
+    prices, so a round trip costs ~2.5c and needs a 2.5% edge to clear. SUB-2.5% COMPLEMENT
+    VIOLATIONS ARE NOT TRADEABLE ON POLYMARKET AT ANY SIZE. That is a hard bound on how much real
+    opportunity exists, and T19's scorer must apply it rather than ranking raw spread.
+    Corollary supporting D10: `p(1-p)` collapses at the tails, so a market at 0.95 costs about a
+    fifth of a coin-flip market to trade - lopsided near-resolution markets are structurally the
+    cheapest place to hunt complement edges. Kalshi's $0.01 per-fill floor cuts the OTHER way there
+    (see T05), so the two venues need different sizing logic in the same bucket.
+
+The implementer verified the per-position gas unit rather than taking it on faith: it fit a line
+across 100- and 20-contract runs, getting slope 0.050116 and intercept -0.10 = -2 x gas. Per-CONTRACT
+gas would have made the 100-lot pay $10 and net -4.9884, so the test fails loudly on the wrong unit
+instead of silently making small positions look ruinous and large ones free.
+
+REAL DEFECT FOUND WHILE WRITING THE LOOK-AHEAD TEST: `DataReplayer` could never run on SQLite at all.
+`DateTime(timezone=True)` returns aware from Postgres but NAIVE from SQLite, and `MarketSnapshot`
+rejects naive timestamps, so the first row raised `TypeError: can't compare offset-naive and
+offset-aware datetimes`. The DB replay path had ZERO test coverage before this task. Fixed with
+`_as_utc()` at the read boundary only - and reading the naive value as UTC is not a guess, because
+SQLite's bind processor discards the offset on the way IN, so the stored wall clock already is UTC.
+
+Beyond-brief changes, all sound:
+- `_close_all_positions` and `MARK_TO_MARKET_KEY` are GONE. PLAN D6 says unresolved positions are
+  MARKED to last price, not exited - booking synthetic exit trades would have padded trade count and
+  win rate with round trips that never happened, corrupting every metric in `metrics.py`.
+  `final_value` marks them via `total_equity`; they are listed in `unrealized_at_end`.
+- `FUTURE_ENCODING_MARKET_FIELDS = {is_resolved, resolution_outcome, resolved_at, outcome_prices}`
+  and `_get_market_metadata` RAISES if its assembled dict ever contains one. The check cannot fire
+  today by construction - it exists so the day someone adds `is_resolved` there, the run STOPS
+  instead of quietly reporting a strategy that could read the answer sheet.
+- Settlement splits P&L from CASH: realized_pnl lands at `resolved_at` (the gain is real) while cash
+  waits `settlement_delay_hours`. `total_equity` includes pending so the equity curve does not dip
+  and recover inventing a drawdown; `cash` does not, so sizing correctly cannot spend it. Verified
+  end-to-end: a 50.00 intent at T0+2h is rejected (spendable 9.00, 99.95 escrowed) and the identical
+  intent fills at T0+26h.
+- A settling market EXPIRES its pending intents rather than filling them, and `_resolved_keys` makes
+  `_book_for` refuse post-resolution books - no fill can occur on a market that has already paid out.
+- `_mark_backtest_failed(error_message)` previously DISCARDED its argument (a ruff ARG001); it now
+  persists into `BacktestRun.report`, so a FAILED run's reason is no longer lost.
+- `markets_closed_unresolved` deliberately conflates "still open" with "closed, no resolution data",
+  and says so: a snapshot carries no close state, because that would itself be look-ahead.
+
+FOR T22: `build_report()` in `tasks/backtesting.py` is the single serializer for the trustworthiness
+payload - reuse it rather than re-flattening `BacktestResult`.
+
+agent: T10 id=a37688fd20900d3d5 role=implementer model=sonnet
+agent: T10 id=aeddecfb5305a6bea role=scout model=sonnet findings=1 confirmed=1 marginal=1 result=accepted
+defect: T10 kind=unusable-default-config
+
+T10 IS NOT CLOSED. The work is largely right - fee literals gone, registry at 8,
+`cross_platform_arbitrage` deleted, ruff/mypy clean, 346 passed - but MY independent run of
+acceptance criterion 3 produced ZERO TRADES where the implementer reported it passing, and chasing
+that disagreement found a real defect neither the implementer nor the scout named.
+
+WHAT I MEASURED: with the SHIPPED DEFAULTS, a persistent yes+no = 0.81 complement produced
+10 intents generated, 0 executed, 9 rejected `below_min_size`, 1 expired.
+
+WHAT THE SCOUT ESTABLISHED (file:line, and I confirm it): the engine rejects at
+`engine.py:1647` when `_leg_sizes` returns None, which happens at `engine.py:1735` when total
+notional < `_MIN_TRADE_USD = 10.0` (`engine.py:127`). The engine does NOT override an explicit
+`Leg.size_contracts` - it takes 10.0 verbatim - so the notional is 10 x 0.405 x 2 = $8.10, under the
+floor. The scout's verdict was "not an engine defect, your fixture used the bare default".
+
+WHY THAT VERDICT IS INCOMPLETE, and this is the actual finding:
+  the floor needs   min_position_size x (yes_ask + no_ask) >= 10.00
+  at the default    min_position_size = 10.0  =>  needs yes+no >= 1.000
+  but the strategy signals only when       yes+no < 1 - fees - gas  (~0.97)
+  THE TWO CONDITIONS ARE MUTUALLY EXCLUSIVE AT EVERY PRICE.
+Measured across the range: yes+no of 0.80/0.90/0.95 all signal and all fail the floor; 0.97/1.00
+clear or approach the floor and do not signal. So `binary_complement_arbitrage` with its shipped
+default can NEVER execute a trade. 100% of its signals are rejected, silently, counted only in
+`intent_rejections`.
+
+THE TEST HIDES IT. `tests/strategies/test_arbitrage_intents.py:293-325` constructs the strategy with
+`config={"min_position_size": 20.0}` and its own docstring says that override is "needed only to
+clear the engine's _MIN_TRADE_USD ($10) notional floor at these prices". The implementer HIT the
+floor, worked around it in the fixture, documented the workaround, and did not recognise that the
+default it shipped is unusable. Acceptance criterion 3 permitted this by requiring "a backtest
+produces trades on both outcomes" without requiring DEFAULT CONFIG.
+
+This is the strongest argument in the whole run for the orchestrator re-running acceptance checks
+independently rather than trusting a green suite. 346 tests passed. ruff and mypy were clean. The
+flagship arbitrage strategy could not place a trade.
+
+RETRY DISPATCHED.
+
+agent: T10 id=a2cdb8dfe29d0bfd4 role=implementer model=sonnet
+outcome: T10 model=sonnet attempts=2 result=retry-pass review=revised run=2026-09-05-3bd5
+
+T10 CLOSED. Suite 346 -> 348 passed / 1 skipped. Orchestrator re-ran the EXACT check that failed,
+with bare shipped defaults: 18 trades across BOTH outcomes, 9 of 10 intents executed, ZERO
+rejections (was 0 trades, 9 rejections). Fee literals still absent, registry still 8, ruff/mypy clean.
+
+Fix: `min_position_size` default 10.0 -> 100.0 on BOTH arbitrage strategies, justified two ways.
+Floor: at 100 contracts the notional clears $10 down to yes+no >= 0.100, versus the old default's
+impossible >= 1.000. Economics: gas/contract at size 100 is 2 x 0.05 / 100 = 0.001, giving
+0.044128/contract against an unlimited-scale asymptote of 0.045128 - within 2.2%, so 100 is the
+smallest round size where the fixed gas drag is already negligible.
+Discoverability: `_MIN_TRADE_USD` moved to `Settings.min_trade_usd` (documented beside
+`redemption_gas_usd` and the other T05 cost knobs); `engine.py` now reads it live, and the old module
+constant is kept as a documented snapshot for back-compat. That is the durable fix - a strategy
+author now finds the floor where every other cost lives.
+
+THE BUNDLE STRATEGY SHARED THE DEFECT, and the implementer handled the second half exactly right.
+It confirmed `multi_outcome_bundle_arbitrage` had the same shape (its own example fixture, asks
+summing to 0.75, gave notional 10 x 0.75 = $7.50, rejected `below_min_size` every time) and fixed
+the sizing. But it then found a SECOND, unrelated, pre-existing blocker: `Backtester._book_for` has
+no book-synthesis path for any outcome other than "YES"/"NO" (its own docstring says so), because a
+bundle's legs ("A"/"B"/"C") are priced from `snapshot.orderbook["outcomes"]` rather than the scalar
+`yes_ask`/`no_ask` fields synthesis reads. So a >=3-leg bundle intent CANNOT fill end-to-end today
+regardless of sizing. It fixed what was in scope, added a test proving `below_min_size` is gone, and
+explicitly REFUSED to write a passing full-fill test - "that would repeat exactly the mistake this
+retry was about". Correct judgement, and it is the behaviour the retry was meant to teach.
+=> CARRY-FORWARD: multi-outcome bundles cannot execute until per-outcome books exist. That is
+   PLAN D10 territory and lands naturally in T21 (recorded depth, `book_snapshots`). T21's brief
+   must cover synthesis or recording for arbitrary outcome labels, not just YES/NO, or the bundle
+   strategy stays dead. Flag to the P1 reviewer.
+
+THE FULL THESIS, DEMONSTRATED END TO END by the orchestrator on identical trades at identical prices:
+    no resolution (marked to market)  pnl =  -30.69   18 trades   coverage 0.00
+    WITH resolution (settled)         pnl = +149.21   20 trades   coverage 1.00
+An unresolved complement pair marks at what you paid minus fees, i.e. a LOSS; the arbitrage profit
+materialises ONLY at settlement, when the pair pays exactly 1.00. Consequence that must reach the
+user and T22: A BACKTEST OVER A WINDOW WHERE MARKETS HAVE NOT RESOLVED WILL MAKE COMPLEMENT
+ARBITRAGE LOOK LIKE A MONEY-LOSER. T09's `low_resolution_coverage` flag (< 0.8) is exactly the guard
+against reading that first row as a verdict on the strategy, and it has now earned its place.
+
+agent: T11 id=a50d03034f5c56ac5 role=implementer model=sonnet
+defect: T11 kind=stale-pin
+outcome: T11 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T11 CLOSED. Suite 348/1skip -> 369 passed / 0 skipped. THE FIRST REAL MONEY FENCE IS CLOSED.
+The skip disappeared because `Settings.trading_mode` now exists, so T02's test-author's
+skip-guarded test began asserting for real - exactly as it was designed to.
+
+Orchestrator-verified the fence directly, all four cases:
+    default settings                  -> LiveTradingDisabled   (blocked)
+    live, NO confirmation             -> LiveTradingDisabled   (blocked)
+    live + exact confirmation string  -> allowed               (deliberate opt-in, correct)
+    live + WRONG-CASE confirmation    -> LiveTradingDisabled   (exact match required)
+`grep -rln 'post_order|create_order|cancel_order' app/venues/polymarket/` matches ONLY `live.py`,
+and `get_adapter('polymarket','live')` raises LiveTradingDisabled under default env. This closes the
+Phase 0 security audit's finding 1.2: `conftest.py` had been setting TRADING_MODE=paper since T02
+while nothing read it - a fence wired to a lock that had not been installed. The lock is installed.
+
+BRIEF/REPO MISMATCH I CAUGHT AT DISPATCH (hence the `stale-pin` line, charged to the architect):
+T11's brief says map CLOB `tick_size`/`min_order_size` onto `OrderBook.tick_size/min_size`.
+`OrderBook` has no such fields - it is `venue, market_id, outcome, bids, asks, ts, metadata`. Those
+constraints live on `VenueMarket`, which is precisely why T07's `fill()` takes an optional `market=`.
+Resolved in the dispatch: populate `VenueMarket.tick_size`/`min_size`, put the book payload's own
+values in `OrderBook.metadata`, and do NOT add fields to a frozen type four modules depend on.
+
+CONFIRMED HAZARD FOR T12/T13 - `Settings(...)` SILENTLY SWALLOWS FIELD-NAME KWARGS.
+Measured by the orchestrator:
+    Settings(trading_mode="live", ...)  -> trading_mode='paper'   (field name, IGNORED)
+    Settings(TRADING_MODE="live", ...)  -> trading_mode='live'    (alias, works)
+Fields carry `alias=` with no `populate_by_name`, and `extra="ignore"` swallows the unmatched kwarg
+with no error. GUARDRAILS 1.2 tells fence tests to "construct explicit `Settings` objects and pass
+them as parameters" - so a test that does exactly that, using the natural field name, would exercise
+PAPER mode while believing it tested LIVE, and would pass. That is the vacuous-test failure inside
+the money fence. Pre-existing, not introduced by T11, and it must be fixed BEFORE more fence tests
+are written on top of it. Folded into T12's dispatch as a precondition.
+
+TWO PRE-EXISTING LIVE-PATH BUGS the implementer documented rather than fixed (correctly - out of
+scope, and both now in `live.py`'s module docstring for T13/T16):
+- `ClobClientWrapper.create_order` passes keyword args that do not match the installed
+  `py_clob_client.ClobClient.create_order(order_args: OrderArgs, ...)` signature. Raises TypeError
+  before any network call - fails loud, not silently wrong.
+- `post_order` takes no `order_type`, so a live order always posts as the client's default GTC
+  REGARDLESS of `OrderRequest.tif`. An IOC or FOK intent would rest on the book as a GTC order.
+  That one is silent and would change execution semantics with real money. T16 must close it.
+
+Other implementer decisions, all sound: registry registration made LAZY inside `get_adapter()` to
+break a real import cycle (`strategies.base -> venues -> registry -> polymarket.live -> execution ->
+fill_engine -> strategies.base`); only `("polymarket","live")` registered, because the read-only
+adapter deliberately lacks `place_order`/`cancel_order` and so cannot satisfy the full protocol -
+T14's `PaperVenueAdapter` populates `("polymarket","paper")`; CLOB fee override uses `is not None`
+so an explicit 0 counts, converting bps->rate by /10_000 (convention confirmed by inspecting the
+INSTALLED `py_clob_client`, not a network fetch); `get_balance`/`get_positions` implemented
+best-effort with docstrings flagging that `py_clob_client` has no positions endpoint at all.
+
+agent: T12 id=acb79af9da0ea5226 role=implementer model=opus
+defect: T12 kind=contradictory-acceptance
+outcome: T12 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T12 CLOSED. Suite 369 -> 456 passed / 0 skipped (+87: 61 Kalshi, 16 cross-venue contract, 10
+settings-alias). PHASE 1 COMPLETE.
+
+MY SETTINGS DIAGNOSIS WAS INCOMPLETE, AND THE IMPLEMENTER CAUGHT IT. I prescribed
+`populate_by_name=True`. That alone does NOT fix it. `EnvSettingsSource` keys by ALIAS
+(`{"TRADING_MODE": "paper"}`) while `InitSettingsSource` keys by whatever the caller typed
+(`{"trading_mode": "live"}`); both survive into one input dict and pydantic resolves the collision in
+favour of the alias - so the ENVIRONMENT silently outranked the explicit constructor argument. And
+`tests/conftest.py` sets `TRADING_MODE=paper` for the entire session, so under my fix every fence
+test written the GUARDRAILS 1.2 way would STILL have been vacuous. Real fix is two-part:
+`populate_by_name=True` PLUS `_AliasNormalizedInitSource` wired through
+`settings_customise_sources`, re-keying init kwargs to aliases so init and env collide on one key and
+the documented precedence (init highest) actually applies. Orchestrator verified WITH the env set:
+both `Settings(trading_mode="live")` and `Settings(TRADING_MODE="live")` now yield 'live', default
+stays 'paper'.
+
+BIDS-ONLY CONVERSION VERIFIED INDEPENDENTLY - the highest-risk arithmetic in Phase 1:
+    YES book: bid 0.40 (native)   ask 0.42 (= 1 - NO bid 0.58)
+    NO  book: bid 0.58 (native)   ask 0.60 (= 1 - YES bid 0.40)
+Both uncrossed; ties sum to exactly 1.00 both ways; and the dollar-string and integer-cents payloads
+produce IDENTICAL OrderBooks, which is the check that catches a missing /100. An inverted derivation
+would have invented an arbitrage against Polymarket on EVERY market, and would have failed SILENTLY
+because T07 declines crossed books with `reason="crossed_book"` - every Kalshi fill skipped, no error.
+The implementer MUTATION-TESTED both hazards: inverting the derivation -> 4 failures (including
+`test_a_normal_book_is_not_crossed[kalshi]`); deleting the /100 -> 7 failures across books, market
+payload, balance, positions, fills and the order ack.
+
+RIGOUR WORTH COPYING IN LATER TASKS: it verified the RSA-PSS signature with an explicit
+`salt_length=digest_size` rather than `padding.PSS.AUTO`, because AUTO accepts ANY salt length and
+would not prove the pinned parameter. It proved query-stripping by verifying a signature made over a
+query-bearing URL against the query-FREE message, rather than comparing two signatures (RSA-PSS is
+randomised, so comparison proves nothing). Both are the difference between a test that checks and a
+test that looks like it checks.
+
+NO-SIDE ORDER MAPPING: legacy endpoint, LABELLED UNVERIFIED. It did not fetch. `ORDER_ROUTES` is an
+explicit table with a real `verified: bool` field asserted by a test - YES BUY/SELL use the V2
+endpoint (pinned in PLAN 3), NO BUY/SELL use the legacy endpoint with `side="no"` and are marked
+unverified. It also recorded the SUBSTANTIVE reason the fallback is right, not merely doc-ambiguous:
+`BUY NO` is not a V2 `ask` on the YES market, because selling YES requires YES contracts you already
+hold (no naked shorts, PLAN 3) - that route would be rejected or would liquidate an unrelated
+position. `self_trade_prevention_type` deliberately OMITTED because PLAN pins the field name but no
+allowed values, and inventing an enum that silently changes self-trade behaviour is not a guess this
+file should make.
+
+THE `contradictory-acceptance` DEFECT, and an honest resolution worth recording: acceptance 2's grep
+(`portfolio/events/orders|portfolio/orders`) cannot coexist with the brief's own requirement that
+`adapter.py` implement `get_open_orders` - reading resting orders is a GET on the SAME URL `live.py`
+POSTs to. It satisfied both by composing the portfolio paths from a `_PORTFOLIO_ROOT` constant, and
+stated plainly in the docstring that this is a concession to a TEXT-MATCHING CHECK and NOT the safety
+property. The real fence is structural and I verified it: `KalshiAdapter`'s only request helper is
+`_get` with "GET" hardcoded, and neither read adapter has `place_order` or `cancel_order` at all.
+
+CARRY-FORWARDS FOR T14/T16/T18 (implementer-reported):
+- OUTCOME CASING DIFFERS BY VENUE. Polymarket uses Gamma's "Yes"/"No"; Kalshi normalises to
+  "YES"/"NO". Cross-venue matching or routing that assumes shared casing is the most likely quiet bug
+  in T14/T18. This is the single most important line in this block.
+- `("kalshi","paper")` and `("polymarket","paper")` are both deliberately UNREGISTERED - the read
+  adapters lack place_order/cancel_order by design and cannot satisfy the full Protocol. T14's
+  `PaperVenueAdapter` populates both.
+- `Balance.locked` is ALWAYS 0.0 for Kalshi (PLAN pins no field for margin held against resting
+  orders, and it refused to invent one). Do NOT treat `available` as net of resting exposure -
+  GUARDRAILS 1.6.
+- `outcome_ids` maps BOTH outcomes to the ticker; Kalshi has no per-outcome token id. Anything keying
+  by outcome id must not assume uniqueness.
+- Fee source strings are behavioural: active waiver -> "fee_waiver" (in T07's declared set);
+  otherwise Settings rates with source="settings", deliberately NOT in that set so an operator-zeroed
+  rate still gets flagged. Note `fees.py::default_kalshi_schedule` uses a THIRD spelling
+  ("settings_default") for the same concept - harmless today, worth unifying if T14 calls it.
+- `price_level_structure` field names are UNVERIFIED; parser accepts several spellings, falls back to
+  0.01 tick. A wrong tick produces a loud venue rejection, not a silent mis-price.
+- `requirements.txt` now declares `cryptography>=42.0.0` explicitly (was only a transitive dep of
+  web3/py-clob-client; `auth.py` imports it directly and a fresh install would have broken).
+
+--- PHASE 1 COMPLETE (T04-T12). Suite 456 passed / 0 skipped. ---
+
+agent: P1 id=aecb60521eddc7a48 role=security-auditor model=sonnet findings=3 confirmed=3 marginal=3 result=accepted
+
+PHASE 1 SECURITY AUDIT: ZERO BLOCKING FINDINGS. The live fence, secret handling, test-network
+isolation and injection surfaces are all clean. Phase 2 is clear on security grounds.
+
+- #1 CONFIRMED, MARGINAL, and the one T13 must act on. `app/bots/executor.py:62-73`
+  `OrderExecutor.cancel_order` calls `ClobClientWrapper.cancel_order` -> the real
+  `py_clob_client.cancel()`. A GENUINE order-cancellation call with NO `assert_live_allowed()`
+  anywhere in the chain, in a file outside the two sanctioned `live.py` modules. T11 neutered
+  `execute_signal` on that same class and LEFT `cancel_order` untouched. Unreachable today
+  (`OrderExecutor` is never instantiated anywhere in `app/`), and T13's brief already anticipates
+  this file as a time-boxed `ALLOWED_UNTIL_T16` exception.
+  => T13 ACTION: point the new `tests/test_fences.py` AST walk at THIS LINE FIRST, and ensure
+     nothing in T13-T15 wires a caller to it before T16 deletes it.
+- #2 CONFIRMED, MARGINAL. `PolymarketAdapter.__init__` (`polymarket/adapter.py:120-138`) takes no
+  `settings_obj` and always reads the process-wide global for `gamma_api_url`/`clob_api_url`;
+  `_ensure_clob_wrapper` (`:408-416`) likewise checks the global `settings.polymarket_private_key`.
+  `KalshiAdapter` does thread an injected `settings_obj` correctly, so the two adapters are
+  inconsistent. Consequence: `PolymarketLiveAdapter(settings_obj=...)` uses the injected settings
+  ONLY for the fence check and then discards it - `super().__init__(transport=transport)` never
+  forwards it. Fails safe today (empty test credentials -> VenueAuthError) and does not weaken the
+  trading_mode gate. But GUARDRAILS 1.2's "pass an explicit Settings object rather than touching the
+  environment" is NOT fully honoured on Polymarket's credential/URL path, and T14/T16 build on it.
+- #3 INFORMATIONAL, and it answers the question I asked. The fence sits ENTIRELY in `__init__`
+  (`polymarket/live.py:73`, `kalshi/live.py:174`) and is never re-checked inside
+  `place_order`/`cancel_order`. That matches PLAN D13's stated design, so it is not drift - but there
+  is no defence in depth at the call site. It tested the bypasses EXPERIMENTALLY rather than
+  reasoning about them: `object.__new__` on both live adapters crashes before any network call
+  (VenueAuthError or AttributeError on the missing client); `pickle.dumps` fails on httpx's RLock;
+  `copy.copy` only replicates an instance that already passed the fence. The only real bypass is a
+  subclass that omits `super().__init__()` - which requires WRITING NEW CODE, exactly the class of
+  change T13's AST walk exists to catch.
+
+Clean, with evidence: no key/PEM/address/secret in any tracked file, fixture, or git history (repo is
+PUBLIC); `.env.example`'s new Kalshi fields are empty placeholders; `.gitignore` intact;
+`kalshi/auth.py` never logs or formats the key, and `load_private_key`'s ValueError deliberately does
+NOT chain the parser's message because some backends echo key bytes; the 2048-bit test key is
+generated in-process and never written to disk; `repr(Settings(...))` does not leak the PEM (locked
+by a test); `VenuePayloadError.raw` is a plain attribute, not in `self.args`, so it stays out of
+`str`/`repr`, and the single catch site never logs it; EVERY adapter construction in tests injects a
+`transport`, several via a `refusing_transport()` helper that raises on any request; no adapter is
+constructed at import time; and the RSA-PSS signed path CANNOT diverge from the sent path, because
+`_apply_auth` signs `str(request.url)` from the same already-built `httpx.Request` that is then sent,
+with the timestamp generated exactly once and reused for both header and signature.
+
+Not yet auditable: `client_order_id` idempotency. Nothing in T04-T12 generates one; the documented
+scheme `f"{intent_id}:{leg_index}:{attempt}"` belongs to T14's OrderRouter. Exposed once T14 lands.
+
+reviewer: P1 model=opus findings=8 confirmed=8 result=accepted
+
+PHASE 1 REVIEW: 8 findings, all confirmed, all demonstrated. VERDICT: Phase 2 may proceed. Nothing
+in Phase 1 mispricing money today, no weak fence, no look-ahead path opened, and the fill engine is a
+genuine shared substrate. Almost every finding is LATENT and detonates in Phase 2/3.
+
+Reviewer independently verified the arithmetic end to end and found it correct on signs and units:
+BUY cost = notional + fee; SELL proceeds = notional - fee; cost_basis fee-inclusive; settlement
+pnl = (size x payout - gas) - cost_basis; gas per POSITION not per contract; Kalshi's ceiling per
+fill not per order. One wrinkle noted: `entry_price` is fee-EXCLUSIVE on a first fill but
+fee-INCLUSIVE on an add (`engine.py:2060-2063`) - harmless except that it is exactly the value
+finding 1's silent fallback marks against.
+
+--- MUST FIX BEFORE THEIR DEPENDENT TASKS ---
+
+#1 OUTCOME CASING - the definitive answer, and it is worse than predicted. The codebase is split:
+   case-INSENSITIVE and safe at every COMPARISON (fill_engine.py:796 book match, :1136
+   synthesize_book, engine.py:973/979 _book_for, :1518/1557 settlement winner, :2253 stop/target);
+   case-SENSITIVE and LOUD where that is fine (base.py:233 complement requires exactly {YES,NO};
+   polymarket/adapter.py:393-397 raises VenuePayloadError);
+   and case-SENSITIVE + SILENTLY WRONG at every KEYING site:
+     engine.py:399   `Position.position_id` interpolates `self.outcome` VERBATIM
+     engine.py:1208, :1211, :1519-1521  `_current_prices` written ONLY under hardcoded "YES"/"NO"
+     engine.py:475   `total_equity` falls back to `pos.entry_price` on a key miss
+     engine.py:1788-1790  `_plan_legs` SELL sizing looks the raw id up
+   Demonstrated at runtime: a "Yes"-cased position marks at ITS OWN ENTRY PRICE FOREVER - equity
+   45.0 vs 90.0, a 50% understatement. Unrealized PnL pinned at 0, equity curve and drawdown wrong,
+   `max_position_pct` sized off a wrong portfolio_value, and a SELL leg on it silently sizes to zero.
+   No warning, no exception, no counter.
+   NOT reachable today (every strategy hardcodes uppercase) but reachable the moment ADAPTER data
+   reaches a Leg: Polymarket `VenueMarket.outcomes` is Gamma verbatim ("Yes","No")
+   (polymarket/adapter.py:229, fixture gamma_markets.json:9) while Kalshi forces ("YES","NO")
+   (kalshi/adapter.py:494, :1098). T18 builds cross_venue legs from BOTH, and `Intent`'s cross_venue
+   branch (base.py:243-251) has NO outcome check at all, unlike complement.
+   Drift because PLAN D7 fixes `f"{venue}:{market_id}:{outcome}"` as THE position identity, and
+   Phase 1 shipped it with two normalisation conventions on either side. One-line fix. BEFORE T14/T18.
+   Reviewer's added consequence: a bundle leg keyed `polymarket:M:Candidate_A` would ALSO mark at
+   entry forever, by the same mechanism - so T21 must cover per-outcome price MARKING, not just books.
+
+#3 PER-VENUE CAPITAL DOES NOT EXIST IN THE BACKTEST PATH, and T18's brief assumes an interface
+   Phase 1 never built. `Portfolio.cash` is a single float (engine.py:442); sizing caps on
+   `portfolio.cash * _CASH_BUFFER` (:1739); `grep cross_venue engine.py` returns NOTHING - the engine
+   is kind-agnostic and will happily draw BOTH legs of a cross_venue intent from one pool, i.e.
+   assume funds move between venues inside a trade. Meanwhile TASKS.md:882 says T18 sizing "uses the
+   per-venue ledger snapshot passed in `positions['__ledger__']`" - and `positions_dict`
+   (engine.py:1341-1349) contains only real position ids. No `__ledger__` key is passed and there is
+   no per-venue balance to put in one. Largest Phase-3 blocker in the phase.
+   ORCHESTRATOR RULING, to be built in T14 and honoured by T18: `Portfolio` grows PER-VENUE cash and
+   T14's `CapitalLedger` is the SHARED abstraction used by both the backtester and the router - one
+   implementation, not two. That keeps D5's "same engine, same numbers" property intact for capital
+   the way it already is for fills, and gives T18 the `__ledger__` snapshot its brief assumes.
+   GUARDRAILS 1.6 / PLAN R6 forbid summing `available` across venues; D8 requires cross-venue sizing
+   bounded by `min(available_A, available_B)`.
+
+--- CHEAP NOW, EXPENSIVE LATER (folding into the P1 remediation) ---
+
+#2 `Signal.to_intent()` hard-defaults every leg to `venue="polymarket"` (base.py:107-113 constructs
+   Leg with no venue; Leg.venue defaults polymarket at :157; engine.py:1244 normalises without
+   injecting `snapshot.venue`; Signal carries no venue field to inject FROM). The two refactored arb
+   strategies do it right; the other SIX still return Signals, which T10's brief permitted. On a
+   Kalshi snapshot all six produce a polymarket-venued leg carrying a Kalshi ticker; `_book_for`
+   bails on venue mismatch (:977) and the intent is rejected as `no_eligible_levels` - a MARKET
+   CONDITION reason. Under fill_at="next" the queue waits on ("polymarket", <kalshi ticker>) and
+   expires at TTL. The failure reads as "no liquidity on Kalshi", not "the venue was wrong".
+   Drift against D3's premise that strategies are venue-agnostic.
+#4 `"category_table"` is a TRUSTED zero-fee source but is operator-overridable to zero, and the two
+   venues are asymmetric. `category_rate()` consults `settings.polymarket_taker_fee_overrides` FIRST
+   (fees.py:98-100) and returns whatever the operator typed, then four call sites stamp
+   `source="category_table"` (polymarket/adapter.py:254-255, multi_outcome_bundle:167-170,
+   binary_complement:150-151, engine.py:931-934). So `POLYMARKET_TAKER_FEE_OVERRIDES={"politics":0.0}`
+   yields a zero rate wearing the label that asserts "the PUBLISHED table says zero" - every fill
+   silently free, absent from `undeclared_zero_fee_markets`, no warning. Kalshi's operator-zero IS
+   flagged (source="settings", outside the trusted set). The guard's own docstring says the rule is
+   provenance-based and "what must never happen is a zero arriving from a source that never meant to
+   assert one" - an operator override is exactly such a source.
+#5 `expected_resolution_ts` is None on every intent from six of eight strategies (base.py:115-122;
+   engine does not inject snapshot.end_date). Not a violated tripwire (R2 binds only
+   hold_to_resolution=True, and both arb strategies comply) but GUARDRAILS 6 requires
+   "time-to-resolution present in every score" and D10 derives `hours_to_resolution` /
+   `annualized_return` from it. Decide now, not in T19.
+#8 `.env.example` COSTS block: `min_trade_usd` is ABSENT (the very knob whose invisibility caused
+   T10's retry - the fix put it in config.py but not the operator-facing file); LIQUIDITY_FRACTION is
+   described as "fraction of VISIBLE order-book depth treated as safely fillable" when it is the
+   opposite, the multiplier on volume_24h used to INVENT depth never observed (GUARDRAILS 1.7
+   mislabelling); SETTLEMENT_DELAY_HOURS is described as "between market close and settlement" when
+   the engine applies it from `resolved_at` to cash release (engine.py:1565).
+
+--- RECORD ONLY, for the tasks that own them ---
+
+#6 FOR T22: `TradeRecord.slippage` is <= 0 BY CONSTRUCTION. `_restrict_to_limit`
+   (fill_engine.py:825-832) filters to levels at or better than the padded limit, so a BUY's
+   exec_price can never exceed order.price; slippage is bounded above by the FIXED pad (0.001) and is
+   negative in the ordinary case. Depth cost surfaces as FEWER CONTRACTS, never a worse price. So
+   D12's `avg_slippage_bps` column will read ~0 at every capital level and tell the reader nothing -
+   `pct_intents_downsized` is the column that carries the signal. Either state that in T22's brief or
+   redefine `avg_slippage_bps` against decision-time top-of-book rather than the strategy's own limit.
+#7 FOR T14: the backtester calls `fill()` with NO `market=` (engine.py:1819-1825, deliberate and
+   labelled `tick_unvalidated_fills`), but T14's `PaperVenueAdapter` WILL have a real `VenueMarket`.
+   So the shared simulator is INVOKED DIFFERENTLY on the two paths in a way that changes which fills
+   are possible - the backtest can book off-tick and sub-min_size fills that paper must reject
+   (Kalshi's min_size floor is 1 contract, kalshi/adapter.py:505-509). D5's stated purpose is that a
+   backtest/paper disagreement be a DATA problem, never a two-simulators problem. T14 should snap
+   simulated limits to the tick and enforce min_size on both paths, or T22 must report
+   `tick_unvalidated_fills` beside every sweep row.
+
+Reviewer also confirmed clean, with evidence: fill engine has ZERO backtester coupling and is not
+forcing a second fill path; nine strategy files -> eight with a true delete, no rename; all 13
+original backtesting `__all__` names survive inside a 23-name `__all__`; no fee literals; no
+cross-venue capital sum exists; no new look-ahead path in T10-T12 (and crucially the ADAPTERS are not
+wired into the replayer or strategies at all, so `VenueMarket.result` never touches a snapshot);
+and the Phase 0 security finding 5.1's premise is GONE (the mass-assignment `__init__` was reverted
+inside Phase 0) though the T15 guidance stands unchanged, because SQLAlchemy's stock
+`_declarative_constructor` still sets any MAPPED name from a dict.
+
+agent: P1 id=aa0aa443a9d8e0a58 role=implementer model=sonnet
+
+P1 REMEDIATION CLOSED. Suite 456 -> 484 passed / 0 skipped (+28). ruff/mypy clean, `003 (head)`.
+
+FIX 1 normalisation point, and it is the right design: `normalize_outcome()` in `strategies/base.py`
+case-folds any spelling of yes/no to canonical "YES"/"NO" and passes EVERY OTHER outcome name
+through untouched - a bundle's "Trump" or "Candidate_A" is not mangled. Applied at TWO choke points:
+`Leg.__post_init__` (the earliest - every fill traces back to a Leg, so OrderRequest.outcome ->
+Fill.metadata["outcome"] -> the Position a fill books are all canonical from there on) and
+`Position.__post_init__` (defence in depth for a Position built directly). That is structurally
+stronger than patching each downstream comparison, which is what a narrower fix would have done.
+It also added the outcome check `Intent`'s `cross_venue` branch never had - meaningful now that
+`Leg.outcome` is pre-normalised by the time it runs. Orchestrator verified all 9 cases plus the
+reviewer's repro, which now marks at MARKET (90.0) rather than at entry (45.0).
+
+FIX 2 venue flow: `to_intent()` gained keyword-only `venue`/`expected_resolution_ts`, and
+`_process_snapshot` passes `snapshot.venue` / `snapshot.end_date` - the engine has the snapshot,
+`to_intent()` does not. The LOUD half is a new `_market_venues` map plus a `_venue_mismatch()` check
+that runs at intent-generation time, BEFORE sizing or queueing, so a mismatch can never bleed out as
+a silent `pending_ttl` expiry. New distinct reason `VENUE_MISMATCH_REASON = "venue_mismatch"`,
+deliberately NOT one of `FillReason`'s market-condition values.
+
+FIX 3 override provenance: new `category_fee_schedule()` stamps `source="settings_override"` (outside
+T07's trusted set) when `polymarket_taker_fee_overrides` supplied the rate, else `"category_table"`
+unchanged. All four hand-building call sites now route through it. Orchestrator verified both
+directions: with an override, rate 0.0 / source 'settings_override' / flagged undeclared = True;
+without, rate 0.04 / source 'category_table' / trusted. Polymarket and Kalshi are now symmetric.
+
+FIX 4 `expected_resolution_ts` injected at the same site as FIX 2; left None when the snapshot has
+none, never invented. FIX 5 `.env.example`: MIN_TRADE_USD added, and the two wrong descriptions
+corrected - LIQUIDITY_FRACTION fabricates depth from volume_24h rather than discounting observed
+depth (a GUARDRAILS 1.7 mislabelling), SETTLEMENT_DELAY_HOURS runs from resolution not from close.
+
+--- PHASE 1 FULLY CLOSED. Suite 484 passed / 0 skipped. ---
+
+--- PHASE 2 ---
+
+T13 (live fences, kill switch, risk limits, AST fence test): defect: T13 kind=stale-pin — brief
+acceptance 1 names `app/services/scoring.py` as the file to copy for the positive/negative control;
+no such file exists in this repo (`app/services/` holds `data_collector.py`, `polymarket/`,
+`backtesting/`, `__init__.py` only). Substituted `app/services/data_collector.py` — a real, currently
+clean module — for both the positive control (copied to `tmp_path`, injected with a genuine
+`client.post_order(x)` call, walker required to flag it) and its paired negative control (same file,
+unmodified, walker required to report nothing). Underlying requirement unaffected.
+
+`tests/test_fences.py::find_violations()` is the allowlist-free AST walker: flags an `Attribute`/bare
+`Name` named `post_order`/`create_order`/`cancel_order`/`create_or_derive_api_creds`, a bare `Name`
+`ClobClient` (exact match only — `ClobClientWrapper` does not match), and a non-docstring string
+`Constant` containing `/portfolio/events/orders` or `/portfolio/orders`. Docstring `Constant`s
+(first-statement-of-scope) are excluded from the path-literal check only, because `app/venues/
+types.py::OrderAck`'s real docstring quotes Kalshi's `POST /portfolio/events/orders` response shape
+in prose — without the exclusion that genuine documentation would need a bogus allowlist entry of
+its own; the method/class-name checks are unaffected either way since docstring prose is never parsed
+into `Attribute`/`Name` nodes. `_unexempted_violations()` applies the GUARDRAILS §1.1 allowlist
+(`venues/polymarket/live.py`, `venues/kalshi/live.py`, `services/polymarket/client.py` the wrapper,
+and `ALLOWED_UNTIL_T16 = {bots/executor.py}`) on top, only for the real-tree check.
+
+ORCHESTRATOR RULING 1 confirmed: `app/bots/executor.py::OrderExecutor.cancel_order` calls
+`self.client.cancel_order(order_id)` — a real, unfenced order-cancellation call reachable through
+`ClobClientWrapper.cancel_order` -> `py_clob_client`'s `.cancel()`, no `assert_live_allowed()`
+anywhere in the chain. Confirmed genuine (not an allowlist artifact) two ways: the raw, allowlist-free
+`find_violations()` run directly against that one file returns a `("method", "cancel_order")` hit;
+the same finding is then shown absent only from `_unexempted_violations()`'s output, i.e. only once
+`ALLOWED_UNTIL_T16` is applied. `ALLOWED_UNTIL_T16` must be emptied by T16 (`OrderExecutor` deleted,
+callers rewired onto `OrderRouter`) — `test_allowed_until_t16_names_only_the_known_executor_finding`
+pins its current, single-entry contents so growth doesn't go unnoticed.
+
+`assert_live_allowed()` gained `KillSwitchEngaged`: checked only once `trading_mode`/
+`live_trading_confirmation` already pass, via `Path(kill_switch_path).exists()` — existence only,
+contents never read (an unreadable-but-present file still engages it; nothing to get "right" inside
+it). Relative `kill_switch_path` resolves against the process's CWD (Python's ordinary filesystem
+resolution — no extra normalization applied); tests pass an absolute `tmp_path`-based path to stay
+deterministic. `check_order_limits(order_notional, open_notional, daily_pnl, settings_obj=None)` is a
+new, separate function (not folded into `assert_live_allowed`) raising `RiskLimitExceeded`; called
+from both paper and live order paths per GUARDRAILS. Boundary semantics: exactly AT a cap passes,
+only strictly past it trips (`order_notional > max`, `open+order > max`, `daily_pnl < -max_daily_loss`)
+— an operator's own round-number limit is not self-tripping. `Settings` gained `kill_switch_path`
+(default `"TRADING_KILL_SWITCH"`), `max_order_notional_usd` (250), `max_daily_loss_usd` (100),
+`max_open_notional_usd` (1000), `max_near_resolution_notional_usd` (500, per the T13 brief; PLAN.md
+D13's own enumeration only lists the first three — additive, not contradictory — this fourth field is
+declared but not yet consumed by `check_order_limits`, which takes no time-to-resolution argument;
+left for the T14 order router to apply against a market's `near_resolution_hours`, so its value lives
+in one place rather than being invented later as a bare literal). `.env.example` gained an uncommented
+`TRADING_MODE=paper` / `LIVE_TRADING_CONFIRMATION=` block (deliberately inconsistent with the
+commented-example convention used everywhere else in that file — these two are safety-critical) plus
+commented examples for the four new limit/kill-switch keys. Suite: 506 passed (484 + 22 new), 0
+skipped; `alembic heads` unchanged at `003 (head)`.
+
+agent: T13 id=a121e415ee394f9f4 role=implementer model=sonnet
+outcome: T13 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T13 CLOSED. Suite 484 -> 506 passed / 0 skipped (+22). GUARDRAILS 1.1's NAMED ENFORCEMENT MECHANISM
+NOW EXISTS - `tests/test_fences.py` had been referenced by the guardrails since setup and did not
+exist until this task.
+
+Orchestrator verified the walker independently rather than trusting 22 green tests (7 assertions):
+- RAW walker on `app/bots/executor.py` returns `Violation(kind="method", detail="cancel_order")` -
+  the genuine unfenced live-order path the Phase 1 security audit found. Through the allowlist it is
+  absent, PROVING the allowlist suppresses it rather than the walker missing it.
+  `ALLOWED_UNTIL_T16 = {PosixPath('bots/executor.py')}` - exactly one entry, and a test pins the set
+  to that single member so T16 emptying it (or anything else GROWING it) is caught.
+- NEGATIVE control: unmodified real module -> 0 violations. POSITIVE control: same module copied to
+  tmp with `client.post_order(x)` appended -> DETECTED. The walker distinguishes "finds the bad
+  thing" from "flags everything".
+- KILL SWITCH: a file containing arbitrary garbage still raises `KillSwitchEngaged`; contents are
+  never read or parsed. The check sits INSIDE `assert_live_allowed()` before it returns success, so
+  an engaged switch makes a live adapter UNCONSTRUCTIBLE rather than making a later order fail.
+- LIMITS are strict "exceeds", not "reaches": exactly at the $250 cap passes, one cent over raises.
+  All three reasons are evaluated rather than short-circuited, so a triple breach names all three.
+
+TWO CONTROLS THE IMPLEMENTER ADDED UNPROMPTED, and they are the ones that make the walker
+trustworthy: a docstring merely MENTIONING `/portfolio/events/orders` in prose is NOT flagged (which
+matches the real `app/venues/types.py::OrderAck`), while the identical string as a code literal
+(`ORDERS_PATH = "..."`) IS flagged. That proves the docstring exemption is POSITIONAL, not a blanket
+suppression - a blanket one would have hollowed out the whole check while still passing.
+
+defect: T13 kind=stale-pin
+Acceptance 1 names `app/services/scoring.py` as the positive-control subject. THAT FILE DOES NOT
+EXIST in this repo (scoring.py arrives in T19). The implementer substituted
+`app/services/data_collector.py` - a real, clean module - which preserves the requirement exactly
+(copy a real module, inject a call, prove detection, pair with an unmodified negative control).
+Correct handling; the brief pinned a path from a future task.
+
+agent: T15 id=a4cd164f93655ec61 role=implementer model=sonnet
+outcome: T15 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T15 CLOSED. Suite 506 -> 521 passed / 0 skipped (+15). `alembic heads` = `004 (head)`, single linear
+head confirmed. Orchestrator verified: offline SQL emits CREATE TABLE orders, CREATE TABLE intents
+and `client_order_id`; exactly ONE `CREATE TYPE orderside` (the shared enum is created once and
+referenced elsewhere with create_type=False); 11 CheckConstraints emitted.
+
+CONSTRAINTS ACTUALLY FIRE - verified against a live SQLite engine, not just read in the DDL:
+  same condition_id on a DIFFERENT venue      -> allowed        (composite unique is right)
+  duplicate (venue, condition_id)             -> IntegrityError
+  venue='draftkings'                          -> IntegrityError
+That last one is a bonus worth noting: the CheckConstraint enforces PLAN 2's "no sportsbooks" rule
+at the DATABASE layer, not merely by convention.
+
+Design choices, both sound:
+- Kept `Mapped[str]` + String(8)/String(16) rather than a SQLAlchemy `Enum`, because an Enum would
+  create a SECOND, differently-cased type system alongside the `Literal["paper","live"]` /
+  `Literal["polymarket","kalshi"]` already used throughout `app/venues`. Added CheckConstraints as
+  DB-layer defence in depth instead, and documented explicitly that this is NOT a substitute for
+  T14/T16 constructing models field-by-field from a validated pydantic schema. The Phase 0
+  security audit's mass-assignment warning is now written into `models/intent.py`'s module docstring
+  and cross-referenced from `models/trade.py`, so T16's implementer reads it before wiring routes.
+- `client_order_id` length budget, computed rather than assumed: a UUID4 `intent_id` is 36 chars, so
+  `f"{intent_id}:{leg_index}:{attempt}"` is ~40-44, comfortably inside String(64). It chose to
+  CONSTRAIN THE GENERATOR (T14 must keep intent ids <= ~36 chars) rather than widen the column,
+  since the brief pins String(64) - and documented that as load-bearing on both
+  `IntentRecord.id` and `Order.client_order_id`.
+- A UNIQUE violation on `client_order_id` is a LEGITIMATE outcome (an idempotent retry re-submitting
+  the same order), verified in `test_duplicate_client_order_id_raises_integrity_error`. T14 MUST
+  catch IntegrityError on that insert and interpret it, not let it crash a run.
+
+Rigor worth copying: before hand-writing the migration it cross-checked the DDL against
+`CreateTable(table).compile(dialect=postgresql.dialect())` for all 9 tables, so the hand-written 004
+matches `Base.metadata` exactly. These tables had NEVER had a migration (PLAN 3), so a mismatch
+between `alembic upgrade head` and `create_all` would have been permanent and invisible.
+
+FOR T14/T16: `Order.token_id` is still `String(100) NOT NULL` and unchanged (out of T15's scope) -
+Kalshi has no CLOB token-id concept, so T14 must decide what goes there. Every `mode` column is
+indexed and EVERY read path (P&L, position listing, reporting) must filter on it, because paper and
+live rows share the same tables by D4's design.
+
+agent: T14 id=a08e87789fe98567a role=implementer model=opus
+outcome: T14 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T14 CLOSED. Suite 521 -> 540 passed / 0 skipped (+19). ~4,000 lines across ledger/router/reconcile/
+paper/tasks - the largest task in the kit. ruff + mypy clean.
+
+GUARDRAILS 1.6 VERIFIED BY THE ORCHESTRATOR, not just asserted: with polymarket=1000 and kalshi=5,
+reserving 100 on kalshi raises `InsufficientCapital` - the polymarket balance is unreachable.
+`available_by_venue()` returns exactly `{'polymarket': 1000.0, 'kalshi': 5.0}`, which IS the
+`positions["__ledger__"]` shape T18's brief assumes. `min_available([...]) = 5.0` is the D8 bound.
+There is NO `transfer()` method and no additive cross-venue method at all. `ledger.py` imports only
+logging/math/collections/dataclasses/itertools/types + app.config + app.venues.types - ZERO DB or
+session coupling, so it is genuinely droppable into the backtester's replay loop, which is what my
+P1 ruling required.
+
+`settle()` TOLERATES AN OVERSPEND, drawn from the SAME venue and logged at WARNING, and the reason
+is a real property of these markets: the fee formula peaks at p=0.5, so a leg limited at 0.90 that
+FILLS at 0.55 genuinely costs more fee than a reservation sized at the limit. If that venue cannot
+cover it, it raises. It is never covered from the other venue.
+
+THE UNWIND - the most dangerous code in the kit, and it was handled with the right instincts:
+- The SELL limit is NOT 0.0. It is `best_bid - unwind_slippage_ticks x tick` (5 ticks, configurable),
+  snapped to tick. The implementer's reasoning, which is exactly right: a 0.0 limit is an unbounded
+  walk that IN SIMULATION FABRICATES AN EXIT THAT NEVER EXISTED.
+- NO BID AT ALL -> no order placed, `NakedLeg(reason="no_bid")`, `logger.error` with
+  `naked_exposure=True`, `IntentRecord.extra_data["naked_exposure"]=True`, and the Position row keeps
+  its full size with `closed_at=None`. Partial unwind -> the residue becomes a NakedLeg the same way.
+  An un-unwound naked leg is the worst state this system can reach and it is now loud and persisted.
+- A sell larger than the held position is REJECTED (`insufficient_position`) - neither venue supports
+  naked shorts, the same impossible-trade class PLAN 3 records as why `cross_platform_arbitrage` was
+  broken.
+- REALIZED COST IS RECORDED for T22: entry cost of the unwound contracts (price x qty PLUS the
+  pro-rated entry fee) minus net sale proceeds. Hand-computed in a test: buy 10 @ 0.50 (fee 0.10),
+  sell 10 @ 0.50 (fee 0.10) -> cost 0.20, ledger 1000 -> 999.80.
+
+TICK/MIN_SIZE PARITY - DECIDED, not deferred (the P1 reviewer's finding 7). The router SNAPS every
+limit to the market tick in the CONSERVATIVE direction (BUY floors, SELL ceils - snapping can only
+make an order LESS aggressive, never reach a price the strategy did not authorise) and rejects a leg
+below `market.min_size` before placement. `PaperVenueAdapter` always passes `market=` to `fill()`.
+The backtester was NOT changed (out of scope, would break T08), so the asymmetry STANDS and is
+documented in `paper.py`'s module docstring: the backtest can still book off-tick and sub-min_size
+fills that paper declines. => T22 MUST report `tick_unvalidated_fills` beside every sweep row.
+
+DISCREPANCIES the implementer found and resolved honestly:
+- `Intent` HAS NO `id` FIELD, so the brief's `f"{intent.id}:{i}:{attempt}"` is not constructible. It
+  mints a UUID4 (or uses `intent.metadata["intent_id"]`) and RAISES if a supplied id exceeds 48 chars
+  rather than letting String(64) truncate into an idempotency-key collision - exactly the failure
+  T15 computed the budget to prevent.
+- The `ordertype` enum in migration 004 has no `IOC`. `all_or_none` places with `tif="IOC"`; the row
+  records `OrderType.FOK` (the other NON-RESTING type - GTC would falsely mark it as resting) and the
+  authoritative tif lives in `Order.extra_data["tif"]`. A follow-up migration adding IOC should
+  backfill from there. No new migration; heads stays 004.
+- RECONCILE IS CONSERVATIVE ON A VENUE OUTAGE: if `get_open_orders()`/`get_fills()` raise, the pass
+  changes NOTHING. An outage must not mass-mark live orders FAILED/CANCELLED. Tested.
+- `token_id` for Kalshi is `""`, by a VENUE-AGNOSTIC rule (`token_id_for` returns "" when the outcome
+  id is absent or equals the market id) rather than a `venue == "kalshi"` branch. Kalshi maps both
+  outcomes to the ticker, so writing it would silently merge a market's YES and NO sides.
+- PAPER-MODE LIQUIDITY CAVEAT, volunteered and important: a simulated fill does NOT deplete the real
+  venue book, so paper fill rates are an UPPER BOUND on live, not an estimate.
+
+WARNING FOR T16, which the implementer spotted and I confirmed: `cancel_order` is in
+`FORBIDDEN_METHOD_NAMES`, and the walker flags ATTRIBUTE ACCESS/CALLS (not definitions - `paper.py`
+defining `async def cancel_order` is clean). `router.py` contains no `cancel_order` call today, so a
+`DELETE /orders/{id}` that calls `adapter.cancel_order(...)` from `app/api/` WILL trip the AST walk
+once T16 empties `ALLOWED_UNTIL_T16`. Note the fence is also INTERNALLY INCONSISTENT here:
+`place_order` is NOT in the forbidden set (the router calls `adapter.place_order` freely) while
+`cancel_order` is - because that name collides between the raw `py_clob_client` API and the
+`VenueAdapter` protocol. T16 must resolve this deliberately.
+
+### T16 — implementer notes
+
+T16 CLOSED. Suite 540 -> 552 passed / 0 skipped (net +12: +7 `tests/api/test_trading.py`, +5
+`tests/test_fences.py` [6 new controls - 1 net removed helper-count wash from deleting 2 tests and
+adding a parametrized one that expands to 4 cases; see below for the exact roster]). `alembic heads`
+still `004 (head)`. `app/bots/executor.py` deleted outright (not gutted) - `OrderExecutor`/
+`ExecutionResult` are gone from the tree entirely, `app/bots/__init__.py` updated to match.
+
+FENCE REDESIGN - the deliberate part of this task. The pre-T16 `FORBIDDEN_METHOD_NAMES` set treated
+`post_order`/`create_order`/`create_or_derive_api_creds`/`cancel_order` as one undifferentiated list,
+which was both TOO LOOSE (`place_order` wasn't forbidden anywhere, so a strategy/bot/task/API route
+could call `adapter.place_order` directly and bypass `OrderRouter`'s risk fences, capital
+reservations and crash-safe PENDING row entirely - nothing flagged it) and, once `DELETE /orders/{id}`
+needed a real `cancel_order` call, about to become TOO STRICT in the wrong place (the router's own
+legitimate cancellation path would trip the same undifferentiated rule that rightly forbids a raw
+`py_clob_client.post_order` call anywhere outside `live.py`). Split into two rules in
+`tests/test_fences.py`:
+  - RULE 1 (`RAW_CLIENT_METHOD_NAMES` = post_order/create_order/create_or_derive_api_creds, plus the
+    `ClobClient` class name and the path literals) - unchanged, still confined to `LIVE_MODULES`/
+    `WRAPPER_MODULE`. These TRANSMIT.
+  - RULE 2 (`ADAPTER_PROTOCOL_METHOD_NAMES` = place_order/cancel_order, new) - confined to
+    `EXECUTION_LAYER_DIRS` = `{app/execution, app/venues}` instead. These don't transmit themselves
+    (transmission happens inside `live.py`/the simulated engine); what calling them from OUTSIDE the
+    execution layer does is skip the router entirely.
+`_is_exempt(rel_path, violation)` dispatches on which rule a violation belongs to; `_unexempted_
+violations` is now `[v for v in find_violations(root) if not _is_exempt(...)]`. `find_violations`
+itself (the allowlist-free walker) is UNCHANGED - it still just unions both name sets and returns
+every hit; only the exemption logic branches.
+
+WHY `OrderRouter.cancel()` IS NAMED `cancel`, NOT `cancel_order` (and why `submit`, not `place_order`,
+already was): the walker matches an AST `Attribute`'s NAME, not the real type of whatever it's called
+on. If the router's own public method were spelled `cancel_order`, a legitimate `app/api/routes/
+trading.py` call `order_router.cancel_order(id)` would be textually IDENTICAL to `adapter.
+cancel_order(id)` and RULE 2 would have no way to tell them apart from outside the execution layer.
+Naming the router's methods disjointly from the adapter's sidesteps the ambiguity instead of trying
+to special-case around it after the fact.
+
+CONTROLS: kept every pre-existing positive/negative control (docstring exemption, ClobClient bare-name
+vs ClobClientWrapper, def-only-is-not-a-call, kill-switch/risk-limit tests - all untouched). Removed
+the two `bots/executor.py`-specific tests (the file/finding they proved against no longer exists) and
+replaced `test_allowed_until_t16_names_only_the_known_executor_finding` with `test_allowed_until_t16_
+is_empty` (asserts `ALLOWED_UNTIL_T16 == set()`, kept as a live canary rather than deleting the
+variable, since the T16 acceptance line greps for `ALLOWED_UNTIL_T16 = set()` verbatim - it is
+`ALLOWED_UNTIL_T16 = set()  # type: set[Path]`, a type-COMMENT so the exact substring survives
+character-for-character while mypy still sees `set[Path]`). Added four new tests: `test_walker_flags_
+place_order_called_from_the_api_layer` (the required positive control - a synthetic `app/api/routes/
+sketchy.py` calling `adapter.place_order` IS flagged), `test_walker_flags_adapter_protocol_calls_
+outside_the_execution_layer` (parametrized over bots/strategies/tasks/services - `cancel_order` is
+flagged in all four), `test_walker_allows_adapter_protocol_calls_inside_the_execution_layer` (negative
+control - both names clean inside synthetic `execution/`+`venues/` files), and `test_walker_still_
+confines_raw_client_names_even_inside_the_execution_layer` (regression guard: a raw `post_order` call
+placed INSIDE a synthetic `execution/router.py` is still flagged - RULE 2 widening WHERE
+place_order/cancel_order may live must not widen RULE 1 along with it).
+
+`OrderRouter.cancel(order_id: int) -> CancelResult`: reads the `orders` row by PK, refuses cross-mode
+access as `UnknownOrder` (a live id can never be probed from a paper-mode router or vice versa - not
+even to confirm it exists), and treats two states as a REPORTED no-op rather than a lie or a crash:
+`already_terminal` (FILLED/CANCELLED/EXPIRED/FAILED - the venue would reject a cancel on it, or the
+cancel would be meaningless) and `no_venue_ack` (still `PENDING`, `order_id IS NULL` - nothing at the
+venue yet to cancel; `reconcile()` resolves that state, not a client cancel). Otherwise calls
+`adapter.cancel_order(row.order_id)`, marks the row `CANCELLED`, `remaining_size=0.0`. `app/api/
+routes/trading.py`'s `DELETE /orders/{order_id}` just calls this and maps `UnknownOrder` -> 404;
+tested end-to-end (`test_cancel_an_already_filled_order_is_a_reported_no_op`,
+`test_cancel_an_unknown_order_returns_404`).
+
+MODE FILTERING: `GET /orders`/`GET /positions`/`GET /positions/{venue}/{market_id}` all filter on
+`settings.trading_mode` explicitly (never assume the shared table holds one mode). `POST /orders`/
+`DELETE /orders/{id}` go through `OrderRouter`, whose own `mode` (from the `Settings` it was
+constructed with) is what gets stamped - never a request field. `Leg`/`Intent` are built field-by-
+field off the validated `OrderRequest` pydantic model, never `Model(**request.model_dump())`
+(module docstring cross-references the Phase 0 mass-assignment writeup in `models/intent.py`/
+`models/trade.py`).
+
+DEFECT (GUARDRAILS.md §3.4, kind=underivable-requirement): the brief says `POST /orders` builds its
+`Intent` from `OrderRequest` "(+ `venue` field, default `polymarket`)", implying the ONLY new field
+versus the pre-existing placeholder schema (`condition_id`, `token_id`, `side`, `size`, `price`,
+`order_type`) is `venue`. That schema cannot actually produce a routable `Leg`: `Leg.outcome` (a
+canonical `"YES"`/`"NO"`, from which `OrderRouter._plan()` DERIVES the venue-native token id via
+`token_id_for()`) has no equivalent field, and going the other way - resolving `token_id` back to an
+outcome - is not just extra plumbing, it is IMPOSSIBLE for Kalshi: T14/T15 already established Kalshi
+has no per-outcome token concept at all (`outcome_ids = {"YES": ticker, "NO": ticker}`, same ticker
+both sides), so a `token_id` could never disambiguate which side of a Kalshi market to trade. Resolved
+by adding a required `outcome: str` field (dropping `token_id`) and renaming `condition_id` ->
+`market_id` (venue-agnostic - a Kalshi identifier is a ticker, not a "condition id"). The existing
+frontend (`frontend/src/types/index.ts::OrderRequest`) still sends the OLD shape
+(`condition_id`/`token_id`/`order_type`, no `outcome`); frontend changes are out of PLAN.md scope for
+this kit (R10) and untouched here - a future task wiring the UI to real trading must update it to
+match.
+
+DEFECT (GUARDRAILS.md §3.4, kind=unrunnable-verify): the verify command's `ruff check app/api
+app/bots` step fails - 20 pre-existing `ARG001` (unused `session: AsyncSessionDep` argument) findings
+in `app/api/routes/arbitrage.py` (5), `app/api/routes/bots.py` (10, the bot-MANAGEMENT placeholder
+routes - distinct from `app/bots/`, which IS in scope and is clean), and `app/api/routes/markets.py`
+(5). T16 is the FIRST task whose verify command runs `ruff` over `app/api` at all (T14/T15 scoped to
+`app/execution app/venues app/tasks`/`app/models`); these three files are untouched TODO scaffolding
+from before this kit started, part of the documented 139-finding baseline (GUARDRAILS.md §2: "fixing
+untouched files is scope creep"). Confirmed via `ruff check app/api/deps.py app/api/routes/trading.py
+app/bots` (my own files) -> "All checks passed!", and via `git diff --stat` showing none of the three
+offending files touched by any task in this kit. Left unfixed per GUARDRAILS.md §2; `mypy app/api/
+routes/trading.py app/bots` (the task's actual mypy scope, which does NOT include the other route
+files) is clean, and the full suite passes. A future task that widens ruff's scope to all of `app/api`
+should budget for cleaning these three files first.
+
+`bots/base.py::BaseBot.execute_signal` is now concrete (no longer `@abstractmethod`): converts a
+`Signal` to an `Intent` via `Signal.to_intent()` (HOLD signals return `False` without reaching the
+router - `to_intent()` has no representation for one), fetches the app-scoped router via
+`app.api.deps.get_router()`, and returns `True` iff `RoutedIntent.status` is `pending`/`executed`.
+The `get_router` import is deliberately LOCAL to the method (not module scope): `app.api.deps` sits
+behind `app/api/__init__.py`, which imports the entire route tree as a side effect of being imported
+at all, and a bot module that only ever computes signals should not pay for that import merely by
+being imported - same deferred-import rationale `app/venues/registry.py::_register()` already
+documents for its own adapter imports.
+
+`api/deps.py::get_router()` is an app-scoped singleton (double-checked-locked on an `asyncio.Lock`,
+built once from `get_adapter(venue, settings.trading_mode)` per venue + `CapitalLedger.paper()`/
+`.from_balances()` depending on mode), reused by both the API routes (`Depends(get_router)`, aliased
+`RouterDep`) and `BaseBot.execute_signal` directly, so a bot and the HTTP API never construct two
+independent routers (and therefore two independent, disagreeing `CapitalLedger`s) over the same
+process.
+
+agent: T16 id=a85dca19e83082d8b role=implementer model=sonnet
+outcome: T16 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T16 CLOSED. Suite 540 -> 552 passed / 0 skipped. `ALLOWED_UNTIL_T16 = set()` - the time-boxed fence
+exception is EMPTY, `OrderExecutor` is deleted, and the API is wired to the router.
+
+THE SUBSTANTIVE WIN IS A HOLE NOBODY HAD NOTICED. The fence guarded `cancel_order` but NOT
+`place_order`, so any strategy, Celery task, or API route could have called `adapter.place_order(...)`
+directly and BYPASSED the router entirely - no risk limits, no capital reservation, no crash-safe
+PENDING row, no reconciliation - with the fence staying green. `cancel_order` was guarded only
+because that name collides between the raw py_clob_client API and the VenueAdapter protocol. The
+fence was catching the wrong thing for the wrong reason while leaving the more dangerous name open.
+
+Now split into two rules, verified independently by the orchestrator:
+  RULE 1 raw-client names {post_order, create_order, create_or_derive_api_creds, ClobClient, path
+    literals} - these TRANSMIT; confined to the two live.py files + the wrapper. Verified still
+    enforced even INSIDE the execution layer.
+  RULE 2 adapter-protocol names {place_order, cancel_order} - these do not transmit but bypass the
+    router; permitted only under `app/execution/` and `app/venues/`. Verified: an API-layer
+    `adapter.place_order(...)` is FLAGGED, a strategy-layer one is FLAGGED, an execution-layer one
+    is allowed.
+
+A NAMING INSIGHT I HAD NOT THOUGHT OF, and it is what makes rule 2 workable: `OrderRouter`'s public
+methods are `submit` and `cancel`, NOT `place_order`/`cancel_order`. Because the walker is syntactic,
+giving the router's own methods DISJOINT names is the only thing that keeps a legitimate
+`router.cancel(...)` call from a route indistinguishable from an adapter bypass. Without that, rule 2
+would have been unenforceable without an allowlist.
+
+ORCHESTRATOR CORRECTION: my own probe reported "execution layer calling adapter.place_order" as
+FAILING. That was my error - `find_violations(path)` takes only a path, so a file I created in a temp
+directory could not be classified into a layer and the walker FAILED CLOSED (flagged rather than
+allowed). Fail-closed on an unclassifiable path is the correct and safe behaviour, and the suite's
+own in-layer negative control passes.
+
+`DELETE /orders/{id}` on an already-filled order returns a reported no-op
+(`cancelled=False, reason="already_terminal"`), never a false "cancelled" and never an error; a
+still-PENDING order with no venue ack gets `reason="no_venue_ack"`. `GET /orders`, `GET /positions`
+and `GET /positions/{venue}/{market_id}` all filter explicitly on `settings.trading_mode`, and
+POST/DELETE stamp `mode` from Settings rather than from any request field.
+
+defect: T16 kind=unrunnable-verify
+`ruff check app/api app/bots` fails on 20 pre-existing ARG001 findings in three UNTOUCHED placeholder
+files (`routes/arbitrage.py`, `routes/bots.py`, `routes/markets.py`) - part of the documented
+139-finding baseline that PLAN 2 explicitly excludes from being a gate. The implementer's own files
+are ruff- and mypy-clean. THIS IS THE SIXTH INSTANCE of the same architect defect shape in this kit
+(T01 ruff scope, T03 `.claude` scope, T05 network-fetch conflict, T06 grep-matches-prose, T13
+scoring.py-does-not-exist, T16 here): a verify clause whose PATH SCOPE sweeps in files the task does
+not own.
+
+Also recorded: `OrderRequest` gained a required `outcome` field and dropped `token_id`, because
+Kalshi has no per-outcome token id to disambiguate YES from NO - consistent with T14's venue-agnostic
+`token_id_for()` rule.
+
+--- PHASE 2 COMPLETE (T13, T15, T14, T16). Suite 552 passed / 0 skipped. ---
+
+reviewer: P2 model=opus findings=13 confirmed=13 result=accepted
+
+PHASE 2 REVIEW: 13 findings. VERDICT: Phase 3 may proceed, with ONE amendment to T18's brief before
+it is dispatched (finding 13). The reviewer's framing is worth preserving: Phase 2's ARCHITECTURE is
+faithful to D4/D5/D8/D13/R6 - genuinely, not nominally - and the defects cluster in THE SEAM BETWEEN
+THE SHARED PATH AND THE LIVE ADAPTERS, which a paper-only test suite is structurally incapable of
+seeing.
+
+--- MUST FIX BEFORE THE SYSTEM IS EVER ARMED LIVE ---
+
+#1 LIVE FILLS CAN NEVER BE MATCHED TO THEIR ORDER. `router.py:1433-1438` matches fills only by
+   `fill.metadata["client_order_id"]` or `fill.order_id == client_order_id`. `paper.py:684` injects
+   that metadata key on every simulated fill; NEITHER LIVE ADAPTER DOES
+   (`polymarket/adapter.py:811` sets market/asset_id; `kalshi/adapter.py:730-738` sets
+   market_id/outcome/fee_source), and in both `Fill.order_id` is the VENUE order id. The router never
+   falls back to `ack.order_id`. So in LIVE mode a FULLY FILLED REAL ORDER yields: fills == [], no
+   Trade row, no Position upsert, RoutedLeg.fee == 0.0, and `_resolve_reservation` (:1711) takes the
+   `not fills` branch and RELEASES THE ENTIRE CAPITAL RESERVATION. `reconcile` cannot repair it -
+   `_update_order_row` already moved the row to FILLED, outside `_UNRESOLVED` (reconcile.py:74-78).
+   Every router test uses PaperVenueAdapter, so 552 green tests cannot touch this. The reviewer's
+   note on cause is generous and correct: `paper.py:686-691` deliberately moved the client key out of
+   `Fill.order_id` into metadata so paper would not be "the only mode where the two fields mean the
+   same thing" - the right instinct, applied to the one adapter that did not need it, leaving live
+   with neither field.
+#2 THE KILL SWITCH DOES NOT HALT ORDER PLACEMENT. D13 says file presence halts all placement.
+   `assert_live_allowed` checks it (fences.py:126) but is called ONLY in live-adapter constructors;
+   `OrderRouter.submit`/`_place` (router.py:1001-1046) never check. `api/deps.py:100-105` caches the
+   router AND its adapters process-wide, so that constructor runs ONCE PER PROCESS at the first
+   order - throwing the switch afterwards changes nothing. INVERTED, too: `tasks/execution.py:56`
+   calls `get_adapter` every beat, so an engaged switch STOPS RECONCILIATION (the read-only pass you
+   most want during a halt) while orders continue. `GET /trading/mode` reports `kill_switch: true`
+   while placement is unaffected.
+#3 CAPITAL RESERVATIONS ARE RELEASED FOR ORDERS STILL RESTING AT THE VENUE. router.py:1711 - a GTC
+   leg that rested with zero fills hits `not fills` -> full `release()`; a partially filled resting
+   leg returns the unfilled remainder. Nothing re-reserves; `reconcile` never touches the ledger.
+   This contradicts the ledger's own stated purpose (ledger.py:14-21: its `locked` is "the only thing
+   in the system tracking capital committed to open orders"). Untested - no router test submits an
+   order that rests.
+#6 EVERY STRUCTURED LOG FIELD IS DISCARDED AT RUNTIME. The naked-leg alarm is
+   `logger.error("order", extra={... "naked_exposure": True ...})` (router.py:1272), and there is NO
+   basicConfig/dictConfig/formatter/logging config ANYWHERE in `app/` outside three `app/scripts/`
+   entry points, and no structlog or json-logger in requirements. Under uvicorn/Celery defaults
+   `extra` is in no formatter, so the worst state the system can reach announces itself as THE BARE
+   WORD "order" on stderr. NOTES.md called the unwind "loud and persisted" - it is persisted; it is
+   not loud.
+#8 THERE IS A PATH WHERE A NAKED LEG IS CREATED AND NOT RECORDED. The naked record is written only in
+   `_finalize_intent` (router.py:1747-1749) inside `_settle`'s single commit (:1379) - AFTER
+   placement and AFTER the unwind. Anything raising in between loses it permanently while the fills
+   are real at the venue. Reachable: `self._ledger.credit(venue, ...)` (:1209) raises `UnknownVenue`
+   if the ledger was not seeded for that venue, and `PAPER_STARTING_BALANCES={"polymarket": 500}` is
+   a LEGAL config (config.py:407 rejects unknown keys and negatives but does not require both
+   venues); `_reserve` catches only `InsufficientCapital` (:826), so `UnknownVenue` escapes `submit`
+   un-persisted. A failed commit at :1379 does the same. Smaller sibling: an all_or_none intent whose
+   SELL leg filled while a BUY leg did not is SKIPPED by `_maybe_unwind` (:1108-1111,
+   `side != "BUY"` -> continue) with NO NakedLeg recorded.
+
+--- MUST FIX BEFORE T22 QUOTES A P&L NUMBER ---
+
+#4 `Position.realized_pnl` OMITS THE ENTRY FEE and disagrees with the router's own unwind cost by
+   exactly that amount. router.py:1683 uses a fee-EXCLUSIVE `avg_entry_price` (:1631) while
+   :1215-1218 computes the unwind cost WITH the pro-rated entry fee. On T14's own recorded example
+   (buy 10 @ 0.50 fee 0.10; sell 10 @ 0.50 fee 0.10): `unwind_cost_usd` = 0.20 (correct, ledger
+   agrees 1000 -> 999.80) while `Position.realized_pnl` = -0.10, understating the loss by exactly one
+   taker fee. TWO NUMBERS FOR THE SAME EVENT IN THE SAME COMMIT. Also `total_cost` never reaches zero
+   on a fully closed position (:1684 subtracts only `closed * avg_entry_price`), leaving entry fees
+   behind forever. This is PLAN R3's error class, and the wrong number feeds BOTH the daily-loss
+   fence and `GET /positions`.
+#5 THE DAILY-LOSS FENCE SUMS LIFETIME P&L OF ROWS TOUCHED TODAY. router.py:789-794 sums
+   `PositionRow.realized_pnl where updated_at >= day_start`, but that column is CUMULATIVE
+   (position.py:72) - a position that gained last month and is touched today contributes the whole
+   gain, MASKING a real loss today. Its own docstring claims "realized P&L booked since the start of
+   the current UTC day". Also `check_order_limits` documents `daily_pnl` as realized-PLUS-unrealized
+   (fences.py:180-182); only realized is passed, and unrealized is structurally zero (finding 11).
+#11 `unrealized_pnl`/`unrealized_pnl_pct` are stored columns (position.py:68-69) that NOTHING EVER
+   WRITES, and `GET /positions` returns both on every row (trading.py:145-146, 199-200). A human
+   reads "flat" on a position that is not.
+
+--- OTHER CONFIRMED ---
+
+#7 A naked leg is discoverable ONLY by hand-querying `intents.extra_data`. No route reads
+   IntentRecord at all; `OrderResponse` carries no `naked_legs`/`unwind_cost_usd`;
+   `BaseBot.execute_signal` reduces the whole RoutedIntent to a bool. Combined with #6, the alarm
+   exists in two places, one unformatted and one unqueryable.
+#9 The fence's classification is SOUND and coverage is `rglob("*.py")` (not hardcoded), and it
+   correctly catches `f = adapter.place_order`, `VenueAdapter.place_order(a, r)`, and
+   `functools.partial(adapter.place_order, ...)`. BLIND SPOT: `getattr(adapter, "place_order")(req)`
+   from `app/api/` is NOT flagged - the bare string is not in FORBIDDEN_PATH_SUBSTRINGS - and the
+   repo already uses that idiom (router.py:2043 `getattr(adapter, "fill_reason", None)`). Also RULE 2
+   exempts whole DIRECTORIES, so a future `app/execution/anything.py` could bypass OrderRouter.
+#10 `PaperVenueAdapter.poll()` has NO PRODUCTION CALLER (only three test call sites), so a resting
+   paper order can never fill - and `POST /orders` builds `best_effort` -> `tif="GTC"`, exactly the
+   type that rests. With #3: reservation released, order rests forever, reconcile re-marks it OPEN
+   each pass. paper.py's "upper bound on live" claim is structurally ZERO for GTC.
+#12 MODE FILTERING IS COMPLETE FOR AGGREGATES - verified exhaustively, every select() touching
+   orders/trades/positions filters on mode, and no other module reads those tables at all. The
+   residue is UNIQUE-KEY lookups (`client_order_id` and `trade_id` are globally unique;
+   `session.get(IntentRecord, ...)`), unreachable with minted UUID4 ids but reachable the moment a
+   caller supplies a deterministic `metadata["intent_id"]` - a natural thing for T18/T19 to do. The
+   effect would be a LIVE trade silently skipped because a PAPER row owns that trade_id.
+#13 T18'S BLOCKER - D8's `min(available_A, available_B)` BOUND HAS NO SEAM. `available_by_venue()`
+   and `min_available()` exist and are the right shape, but: `on_market_data(snapshot)` (the hook
+   that actually produces Intents) receives NO capital at all; `calculate_position_size(signal,
+   portfolio_value, positions)` has ZERO callers in `app/` and its capital parameter is a single
+   scalar `portfolio_value` - precisely the cross-venue-summed number 1.6 forbids; and
+   `OrderRouter._reserve` (:802-833) has NO DOWNSIZING PATH - the first venue shortfall REJECTS the
+   whole intent, turning D8's bound into a rejection. T18 needs a capital-aware strategy hook OR a
+   router-side downsize step, and WHICH belongs in its brief, not its improvisation.
+
+VERIFIED CLEAN, stated plainly: D4 holds literally - there is NO `if mode == "paper"` branch anywhere
+in `app/execution/` or `app/venues/`; the only `trading_mode ==` comparisons are fences.py:123 and
+deps.py:82 (which ledger seeder). D5 holds - exactly one SimulatedFillEngine with four call sites,
+and the paper adapter grew NO fill logic. The recorded tick/min_size asymmetry is NOT worse than
+recorded: `market=` gates only `_check_on_tick`, `min_size`, and the label - fees come from the
+`schedules()` resolver, so both callers price fees identically. R6 holds in the ROUTER too:
+`Reservation` binds its venue at creation and release/settle use `reservation.venue` exclusively,
+including the overspend path; there is no path where it does not.
+One soft asymmetry named: `_reason_for` reaches `fill_reason` via getattr and only PaperVenueAdapter
+implements it, so `_STRUCTURAL_REASONS` and the FAILED-vs-EXPIRED split are unreachable in live -
+paper will persist order statuses live never can.
+
+agent: P2 id=aa4820ecff8b12dcd role=implementer model=opus
+
+P2 REMEDIATION CLOSED. Suite 552 -> 580 passed / 0 skipped (+28). All eight fixes verified by the
+orchestrator independently.
+
+FIX 1 fill matching - `_fill_matches(fill, client_order_id, venue_order_id)`, three arms in PRIORITY
+order, and the priority is the insight: (1) if the fill carries `metadata["client_order_id"]` AT ALL,
+that key decides - match if equal, NON-match if not, because an adapter that labels its fills has
+told us which order each belongs to and no weaker signal may override it; (2) else match
+`fill.order_id == ack.order_id` (the live arm), with an EMPTY venue id never matching, since both
+real parsers fall back to "" and an unidentifiable fill must not attach to every order at once;
+(3) else match `fill.order_id == client_order_id`. `RoutedLeg` now carries `venue_order_id`.
+THE TEST IS THE POINT: `tests/venues/live_shaped_adapter.py::LiveShapedAdapter` is NOT a paper
+adapter - its acks carry a venue-native order_id and its fills stamp only the REAL venues' metadata
+keys. Under the old rule the ledger read 1000.00 (full release on a filled order); it now reads
+994.90 with locked 0.0, a genuine SETTLE. The implementer ran the NEGATIVE CONTROL: reverting
+`_fill_matches` fails that test and its sibling.
+
+FIX 2 kill switch - TWO FUNCTIONS, TWO QUESTIONS, which is a better cut than I asked for.
+`assert_live_allowed()` still answers "is live armed?" at adapter construction. New
+`assert_placement_allowed()` answers "is trading HALTED RIGHT NOW?", ignores mode entirely, and is
+called at `submit()` step 0 before planning/reserving/persisting/placing - so it halts paper AND live
+and is re-evaluated on EVERY submission, which is what the cached process-wide router made
+impossible before. Reconciliation is separated BY TYPE rather than by exemption: a new
+`ReconcileAdapter` Protocol exposing only `get_open_orders`/`get_fills`, plus
+`registry.get_read_adapter()`, so the read-only pass literally cannot place an order and never
+evaluates a placement fence. `GET /trading/mode` now reads the SAME `kill_switch_engaged()` the fence
+uses, so the report and the halt cannot disagree.
+
+FIX 5 today's P&L - a PER-DAY DELTA written at the moment of realization into
+`Position.extra_data["realized_by_day"][YYYY-MM-DD]`, in the same transaction that books it, bounded
+to 7 days. Rows written before this bookkeeping contribute 0.0 to today, which is the correct answer
+for a lifetime column. Negative control run: restoring the `SUM(realized_pnl)` query fails the test
+where a +50 lifetime gain masks a -0.20 loss today.
+
+FIX 3 capital is released only on a TERMINAL ack; a working order keeps its reservation (partial fill
+-> settle the spent part, re-reserve the remainder), the id lives in
+`Order.extra_data["reservation_id"]`, and `cancel()` releases it. Documented limit: `reconcile` runs
+in a different process with no ledger and still cannot release - that is D8's capital seam, and it
+errs toward LOCKED, which is the safe direction.
+FIX 4 realized P&L is fee-inclusive on both sides and `total_cost` is zeroed on a full close; on
+T14's example `realized_pnl == -0.20 == -unwind_cost_usd`, asserted TOGETHER in the unwind test.
+FIX 6 `app/logging_config.py` - stdlib dictConfig + an in-repo JSON formatter, no new dependencies,
+installed from `main.create_application()` and `tasks/__init__` with `worker_hijack_root_logger=False`.
+Values are ALLOW-LISTED BY TYPE, so an exception renders as `"<VenuePayloadError>"` and no attribute
+of it - `raw` included - is ever reached. Orchestrator-verified: a VenuePayloadError carrying
+`{"api_secret":"SUPERSECRET","private_key":"0xdeadbeef"}` leaks neither value; `api_key` renders
+`"***"`; `naked_exposure` and `intent_id` survive. Allow-listing by TYPE rather than blocklisting by
+KEY is what makes a future secret-bearing exception safe too.
+FIX 7 `_naked()` is async and commits in its OWN transaction as the exposure is created - a test
+overrides `_settle` to raise and still finds `naked_exposure` persisted. `_reserve` now rejects on any
+`LedgerError`, `paper_starting_balances` must seed every venue at load (closing the `UnknownVenue`
+escape), and an all_or_none SELL leg that filled alone is recorded as
+`NakedLeg(reason="sell_leg_not_unwindable")`.
+FIX 8 `unrealized_pnl`/`_pct` are now written wherever `current_price`/`current_value` are.
+
+defect: - kind=unrunnable-verify
+SEVENTH instance of the shape: `ruff check app/api` fails on 20 pre-existing ARG001 findings in three
+legacy stub routes (`arbitrage.py`, `bots.py`, `markets.py`) this remediation never touched -
+`git diff --stat` shows no change to any of them. Reported, not improvised.
+
+## T17 — event-equivalence subsystem
+
+DESIGN ADDITION (not a defect, but it goes beyond the brief's stated formula, so it is recorded).
+D9's weighted sum alone cannot satisfy the brief's own test `"above 100k" vs "above 150k" -> False
+and confidence < 0.5`. Both titles normalize to the SAME tokens — the number becomes `<num>` by
+design — so `title_jaccard = 1.0`, and with equal close times the sum is
+`0.55x1 + 0.20x1 + 0.15x0 + 0.10x0.5 = 0.80`. No choice of test fixture fixes it: even a 10-day
+close gap leaves 0.60. The resolution is a single documented VETO in
+`matcher.score_pair`: when `threshold_match is False` (both titles state thresholds and share NO
+value) the confidence is capped at `THRESHOLD_MISMATCH_CAP = 0.45`, below the default
+`min_confidence`, so the pair is never proposed. The cap only ever LOWERS a score — it can suppress
+a proposal, never promote one — which is the safe direction for R1. A PARTIAL threshold overlap is
+`None` (unknown), not `False`, so the veto cannot fire on ambiguity.
+
+TWO STOPWORD DEPARTURES, same safe direction: negations (`not/no/never/without/neither`) and
+comparison words (`above/below/over/under/more/less`) are KEPT as content tokens even though a stock
+English stopword list drops them. Dropping them would make "Will X happen?" and "Will X NOT happen?"
+— the two sides of the same contract — normalize identically, and likewise "above 100k" and
+"below 100k". `will/the/by/before/after/on/in` are removed exactly as D9 says.
+
+STEMMER: vendored, not `nltk`. `nltk 3.9.1` IS installed and `PorterStemmer` needs no corpus, but
+(1) `nltk` is not in `backend/requirements.txt`, so importing it from `app/` would be an undeclared
+runtime dependency; (2) its stopword list IS a downloaded corpus (GUARDRAILS §1.4 forbids the
+network), so that half had to be self-contained regardless; (3) every `title_jaccard` is persisted
+in `event_links.evidence` and read by a human, so a dependency upgrade that changed one stem would
+silently change every stored score. `normalize.stem` implements Porter steps 1a/1b/1c, a
+conservative step-2/4 table, and step 5.
+
+agent: T17 id=a62d1b1e7c1415335 role=implementer model=opus
+outcome: T17 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T17 CLOSED. Suite 580 -> 611 passed / 0 skipped (+31). `alembic heads` = `005 (head)`, one head,
+`CREATE TABLE event_links` present exactly once in the offline SQL.
+
+ACCEPTANCE 2 VERIFIED STRUCTURALLY: the ONLY lifecycle literal anywhere in `app/services/matching/`
+is `"proposed"`. The matcher cannot promote its own guess. `approved`/`rejected`/`reviewed_by`/
+`reviewed_at` are written ONLY by `approve_link`/`reject_link` in `app/api/routes/links.py`.
+
+THE WORKED EXAMPLE IS THE WHOLE ARGUMENT FOR THIS SUBSYSTEM, and it should go in the final report:
+  Kalshi     "Bitcoin above 100K by Dec 31 2025"
+  Polymarket "Will Bitcoin be above $100,000 on December 31, 2025?"
+Both normalise to {bitcoin, abov, <num>, <date>} -> title_jaccard 1.0, close delta 0, thresholds both
+100000.0 -> confidence 0.90. And their rules texts resolve against CoinDesk BPI at 5pm ET vs 4pm ET.
+Identical by every automated measure; one hour apart on a volatile asset is exactly where a
+"riskless" cross-venue arb becomes two uncorrelated directional bets. No token overlap can see it -
+which is why `GET /links/{id}` puts both rules texts side by side and why nothing trades on a
+proposal.
+
+TWO STOPWORD DEPARTURES, both in the safe direction, and this is a genuinely important catch:
+NEGATIONS (not/no/never/without) and COMPARISON WORDS (above/below/over/under) are KEPT as content
+tokens. A stock stopword list drops them, which would make "Will X happen?" identical to
+"Will X NOT happen?" and "above 100k" identical to "below 100k" - i.e. it would link a market to its
+own INVERSE and call it a hedge. Orchestrator-verified: 'Will X happen?' -> ['happen'] vs
+'Will X not happen?' -> ['happen','not']; 'above 100k' -> [...,'abov',...] vs 'below 100k' ->
+[...,'below',...]. `will/the/by/before/after/on/in` are removed exactly as D9 says.
+
+STEMMER: vendored Porter-style in `normalize.py`, NOT nltk, for three reasons - nltk is not in
+`requirements.txt` (importing it from `app/` would be an undeclared runtime dependency); its stopword
+list is a DOWNLOADED CORPUS and GUARDRAILS 1.4 forbids the network, so half had to be self-contained
+regardless; and every `title_jaccard` is PERSISTED into `event_links.evidence` and read back by a
+human, so a dependency upgrade that changed one stem would silently change every stored score. That
+third reason is the one that makes vendoring correct rather than merely convenient.
+
+THE BRIEF'S FORMULA CANNOT SATISFY ITS OWN TEST, found and resolved honestly: "above 100k" vs
+"above 150k" normalise IDENTICALLY (the number becomes `<num>` by design), so the stated weights give
+0.55+0.20+0+0.05 = 0.80, and no fixture choice reaches the required < 0.5 (a 10-day gap still leaves
+0.60). `score_pair` therefore applies ONE documented veto: `threshold_match is False` caps confidence
+at 0.45, below `min_confidence`, setting `evidence["threshold_capped"]`. THE CAP ONLY EVER LOWERS -
+it can suppress a proposal, never promote one, which is the R1-safe direction.
+
+Tri-state verified COMPARATIVELY, not just by value: `tri_state_score(None)=0.5`, `True=1.0`,
+`False=0.0`, and an unknown source scores 0.875 against a disagreeing source's 0.825 - so absent
+information is never punished like disagreement.
+
+Other properties worth keeping: `evidence` stores the COMPONENTS (both sub-scores, both threshold
+lists, shared/distinct tokens, weights, the veto flag) so a later kit can re-weight without re-running
+and a reviewer can see WHY a pair was proposed. `GET /links/{id}` returns both sides in the SAME
+field order plus a `comparison` list and `close_time_iso` with the offset rendered explicitly,
+because a timezone-cutoff mismatch is otherwise invisible. Blocking is pinned against a brute-force
+scan with NO document-frequency cutoff, so it degrades to quadratic rather than to a wrong answer.
+`POST /links/propose` never overwrites a human decision (`skipped_reviewed`). Adapters come from
+`get_read_adapter`, so the review path never constructs an order-placing adapter.
+
+agent: T18 id=aeae2556eb0b7ca93 role=implementer model=opus
+outcome: T18 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T18 CLOSED. Suite 611 -> 624 passed / 0 skipped (+13). Registry back to 9 with
+`cross_venue_arbitrage` present. THE STRATEGY THE KIT EXISTS FOR NOW EXISTS.
+
+THE HEADLINE ECONOMIC RESULT, computed independently by the orchestrator from the repo's own fee
+models. Polymarket YES 0.46 (Politics 0.04) + Kalshi NO 0.50 (0.07), probe size 50:
+    fee_A 0.009936/contract, fee_B 0.017600/contract, gas 0.002000/contract
+    cost 0.989536  ->  gross_edge 0.010464  ->  worst_case_loss 0.50
+    p=1.00 net +0.010464 | p=0.98 +0.000255 | p=0.95 -0.015059 | p=0.90 -0.040582 | p=0.80 -0.091629
+  Required GROSS edge to clear net_edge >= 0.015:
+    p=1.00 -> 1.50%   p=0.98 -> 2.55%   p=0.95 -> 4.21%   p=0.90 -> 7.22%   p=0.80 -> 14.37%
+CONCLUSION THAT SHOULD SHAPE THE WHOLE STRATEGY, and it belongs in the final report:
+CROSS-VENUE ARB IS ONLY VIABLE ON NEAR-CERTAIN LINKS (>= ~0.98). A 0.90-confidence link would need a
+7.2% mispricing between two venues quoting the same event, which does not persist on liquid markets.
+The asymmetry is why: when equivalence HOLDS you earn a cent; when it FAILS you lose the losing leg's
+entire ~50c cost. A 5% failure chance costs 2.5c against a 1c gross edge.
+=> This VALIDATES T17's human-review design economically, not just as hygiene: the approved link's
+   confidence is the DOMINANT TERM in whether the trade exists at all.
+=> And same-venue COMPLEMENT arb needs only ~2.5% (measured at T09) because both legs settle together
+   BY CONSTRUCTION - no equivalence risk. Complement is the structurally safer edge of the two.
+
+BRIEF ARITHMETIC DEFECT, found and resolved: the brief writes `cost = ... + 2 x redemption_gas`.
+Taken literally PER CONTRACT that is $0.10/contract, which makes gross_edge NEGATIVE at every
+realistic price - the strategy could never signal, ever. Amortised as `2 x redemption_gas / probe_size`
+instead, matching `binary_complement_arbitrage`'s established convention and PLAN D8's own
+per-contract comparison against $1.00. This is the SECOND instance in the kit of a brief whose
+arithmetic makes a strategy structurally unable to signal (T10's `min_position_size` default was the
+first) - worth naming as a pattern for the architect.
+
+WHERE THE DOWNSIZE WENT, and the distinction is a good one: `OrderRouter._downsize_to_capital`, a new
+step between `_check_limits` and `_reserve`. The strategy's `calculate_position_size` also applies
+D8's `min(available_A/ask_A, available_B/ask_B, max_contracts)` and IS now genuinely called
+(`_build_intent` supplies `positions["__ledger__"]` from `observe_capital(ledger.available_by_venue())`),
+but that snapshot is a COPY taken before risk checks and possibly stale; the router owns the one
+authoritative ledger and is the last place size can change before capital is committed.
+OPT-IN via `Intent.metadata["downsize_to_capital"]`, because ONLY THE STRATEGY KNOWS WHETHER ITS EDGE
+IS SCALE-FREE: a hold-to-resolution complement earns a fixed edge PER CONTRACT so a smaller pair is
+the same trade, whereas a directional single-leg bet at a third of its intended size is a DIFFERENT
+trade and must still be rejected. A test pins exactly that - same setup with the flag stripped is
+still `rejected/insufficient_capital` with nothing placed.
+Every leg scales to the SAME contract count (or the "arbitrage" acquires a naked directional
+residual), floored to a whole contract via integer bisection because Kalshi's cent ceiling makes
+`_reservation_amount` monotone but NOT affine - there is no closed form to invert. Flooring is the
+only rounding that cannot round back into a second shortfall.
+End-to-end proof: $50 Kalshi / $5,000 Polymarket, asks 0.45/0.48 -> strategy sizes 104.17 (the POOLED
+formula would give 5430.1, asserted against explicitly) -> router funds 100 contracts on BOTH legs,
+and `5000 - available("polymarket") == 45.99` exactly, so the richer venue funded only its own leg.
+
+`LinkBook` raises on `status is None` TOO, and the reason is subtle and correct: `"proposed"` is a
+COLUMN default applied at INSERT, so a never-persisted `EventLink` carries `status is None` - a check
+written as `status != "proposed"` would have let an unsaved row through. Parametrised over
+proposed/rejected/None. A failed `set_links` leaves the previous good book intact.
+
+`suspect_link` fires at `net_edge >= 0.08` and DISCRIMINATES rather than firing on every arb: asks
+0.42/0.44 at confidence 0.98 -> net 0.0998 -> True; the believable 0.45/0.48 4% edge on the same pair
+-> False. The docstring says plainly that a large edge is evidence the LINK is wrong, not that the
+trade is good - a flagged intent is a request to re-read both rules_texts.
+
+Also: fees priced PER FILL at probe_size then divided back, because pricing `fee(price, 1.0)` levies
+Kalshi's cent floor once per contract and overstates it by ~14% at these prices (0.02 vs 0.0176).
+A book too thin for the probe size yields NO evaluation - "a price the book cannot fill is not a
+price". An INVERTED outcome_map (A's YES <-> B's NO) is skipped with a WARNING rather than silently
+mis-hedged, since `Intent`'s cross_venue rule cannot express YES-on-both.
+
+agent: T19 id=a899fde9b6b64d43c role=implementer model=sonnet
+outcome: T19 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+T19 CLOSED. Suite 624 -> 641 passed / 0 skipped (+17).
+
+SCANNER IS STRUCTURALLY READ-ONLY, verified by the orchestrator at the AST level rather than by grep:
+`app/services/scanner.py` and `app/tasks/scanner.py` have NO router import, NO `.submit()` call, and
+the only adapter type either can hold is `MarketDataAdapter` (the read-only Protocol) obtained via
+`get_read_adapter`. So the scanner cannot route AND cannot acquire an order-placing adapter - stronger
+than acceptance 2's grep. This matters because the scanner runs on a 120s Celery beat over live venue
+data: if it could route, a scoring bug would become an automatic trading bug at machine speed.
+(My own first grep reported "ROUTING REACHABLE" - all five hits were DOCSTRING PROSE explaining that
+the module does not import OrderRouter. Ninth instance of the naive-grep shape, this time in my own
+probe. The implementer hit it too and had to reword a docstring that literally contained `.submit(`.)
+
+ANNUALIZATION FLOOR verified: `net_edge / max(hours, min_hours_for_annualization=6) x 8760`, capped
+rather than extrapolated. A 10-minute market reports 29.20 instead of 1030.59 - a 35x suppression
+that stops a near-expiry rounding artifact from dominating the ranking - while raw
+`hours_to_resolution` stays UNFLOORED so the near-term bucket is still visible and filterable. That
+is the right split: floor the derived metric, keep the raw axis honest.
+
+All nine score fields reach the payload including `depth_source` and `link_status`. `depth_source`
+aggregates across every leg's book - "recorded" only if ALL are recorded, "mixed" if both appear, and
+"synthetic" as the CONSERVATIVE default when no book was found. `link_status` is read verbatim from
+`intent.metadata`; the scanner filters links to `approved` before constructing the strategy (and
+`LinkBook` would raise anyway), so every cross-venue intent it emits is honestly labelled - but
+`score()` itself is agnostic and would carry a `"proposed"` label through unchanged if one ever
+reached it, which is the correct separation.
+
+A resolved market, or one past `close_time`, raises `UnscorableIntent` and is skipped - no phantom
+opportunities on markets that can no longer fill (T09 established no fill can occur post-resolution).
+New settings: `scan_top_n` 200, `scan_interval_s` 120, `max_slippage_bps` 50.
+
+agent: T20 id=a96b07876ba3962d7 role=implementer model=sonnet
+
+T20 implementation complete pending review. Suite 641 -> 654 passed / 0 skipped (+13). `alembic heads`
+unchanged at `005 (head)` - no migration, both `Order`/`Position`'s existing `extra_data` JSON columns
+were enough.
+
+THE `close_time`-PASSED TENSION (carry-forward #6) is resolved by giving `app.services.scoring.score`
+a new `allow_past_close: bool = False` parameter. `_leg_markets`'s gate used to be ONE check
+(`status == "resolved" or close_time <= now`) enforcing T09's rule; it is now TWO separate checks,
+and `allow_past_close=True` skips only the second. `near_resolution_pass` is the one caller that
+passes it, and only for `settlement_edge`'s outcome-determined intents, which by construction are
+always past `close_time`. `"resolved"` is still refused unconditionally either way - the existing
+T19 test `test_market_past_close_time_is_never_scored` (no kwarg passed) is untouched and still
+passes. This is a narrow, additive change to a "done" T19 function, not a rewrite of its contract.
+
+A GENUINE BUG CAUGHT BY MY OWN HAND-COMPUTED TEST NUMBERS, not by an acceptance line: my first draft
+of `_apply_near_resolution_risk` re-derived `annualized_return` from `score()`'s generic formula
+(`net_edge / floor_hours * HOURS_PER_YEAR`), and the persisted score came out to 2.774 where the
+strategy's own metadata said 2.8306 for the identical intent. `score()`'s formula never divides by
+the capital deployed (`ask`) at all - fine for `binary_complement_arbitrage`/`cross_venue_arbitrage`
+where combined asks sum near $1.00, wrong here where a near-certain ask can sit anywhere in (0,1) and
+PLAN.md D10(c)'s own formula is explicitly `(1-ask-fee-gas)/ask`. Fixed by reading
+`intent.metadata["annualized_return"]` (the strategy-published, already-correct figure) straight
+through in `_apply_near_resolution_risk` instead of re-deriving a different number from `net_edge`.
+Recorded as a carry-forward for anyone extending `near_resolution_pass` to a strategy whose "edge" is
+NOT already close to $1 of capital per contract.
+
+SCOPE DECISION: `near_resolution_pass` runs ONLY `settlement_edge`, not "the same strategies" `scan()`
+runs (PLAN.md D10's intro paragraph could be read either way). Reasons: (1) the ordinary arbitrage
+strategies are already scored fine by `scan()` for any near-resolution market that has NOT yet passed
+`close_time`; only the outcome-determined/dispute-window regime - where `close_time` HAS passed - is
+unreachable through `scan()`, and `settlement_edge` is the one strategy PLAN.md ties to that regime;
+(2) `in_dispute_window` needs the real `VenueMarket` (status/close_time/expected_settle_time), which a
+bare `MarketSnapshot` (what every OTHER strategy's `on_market_data` receives) cannot express, so
+generalizing this pass to arbitrary strategies would need a second interface those strategies don't
+have and nothing in the brief asks for.
+
+Market SELECTION reads `list_markets(status=None)`, not `status="open"` like `scan()`: Kalshi moves a
+closed-but-undetermined market to `status="closed"`
+(`app/venues/kalshi/adapter.py::_MARKET_STATUS_FROM_PAYLOAD`), which `scan()`'s filter would silently
+drop from every pass, near-resolution included. A market is kept if `status != "resolved"` and
+`(close_time - now)` in hours is `<= near_resolution_hours` - negative for an already-closed market,
+which trivially satisfies the bound and needs no separate branch.
+
+`in_dispute_window` and the settlement-time ESTIMATE fed to the strategy share one function
+(`_expected_settlement_ts`), and getting this right took a second pass: Kalshi's `expected_settle_time`
+is the natural per-venue reference, but if it has ALREADY passed (i.e. `in_dispute_window` is already
+`True`), using it verbatim as "hours to resolution" gives zero or negative hours and
+`SettlementEdgeStrategy.evaluate` refuses to annualize at all - which would make the dispute-window
+test case (allow_dispute_window=True) unable to signal, ever. Fixed: `expected_settle_time` is used
+ONLY when it is still in the future; otherwise (Polymarket's always-`None` case, OR a Kalshi market
+already stuck past its own expected settlement) the estimate restarts from `now + settlement_delay_hours`.
+
+THE BUCKET CAP (D10(d)) is a real cross-submission aggregate, not a per-intent check: `Order` and
+`Position` gained no new column (no migration) - `_bucket_open_notional` reads the tag back off the
+OWNING `IntentRecord.extra_data["bucket"]` (persisted at `_persist_pending` time from
+`intent.metadata["bucket"]`) for every resting order / open position, summed in PYTHON rather than SQL
+(JSON-field filtering is not portably expressible across SQLite-in-tests and Postgres-in-prod with
+plain SQLAlchemy Core, and the bucket is a small subset of an account's rows). `check_order_limits`
+gained `bucket`/`bucket_notional` as a FOURTH, additive limit alongside the existing three - an
+unrecognized bucket name is a no-op, not a raise, since this function owns no registry of valid
+buckets (that lives with whatever assigns the tag). This SUPERSEDES the T14-era inline check in
+`OrderRouter._check_limits` that guessed "near-resolution" from `hours_to_resolution <=
+near_resolution_hours` and compared only one intent's own total against the raw cap - it neither
+aggregated across submissions nor could tell a settlement-edge trade from any other strategy that
+happened to fire near expiry. A router test proves the new shape: a first intent at EXACTLY $500 (the
+default cap) passes (strict "exceeds", not "reaches" - matching the other three limits' own
+convention), and a second, five-dollar intent is rejected once the first has filled, because the
+bucket's committed notional (not the second intent's own, tiny notional) is what now exceeds $500.
+
+defect: T20 kind=unrunnable-verify
+EIGHTH instance of the same architect defect shape (T01/T03/T05/T06/T13/T16/two unlabeled T16-era
+entries - see above): `ruff check app/services app/strategies/settlement_edge.py app/execution`
+sweeps in 6 pre-existing findings across THREE files T20 never touched
+(`app/services/data_collector.py`, `app/services/polymarket/client.py`,
+`app/services/polymarket/websocket.py`) - `data_collector.py` shows as already modified by an earlier,
+still-uncommitted task in this kit run; the other two are untouched baseline. `git diff --stat` shows
+no change to any of the three from this task. `ruff check` scoped to the five files T20 actually wrote
+(`app/services/scanner.py`, `app/services/scoring.py`, `app/strategies/settlement_edge.py`,
+`app/execution/fences.py`, `app/execution/router.py`) is 100% clean, and
+`mypy app/services/scanner.py app/strategies/settlement_edge.py` (the acceptance line's own mypy
+scope) is clean.
+
+### T20 review finding (orchestrator, before close) — Kalshi fee priced at maximum fragmentation
+
+`settlement_edge.py::_evaluate` computed `fee = fee_model.fee(ask, 1.0, "taker", schedule)` while
+`gas_per_contract = redemption_gas_usd / size` used `size = 100`. Two size bases in one residual.
+On Kalshi `fee(ask, 1.0, ...)` is numerically IDENTICAL to the worst possible fragmentation of the
+order (100 single-contract fills, each paying the $0.01 per-fill floor in full), verified against
+the real fee models:
+
+    ask=0.98   as-shipped 0.009500/ct (283.06% ann.) | 100ct in 1 fill 0.018100/ct (539.31%)
+    ask=0.995  as-shipped -0.005500/ct (REJECTED)    | 100ct in 1 fill 0.004100/ct (120.32%)
+
+(CORRECTED: the orchestrator's first pass at this table priced Kalshi with
+`category_fee_schedule(None)` -- taker_rate 0.05, the POLYMARKET category default -- instead of
+`default_kalshi_schedule()` -- taker_rate 0.07, which is what `settlement_edge._fee_inputs` actually
+uses for Kalshi. The defect and its sign were unaffected; the magnitudes above are the verified ones.
+Lesson for later tasks: reproduce a venue number through the same `_fee_inputs` the code under review
+calls, never through a hand-picked schedule.)
+
+The as-shipped row equals the 100-fills row exactly at both prices. Polymarket is unaffected -- its
+fee is linear in size and flat in fill count (`fee(0.995, 100) == 100 * fee(0.995, 1)` exactly), which
+is why the bug is Kalshi-only and invisible to any Polymarket-only test.
+
+CONSEQUENCE for the brief's demanded "0.995 -> None (fees eat it)" case: it passed for the WRONG
+reason -- the size=1 artifact, not genuine fee pressure. At the strategy's own `min_position_size`
+of 100 contracts filled in one level, 0.995 on Kalshi is a real +123% annualized trade.
+
+CARRY-FORWARD (T21/T22): the fee a Kalshi order actually pays is a function of how the order
+FRAGMENTS, and recorded depth (T21) changes fragmentation directly. Any capital sweep (T22) that
+varies size without re-walking the book will misprice Kalshi at every size but the one it calibrated
+on. Polymarket's fee is invariant to this and needs no such care.
+
+Also corrected: the module docstring's "~40x" venue asymmetry holds only at 1 contract, and sat
+beside a Polymarket example computed at 100 contracts. At equal size in one fill it is ~1.2x. The
+asymmetry is fragmentation-driven, not a flat per-contract penalty.
+
+### T20-retry — notes
+
+Fixed by pricing ONE size basis throughout, not two. `_sizing_ask` (weighted-average-only) is gone;
+`_priced_fills(snapshot, outcome, top_of_book, size) -> list[(price, qty)]` returns the ACTUAL fills
+`OrderBook.walk` produces (or, with no matching book, one explicit fallback fill of the whole
+requested size at `top_of_book` -- the optimistic end, now a documented choice rather than an
+accident). `evaluate()` sums `fee_model.fee(price, qty, ...)` PER FILL (never `fee(ask, 1.0, ...)`
+scaled), divides by the ACTUAL filled size for both `fee_per_contract` and `gas_per_contract`, and
+sizes the emitted leg at `min(filled_size, max_position_size)` -- so a thin book both prices AND sizes
+correctly instead of assuming the full requested count filled at an invented cost.
+
+Re-verified against the real fee models (not the coordinator's illustrative table, which had small
+scratch-arithmetic drift -- these are exact, from `KalshiFeeModel`/`PolymarketFeeModel` directly):
+
+    ask=0.98,  100ct in ONE fill:  fee $0.14 total ($0.0014/ct) -> residual $0.0181/ct -> ann. 539.31%
+    ask=0.98,  100x 1ct fills:     fee $1.00 total ($0.0100/ct) -> residual $0.0095/ct -> ann. 283.06%
+    ask=0.995, 100ct in ONE fill:  fee $0.04 total ($0.0004/ct) -> residual $0.0041/ct -> ann. 120.32%
+    ask=0.995, 100x 1ct fills:     fee $1.00 total ($0.0100/ct) -> residual -$0.0055/ct -> None
+
+Both 0.98 rows still signal (D10(c)'s residual survives even worst-case fragmentation at that price);
+0.995 signals on one deep fill and is genuinely rejected once fragmented -- the "fees eat it" case the
+brief asked for, now for the real reason, not a `size=1` artifact.
+
+Test fix, per the review's Finding 2: `tests/strategies/test_settlement_edge.py` no longer asserts the
+core arithmetic against a bookless snapshot (which silently meant "one fill of the whole size" after
+this patch, not the fragmented worst case the numbers used to describe). It now builds two explicit
+books -- `_one_fill_book` (one deep level) and `_fragmented_book` (a hundred 1-contract levels) -- and
+has four paired tests (098/0995 x one-fill/fragmented) asserting the four numbers above by hand, plus
+`fill_count`/`filled_size` on every intent's metadata so the book shape a test assumed is itself
+checked, not just implied. `tests/services/test_near_resolution.py`'s two Kalshi-based tests (its
+fixture book is one deep 500-contract level, i.e. always a single fill) had their expected
+`annualized_return`/`composite` updated to the one-fill numbers (5.393061224489802 /
+4.584102040816331 baseline, /3.5054897959183715 with the liquidity penalty); its ONE Polymarket-based
+test was untouched, because Polymarket's fee is fragmentation-invariant by construction and its
+numbers did not move at all -- confirmed by re-running it unedited and it still passing.
+
+Module docstring's "VENUE ASYMMETRY" section rewritten per Finding 3: no single "Kalshi is Nx more
+expensive" headline. Three fresh, independently-verified numbers at p=0.995 (rate 0.07 Kalshi / 0.05
+Polymarket, same as elsewhere in this file) show the SAME Kalshi $0.01-per-fill mechanic producing a
+~40x ratio at 1 contract, ~1.6x at 100 contracts in one fill, and back to ~40x at 100 contracts fully
+fragmented -- while Polymarket's total is IDENTICAL across all three. The point stated plainly: it is
+fragmentation (how thin the book is), not price, that decides whether Kalshi is cheap or expensive
+here.
+
+Full verify command re-run clean (suite 656 passed / 0 skipped, up from 654 -- +2 tests from the
+paired fragmented/one-fill split); `ruff check`/`mypy` on this task's own files unchanged (clean); the
+`ruff check app/services ...` sweep still surfaces the SAME 6 pre-existing findings in the SAME 3
+untouched legacy files as before this retry (`data_collector.py`/`polymarket/client.py`/
+`polymarket/websocket.py`) -- `git diff --stat` against those three shows no change from this retry
+either, per the explicit instruction not to touch them.
+
+### T20-retry adjudication (orchestrator)
+
+Retry verified independently: 656 passed (up 2 from the paired 0.995 split), scoped `ruff`/`mypy`
+clean, `alembic heads` still `005 (head)` (T20 correctly adds no migration). The
+`ruff check app/services ...` sweep still reports the same 6 pre-existing findings in the same 3
+untouched legacy files -- the recorded `defect: T20 kind=unrunnable-verify`, not a regression. Four of
+those six live in `app/services/data_collector.py`, which T21 modifies and is therefore fixing.
+
+Verified the retry's fee table by hand through `_fee_inputs` rather than the agent's report:
+Kalshi 539.31% / 283.06% / 120.32% / -161.41%, Polymarket 551.82% and 124.76% INVARIANT across both
+fill shapes. The Polymarket invariance is the load-bearing check: it is what proves the fee model is
+flat in fill count and therefore that the whole defect was Kalshi-only.
+
+agent: T20 id=a96b07876ba3962d7 role=implementer model=sonnet result=revised
+outcome: T20 model=sonnet attempts=2 result=retry-pass review=revised run=2026-09-05-3bd5
+
+### Cross-cutting audit (orchestrator, between T20 and T22): three strategies, three fee-size conventions
+
+T20's defect was not isolated. Auditing every `.fee(` call site in `app/` turned up THREE different
+conventions for what size a fee is priced at, and the sweep in T22 compares these strategies to each
+other:
+
+| call site | convention | direction |
+|---|---|---|
+| `settlement_edge.py:462` | one `fee()` PER ACTUAL FILL from `_priced_fills` | correct (fixed in T20) |
+| `fill_engine.py:890` | one `fee()` per level, inside the walk loop | correct |
+| `cross_venue_arbitrage.py:667-668` | `fee(ask, size)/size` -- ONE aggregate fill | OPTIMISTIC |
+| `binary_complement_arbitrage.py:237-238` | `fee(ask, 1.0)` | PESSIMISTIC (the T20 shape) |
+| `multi_outcome_bundle_arbitrage.py:173` | `fee(price, 1.0)` | PESSIMISTIC (the T20 shape) |
+
+Magnitudes on Kalshi (rate 0.07, size 100, error in percentage points of edge, `+` = cost overstated):
+
+    price  levels    TRUE/ct   cross_venue    binary sz=1
+     0.55       1   0.017400      +0.000%        +0.260%
+     0.55      20   0.018000      -0.060%        +0.200%
+     0.90      20   0.008000      -0.170%        +0.200%
+     0.95       1   0.003400      +0.000%        +0.660%
+     0.98       1   0.001400      +0.000%        +0.860%
+     0.98      20   0.002000      -0.060%        +0.800%
+
+Read it as: the error is negligible at mid prices and grows toward the TAILS, because that is where
+the whole-cent floor stops being small relative to the rate-driven fee. At p=0.98 the size=1
+convention charges 7x the true cost of a single 100-contract fill.
+
+`cross_venue` is the money-LOSING direction (understates cost) but is bounded at -0.17pp even at
+20-way fragmentation, against required gross edges of 1.50%-4.21%; it also carries an explicit comment
+claiming the probe is "the fill it is actually charged on", which is only true when
+`_marginal_ask`'s walk consumes ONE level. Worth correcting, not urgent.
+`binary_complement` and `multi_outcome_bundle` are the CONSERVATIVE direction -- they never lose money,
+they refuse trades they should take -- but both can have a skewed leg near the tails (a complement pair
+at 0.96/0.02; a 5-way race with a 0.90 favorite), which is exactly where the 0.86pp error lives.
+
+NOT a defect in `router.py:1200`: `_RESERVATION_FEE_HEADROOM_USD = 0.10` exists precisely for this,
+and its comment already states the per-fill reasoning correctly ("a multi-level walk costs strictly
+more than one aggregate call on the same total size, by up to a rounding step per level on Kalshi").
+Overspend past the reservation is handled by `CapitalLedger.settle`. Left alone deliberately.
+
+CARRY-FORWARD to T22: a capital sweep that varies size across strategies priced on three different
+fee bases produces rows that are not comparable to each other, which defeats the sweep's purpose. Unify
+the three strategy call sites on `settlement_edge`'s per-actual-fill basis BEFORE running any sweep,
+or label every sweep row with the convention that produced it.
+
+### T21 — recorded book depth: `book_snapshots`, `collect_books`, replayer wiring
+
+`app/models/book_snapshot.py::BookSnapshot(venue, market_id, outcome, ts, bids JSONList,
+asks JSONList, tick_size, min_size, depth_source="recorded")`, unique on
+`(venue, market_id, outcome, ts)`, migration `006` (linear, `001->...->006`, hypertable
+guard copied from `001`/`005`, checked against `CreateTable(...).compile(dialect=postgresql
+.dialect())` column-for-column before being hand-written, per `004`/`005`'s own convention).
+`DataCollector.collect_books(adapters, market_ids_per_venue, session)` runs over BOTH venues
+through the `MarketDataAdapter` seam (`app.venues.base`), NOT `GammaAPIClient`/`CLOBDataClient`
+— the first method on this class that does. `scripts/collect_prices.py` gains `--books`
+(`collect_books_once()`, obtaining adapters via `app.api.deps.get_market_data_adapters`,
+building `market_ids_per_venue` from each venue's `list_markets(status="open")`). New
+`Settings`: `book_match_window_s` (120.0) and `book_collection_top_n` (50, mirrors
+`scan_top_n`'s convention — deliberately NOT literal per D11).
+
+Suite 654 -> 663 passed (+9: 7 in `test_recorded_depth.py`; the other +2 came from the
+concurrently-running settlement_edge task, not touched here). `alembic heads` = `006 (head)`,
+one head. `ruff check`/`mypy app/services/backtesting` clean.
+
+DESIGN DECISION — idempotency is CHECK-THEN-INSERT, not a database-native `ON CONFLICT`:
+`DataCollector._upsert_book_snapshot` queries the natural key `(venue, market_id, outcome, ts)`
+before adding, rather than `postgresql.insert(...).on_conflict_do_update` (the pattern
+`_upsert_market` already uses, above it in the same file) — that construct has no SQLite
+equivalent that compiles through the async ORM session without a dialect branch, and the task
+brief requires SQLite to pass. The `SELECT` before each `add()` also triggers SQLAlchemy's
+autoflush of anything already `add()`-ed earlier in the SAME `collect_books` call, so it is
+correct both across separate calls (idempotency test) and within one call (no double-insert on
+a duplicate outcome/market id in one candidate list). `FixtureAdapter.get_book` is deliberately
+STATIC (same book, same `ts`, every call — its own docstring says so), which is exactly what
+makes the idempotency test meaningful: a second `collect_books` call sees the IDENTICAL natural
+key and writes zero new rows, not "happens to write different rows that don't collide".
+
+DESIGN DECISION — `book.outcome` is canonicalized through `normalize_outcome()` AT PERSIST TIME,
+not left as the venue's raw casing. Verified against the real adapter, not assumed:
+`app/venues/polymarket/adapter.py::get_book` calls `_parse_book(payload, market_id=market_id,
+outcome=outcome)`, echoing back whatever casing the CALLER passed (Polymarket's real Gamma
+payload spells outcomes `"Yes"`/`"No"`, confirmed by reading the adapter, not by guessing). Since
+`Leg.outcome`/`Position.outcome` are ALWAYS normalized at their own construction
+(`app/strategies/base.py::normalize_outcome`, Phase-1 remediation FIX 1), a `BookSnapshot` row
+keyed by the raw casing would never match what `data_replay.py`'s lookup or `Backtester
+._book_for` actually ask for. `_upsert_book_snapshot` normalizes before both the existence check
+and the insert, so this is closed at the ONE place outcome identity enters this table, matching
+the same discipline `normalize_outcome`'s own docstring describes for `Position`/`_current_prices`.
+
+DESIGN DECISION — `market_ids_per_venue` is a CANDIDATE set the caller supplies (e.g. every open
+market via `list_markets`); `collect_books` itself does the top-N-by-volume ranking and
+per-outcome book fetch, mirroring `app.services.scanner.scan`'s `_volume()` convention exactly
+(`VenueMarket.raw["volume"]`, `0.0` if absent/non-numeric — `VenueMarket` has no normalized
+`volume_24h` field, matching `scanner.py`'s own documented reason for the same choice).
+`book_collection_top_n` is a plain per-venue cap, not derived from the strategy sweep.
+
+CARRY-FORWARD 1 RESOLVED (bundles were "dead" until this task — recorded in T17/T19 NOTES):
+`Backtester._book_for`'s recorded-book branch ALREADY matched on the real outcome label,
+case-insensitively, for any string — not just YES/NO (`book.outcome.casefold() ==
+outcome.casefold()`), so once a `BookSnapshot` exists for an arbitrary outcome, a bundle leg
+fills exactly like a binary one. Proven end-to-end with a market whose only outcome is
+`"TRUMP"`: `test_bundle_outcome_recorded_book_fills_with_real_levels` walks a real two-level
+book (`25 @ 0.20` + `25 @ 0.22` -> avg `0.21`) for that non-binary outcome, and
+`test_bundle_outcome_without_recorded_book_is_an_explicit_skip` proves the ABSENCE of a
+recorded book is a labeled rejection (`"no_eligible_levels"`, plus a new debug log at the exact
+`_book_for` branch explaining synthesis is undefined for a non-binary outcome) — never a silent
+YES/NO guess. `collect_books` iterates `market.outcomes` IN FULL (every outcome the venue
+payload carries), not a hardcoded YES/NO pair, so the collector side of this was never the
+limiting factor — only the ABSENCE of any recorded-depth table was.
+
+REMAINING LIMITATION, not fixed here and out of scope for T21 (recorded, not hidden): the
+DB-backed `DataReplayer` (as opposed to `InMemoryDataReplayer`) is built from `PriceHistory`,
+which has NO outcome column at all — one row per `(market_id, timestamp)`, inherently
+YES/NO-shaped (`yes_price`/`no_price` columns). `DataReplayer._row_to_snapshot` therefore only
+ever asks `_get_recorded_book` for `outcome="YES"` (documented at that one call site, matching
+`app.services.scanner._snapshot_from_market`'s identical "primary outcome" convention, since
+`MarketSnapshot.book` is a SINGLE field). A true multi-outcome bundle backtest driven from the
+real DB (rather than a hand-built `InMemoryDataReplayer`, as every test above uses) still cannot
+attach a NO-outcome or bundle-outcome book from `PriceHistory` alone — that would need either a
+new outcome-aware price table or a different replay path that reads `BookSnapshot` rows directly
+for signal generation, neither of which this brief asked for. `_get_recorded_book` itself takes
+`outcome` as a plain parameter and makes no internal YES/NO assumption, so a future caller that
+DOES have a real per-outcome price source can reuse it unchanged.
+
+CARRY-FORWARD 2 RESOLVED (per-outcome price MARKING, the P1 reviewer's addition): confirmed the
+exact defect by reading the code, not assuming it — `Backtester._process_snapshot` wrote
+`_current_prices` under ONLY the two literal keys `f"{venue}:{market_id}:YES"`/`"...:NO"`, and
+`_check_position_exits` read `snapshot.yes_price if pos.outcome.casefold()=="yes" else
+snapshot.no_price` (so a bundle position was checked against the WRONG outcome's price, not just
+left unmarked). Both are the SAME shape of bug `normalize_outcome`'s docstring already fixed for
+CASING (`"Yes"` vs `"YES"`) but never for outcome IDENTITY (a label that isn't YES/NO at all).
+Fixed with one new method, `Backtester._price_for_outcome(snapshot, outcome)`, consulted by both
+call sites: YES/NO resolves exactly as before (byte-identical), a non-binary outcome resolves via
+`snapshot.book` (`.mid()`, falling back to whichever of `best_ask()`/`best_bid()` exists) or
+`snapshot.orderbook["outcomes"]` (the SAME payload shape `multi_outcome_bundle_arbitrage` already
+reads prices from), and an outcome with neither source returns `None` — never a fabricated
+price — which `_check_position_exits` now treats as "skip the exit check this tick" rather than
+silently defaulting to NO's price. `_process_snapshot` additionally marks every OTHER outcome a
+snapshot can price (`_other_outcomes`), not only YES/NO, so a bundle position's cache key gets
+written at all. Proven via `BacktestResult.final_value` (positions are never liquidated at
+`end_date`, only marked, per PLAN.md D6, so this is the one PUBLIC number that reflects the
+mark): a position bought at avg `0.21`, later re-priced to `0.30` via a THIRD snapshot's
+`orderbook["outcomes"]` payload (no book this time, proving the other resolution path too),
+reports `final_value = 10_004.1684`, not the `10_000.00` the pre-fix bug would have produced
+(marked at entry forever). A companion direct test
+(`test_price_for_outcome_resolves_book_and_orderbook_payload_sources`) exercises all four
+resolution branches, including the case-insensitive match and the `None` (unresolvable) case, by
+calling the method directly rather than only through a full backtest run.
+
+CARRY-FORWARD 3 (Kalshi fragmentation/T22) — CHECKED, NOT A DEFECT THIS TASK: re-read
+`SimulatedFillEngine.fill`'s own module docstring before touching anything, since T20's review
+found a fee-basis bug elsewhere in this exact area. Confirmed `FeeModel.fee()` is already called
+ONCE PER FILL and summed (never once for the order's aggregate size) — the module docstring
+states the measured numbers directly (`(0.40,100)+(0.41,100)+(0.42,50)` at Kalshi's 0.07 costs
+`1.68+1.70+0.86=4.24`, strictly more than one call at the blended size). So walking a REAL
+multi-level `BookSnapshot` (as this task's fills do) already prices Kalshi fragmentation
+correctly — there is nothing to fix in the fill path for T21. `depth_source` already rode all
+the way to `BacktestResult` before this task (T08's `_aggregate_depth_source`); T21 only feeds it
+real books instead of synthetic ones more often. The genuine T22 risk (a capital SWEEP that
+varies size without re-walking the book at each level) is unchanged by this task and already
+recorded as T20/T21's carry-forward in NOTES.md above.
+
+Files touched: `app/models/book_snapshot.py` (new), `app/models/__init__.py`,
+`alembic/versions/20260904_000500_006_book_snapshots.py` (new), `app/config.py`,
+`app/services/data_collector.py` (+ its 4 pre-existing ruff findings named in the brief:
+`I001`/`F541`/`E712`/`B905`, all fixed), `app/scripts/collect_prices.py`,
+`app/services/backtesting/data_replay.py`, `app/services/backtesting/engine.py`,
+`tests/backtesting/test_recorded_depth.py` (new, 7 tests).
+
+NOT A `defect:` LEDGER ENTRY, but recorded for the same reason carry-forward 4 named
+`data_collector.py`'s findings as "yours to fix": `collect_prices.py` is explicitly named (not
+just directory-swept) in this task's own `ruff check` verify command, and this task substantially
+rewrites it (new imports, a new function, `--books` threaded through three existing ones). Ruff
+turned up 4 PRE-EXISTING findings on lines this task did not otherwise touch (`F401` unused
+`Optional`, `ARG001` unused `frame` in `signal_handler`, `F541` on `"Press Ctrl+C to stop"`, plus
+the `I001` my own new imports caused). All four are trivial, safe, zero-behavior-change fixes
+(dead import removed, `frame` -> `_frame`, extraneous f-prefix removed, `ruff --fix` re-sorted
+imports), so — following the same reasoning the brief itself used for `data_collector.py` — they
+were fixed rather than reported, since the verify command's own `ruff check ... clean` cannot
+pass otherwise and nothing about the fix is a judgment call.
+
+### T21 adjudication (orchestrator)
+
+Verify re-run independently, fully green: 7/7 new tests, `alembic heads` -> `006 (head)`, offline SQL
+carries `CREATE TABLE book_snapshots`, `ruff check` clean on ALL FOUR named paths, `mypy` clean, suite
+**663**. Both carry-forwards spot-checked in the tree rather than taken on report:
+`engine._price_for_outcome` / `_other_outcomes` exist and are actually CALLED from `_current_prices`
+(engine.py:1426) and `_check_position_exits` (engine.py:2516) -- the marking path, which is where the
+prior "Yes"-cased-position-marks-at-entry-forever defect lived. `normalize_outcome()` is applied at
+persist time (data_collector.py:989), so a `BookSnapshot.outcome` can actually match a `Leg`/`Position`
+identity instead of echoing raw venue casing.
+
+THE RECURRING RUFF DEFECT IS NOW MOSTLY CLOSED: the sweep
+`ruff check app/services app/strategies/settlement_edge.py app/execution` that failed eight
+consecutive tasks is down from 6 findings to 2 (`polymarket/client.py:118` ARG002,
+`polymarket/websocket.py:10` F401). T21 legitimately fixed `data_collector.py`'s 4 because it modified
+that file. The remaining 2 are in files no task in this kit touches and stay out of scope.
+
+NEW LIMITATION, CONFIRMED IN THE TREE, NOT JUST REPORTED: `app/models/price_history.py` has NO
+`outcome` column at all -- grep returns nothing. `PriceHistory` is structurally binary. So the
+DB-backed `DataReplayer` can only ever attach a `"YES"` book, and a genuine multi-outcome bundle
+backtest still requires `InMemoryDataReplayer` or a future outcome-aware price table. T21 closed the
+LIVE/scan path for arbitrary outcome labels (proven with a `"TRUMP"` outcome test) and the marking
+path, but NOT the historical-backtest path. Any bundle backtest number must be labeled with this
+limitation wherever it is shown (same discipline GUARDRAILS §1.7 imposes on `depth_source`).
+
+agent: T21 id=abe01fca6f3c95cc3 role=implementer model=sonnet
+outcome: T21 model=sonnet attempts=1 result=pass review=none run=2026-09-05-3bd5
+
+### Phase 4 fence re-read (orchestrator, phase-start guarantee)
+
+Re-read `GUARDRAILS.md` and PLAN.md §2 (constraints/out-of-scope) + §D12 from disk before dispatching
+T22, per the execute loop's phase-start rule. Not from memory, and not delegated.
+
+PLAN §2 settles the recurring verify defect definitively: "Do not 'fix' ruff/mypy across the whole
+repo. Baseline is 139 ruff findings. New/changed modules must be clean under `ruff check <path>` and
+`mypy <path>`; untouched legacy files are not a gate." So the ARCHITECT'S OWN FAILURE MODE, stated
+precisely for the scorecard's brief-defect floor: eight task verify commands used DIRECTORY-level ruff
+scopes (`app/services`, `app/execution`) which necessarily sweep untouched legacy files, contradicting
+the constraint PLAN.md itself wrote three sections earlier. The fix for a future kit is mechanical --
+scope `ruff check` to the FILES a task actually writes, never a directory, whenever the directory
+contains legacy modules the task does not touch. This is the single most repeated defect in this kit
+(8 of 21 tasks) and it is entirely an architect-side authoring error, not an executor error.
+
+D12 pins for T22, read from PLAN rather than TASKS.md: default levels
+`[500, 2_000, 10_000, 50_000, 250_000]`; `edge_dies_at` = the SMALLEST level at which annualized net
+return falls below `min_viable_annualized` (0.05); `None` if it never dies within the sweep, "with the
+caveat printed that the sweep ceiling is not proof". T22's own ruff/mypy scope was pre-checked and is
+currently CLEAN (`app/services/backtesting`, `app/api/routes/backtesting.py`, `app/tasks/backtesting.py`,
+`mypy app/services/backtesting`), and `create_sample_snapshots` exists and is exported -- so T22 should
+be the first task in eight whose verify command can run as written.
+
+## Phase 3 boundary review (T17-T21) — adjudication
+
+Reviewer reproduced the baseline independently (663 passed, `alembic heads` = `006 (head)`, mypy clean
+across 17 files, chain linear 001->006) and made no repo change (`git status --porcelain` byte-identical
+before and after; all probes in the scratchpad). Every GUARDRAILS §6 drift signal came back CLEAN:
+no sportsbook code, exactly one new strategy file (`cross_venue_arbitrage.py`), backtest public surface
+extended-not-renamed, matcher writes only `status="proposed"` (`"approved"` appears zero times in
+`app/services/matching/`), paper+live share one `OrderRouter` with one construction site
+(`api/deps.py:87`), fill engine shared, time-to-resolution structurally unskippable
+(`scoring._hours_to_resolution` RAISES `UnscorableIntent` when `expected_resolution_ts is None`),
+mimicry gone (zero hits for whale/TrackedTrader/copy_trad/leaderboard), no fee literals in any of the
+9 `DEFAULT_CONFIG`s.
+
+**CONFIRMED DEFECT (blocks the phase, dispatched as T21b):** every `multi_outcome_bundle_arbitrage`
+opportunity scores `net_edge = 0.0`. `scoring._net_edge` reads `metadata["net_edge"]` then
+`metadata["edge"]`; the bundle strategy publishes only `"profit_margin"`. Verified independently -- the
+four scored strategies publish `net_edge` / `edge` / `edge` / `profit_margin` respectively, and the
+bundle is in `STRATEGY_CATEGORIES["arbitrage"]`, which is exactly what `scanner.ARBITRAGE_STRATEGIES`
+is built from, so the DEFAULT scanner pass runs it. `composite = annualized x fill_conf x (1 - risk)`,
+so composite collapses to 0.0 and a real 7.48% bundle arb is returned ranked below every cross-venue
+intent that cleared its 1.5% floor. This is precisely the gap between the verifier's lens and the
+reviewer's: T19 acceptance line 1 asked only that the seven score keys be "present and non-null". They
+are. The VALUE is wrong. A presence assertion cannot catch a correctness defect.
+
+**CONFIRMED (documentation, T21b):** `config.py:282-288`'s near-resolution cap comment describes T14
+behavior that T20 replaced -- all three of its clauses are now false, and an operator sizing
+`MAX_NEAR_RESOLUTION_NOTIONAL_USD` from it would believe it bounds all near-expiry exposure.
+
+**CONFIRMED (documentation, T21b):** `cross_venue_arbitrage.py:664-666` claims the fee is "amortized
+over the fill it is actually charged on". False: `_marginal_ask` blends across every level `walk()`
+consumed, so the single aggregate `fee()` call understates Kalshi's per-fill floor. Comment corrected;
+the ARITHMETIC deliberately left alone (see the fee-basis follow-up below).
+
+**Q2 ANSWERED, NO DEFECT -- and my stated reason was the wrong one.** I judged `router.py:1200`'s
+`worst_case_fee` safe because of the $0.10 headroom plus `CapitalLedger.settle`. The reviewer
+brute-forced every contiguous 1c-tick Kalshi walk (start 0.01-0.98, 1-39 levels, q in {1,2,3,5,10,25,100})
+and found the FEE TERM ALONE overshoots `fee(0.5, C)` by up to **$0.18 > $0.10 headroom**. The
+reservation is still never breached, but the protection comes from the CASH bound, not the headroom:
+for N levels of q contracts, cash is loose by at least `q x 0.01 x N(N-1)/2` (only the top level can
+equal the limit) while fee overshoot is bounded by `0.01 x N` -- linear vs quadratic, so a breach needs
+`N - 10 > q*N(N-1)/2`, false for every `q >= 1, N >= 2`. The two error terms are ANTI-CORRELATED: the
+only way the cash bound is tight is a single-level fill at exactly the limit, which is also the only
+way the fee overshoot is zero. Minimum slack over the whole search = $0.1000, never negative.
+Polymarket has no per-fill rounding so its overshoot is identically zero. Right answer, better proof.
+
+**Q1 CONFIRMED AND UNDERSTATED -- and T22 is the WRONG destination.** My recorded plan was to fold the
+fee-basis unification into T22. The reviewer is right that this never fixes it: the strategies' fee
+estimates never touch realized P&L (the fill engine charges the real per-level fee), so backtest and
+sweep numbers are self-correcting. What the estimate governs is the EMISSION GATE and
+`metadata["net_edge"]`, i.e. the sole input to scoring -> ranking. T22 touches neither. Also the error
+runs in BOTH directions with opposite sign -- on a fragmented tail book `cross_venue` understates by
+0.86pp while `binary_complement` is exact; on a deep tail book the reverse -- so the cross-strategy
+RANKING SPREAD can reach ~1.7pp against a `min_net_edge` gate of 0.015. A trade whose true net edge is
++0.7pp can be emitted as +1.56pp. Recorded as a follow-up needing its own home, NOT T22.
+
+**Q4 CONFIRMED AND UNDERSTATED -- architectural, not schema-only.** Beyond `PriceHistory` having no
+`outcome` column: `MarketSnapshot.book` is a SINGLE field, and all legs of a bundle share one
+`(venue, market_id)` snapshot, so an N-outcome bundle can carry at most ONE book regardless of replayer.
+`engine._book_for` returns `None` for a non-binary outcome with no recorded book, `_atomicity_blocker`
+then returns `no_eligible_levels`, and the bundle strategy is `atomicity="all_or_none"` -- so a real
+N-leg bundle intent can NEVER execute in ANY backtest, `InMemoryDataReplayer` included. Two further
+consequences: (a) `data_replay.py:440` hardcodes `venue="polymarket"`, so every KALSHI `BookSnapshot`
+row `collect_books` writes is dead data for the DB-backed backtest; (b) a binary complement's NO leg
+ALWAYS fills against synthesized depth even when a recorded NO book exists, because the snapshot's
+single `book` field is the YES one -- and `binary_complement_arbitrage` is the strategy PLAN "Done is
+checkable" #6 names as the backtest proof case. The run is honestly labeled `depth_source="mixed"`, so
+GUARDRAILS §1.7 is satisfied, but "mixed" reads as "some snapshots recorded, some not" when the real
+meaning is "every complement intent is half-recorded BY CONSTRUCTION".
+
+**Two safe-direction deviations recorded, no change:** PLAN D9's "in paper mode a `proposed` link with
+confidence >= 0.85 may be scored" is NOT implemented -- proposed links are never scored at all. And the
+router has no link-status re-check at submission; no code path routes a persisted `IntentRecord` today
+(`api/routes/trading.py:269` builds a fresh single-leg intent), but any future "route this scanned
+opportunity" feature must re-check `link_status`, since a link approved at scan time can be rejected
+before routing.
+
+reviewer: P3 model=opus findings=7 confirmed=5 result=accepted
+
+### T21b — Phase 3 remediation of the P3 reviewer's 3 confirmed findings
+
+All three findings matched repo reality exactly as the brief pinned them (no stale line numbers, no
+missing symbols) -- no `` defect: `` entry needed.
+
+**Defect 1 (CORRECTNESS) fixed at the strategy end.**
+`app/strategies/multi_outcome_bundle_arbitrage.py`'s `on_market_data` published only
+`metadata["profit_margin"]`; `app/services/scoring.py::_net_edge` reads `metadata["net_edge"]` then
+`metadata["edge"]`, never `"profit_margin"`, so every bundle intent scored `net_edge = 0.0` and
+therefore `annualized_return = 0.0` and `composite = 0.0` regardless of the real edge. Fixed by adding
+`"net_edge": profit_margin` alongside the existing `"profit_margin"` key at the Intent's metadata
+publication site (kept `"profit_margin"` -- grepped first and confirmed
+`tests/strategies/test_arbitrage_intents.py:245` asserts it), with a docstring comment at that call
+site stating exactly what it is net of (every outcome's taker fee, already subtracted; nothing else --
+no gas) and, explicitly, that no link-confidence haircut applies, because a bundle is single-venue and
+single-market so there is no cross-venue identity risk to discount -- a real semantic difference from
+`cross_venue_arbitrage`'s same-named key that a reader ranking the two side by side needs to know.
+`app/services/scoring.py` itself was NOT touched (the brief explicitly forbids aliasing
+`profit_margin` into `_net_edge`'s key list, since the two quantities are differently defined).
+
+New test `tests/services/test_scoring.py::test_bundle_intent_scores_a_nonzero_net_edge_and_composite`
+runs the REAL `MultiOutcomeBundleArbitrageStrategy` against a 4-outcome fixture (asks
+0.20/0.20/0.20/0.15, matching the existing hand-computed example in
+`tests/strategies/test_arbitrage_intents.py::test_bundle_emits_one_leg_per_outcome`), scores the
+resulting `Intent`, and asserts by hand: `net_edge = 0.219625` (== the strategy's own
+`profit_margin`), `annualized_return = 0.219625/100*8760 = 19.23915`, `fill_confidence = 1.0`,
+`resolution_risk = 0.15`, `composite = 19.23915*0.85 = 16.3532775` -- all non-zero.
+
+BEFORE/AFTER observed directly: before the fix, `intent.metadata` for this fixture carried no
+`"net_edge"`/`"edge"` key at all, so `score(...)` returned `net_edge=0.0`, `annualized_return=0.0`,
+`composite=0.0` (verified by reverting the one-line addition locally and re-running the new test --
+it fails with exactly those three zeros). After the fix: `net_edge=0.219625`,
+`annualized_return=19.23915`, `composite=16.3532775`.
+
+**Defect 2 (DOCUMENTATION) fixed.** `app/config.py`'s `max_near_resolution_notional_usd` comment
+(pinned at lines 282-288) described T14-era behavior ("separate, tighter cap... on time-to-close...
+`check_order_limits()` takes no time-to-resolution argument... left to the order-router call site")
+that T20 replaced wholesale. Confirmed in the tree: `check_order_limits` (`app/execution/fences.py`)
+takes a `bucket: str | None` keyword directly; the cap fires only when `bucket == "near_resolution"`;
+`OrderRouter._bucket_open_notional` (`app/execution/router.py:886`) aggregates resting orders + open
+positions tagged with that bucket. Rewrote the comment to state the real mechanism AND the coverage
+gap honestly: only `SettlementEdgeStrategy` stamps `metadata["bucket"] = "near_resolution"`
+(`settlement_edge.py:507`), and `scanner.near_resolution_pass` instantiates only that strategy, so a
+`cross_venue_arbitrage` intent on a link resolving in a few hours carries no bucket tag, skips this
+cap entirely, and is bounded only by `max_order_notional_usd`/`max_open_notional_usd`. Also corrected
+the stale `app/venues/fees.py` cross-reference for `near_resolution_hours` -- that setting is read
+only by `scanner.py:882` and `api/routes/arbitrage.py:237`, confirmed by grep.
+
+**Defect 3 (DOCUMENTATION) fixed, arithmetic untouched.**
+`app/strategies/cross_venue_arbitrage.py:664-666` claimed the fee is "amortized over the fill it is
+actually charged on". False: `_marginal_ask` (same file, `~814-856`) returns a size-weighted blend
+across however many book levels `OrderBook.walk("buy", size)` consumed, and the code then prices that
+blended price as ONE aggregate fill. On Kalshi the whole-cent per-fill floor is charged per fill, so a
+multi-level walk costs strictly more than the one aggregate `fee()` call reports. Rewrote the comment
+to say what the code actually does (prices the whole probe as one aggregate fill), the direction of
+the error (always UNDERSTATES Kalshi's cost when the walk spans multiple levels, never overstates),
+and the measured bound the brief supplied (up to 0.86 percentage points of edge on a fragmented tail
+book, against this strategy's own `min_net_edge` gate of 0.015) -- consistent with the fee-basis
+follow-up already recorded earlier in this file under "Q1 CONFIRMED AND UNDERSTATED". Per the brief,
+the fee arithmetic itself was deliberately left alone; unifying the fee basis across strategies stays
+a separate follow-up with its own blast radius.
+
+Verification: `python3 -m pytest -q` -> **664 passed** (663 baseline + 1 new test), 0 failures.
+`ruff check` on all 4 touched files -> clean. `mypy` on the 2 touched files under `app/strategies` (and
+`app/config.py`, though not required by scope) -> clean, no issues. `git status --porcelain` shows
+exactly the 4 files touched: `app/config.py`, `app/strategies/cross_venue_arbitrage.py`,
+`app/strategies/multi_outcome_bundle_arbitrage.py`, `tests/services/test_scoring.py` -- all were
+already modified in the working tree from prior kit tasks, so nothing unexpected was added.
+
+## Red-team, T20/T21 surface — adjudication
+
+Read-only, tree untouched (`git status --porcelain` unchanged; `find -newermt` over `backend/` and
+`.claude/` returns nothing; every scratch file in `$TMPDIR`). 11 findings raised, 9 confirmed. This is
+the highest-yield role dispatch of the kit so far and it found things BOTH the verifier and the phase
+reviewer missed, on code that had already passed both.
+
+**CONFIRMED, dispatched as T21e (money fences):**
+1. The near-resolution cap is blinded permanently by ONE untagged $0.50 order. `_upsert_position`
+   (`router.py:2135-2141`) folds later BUYs into the existing `PositionRow` but never updates
+   `intent_id`, and `_bucket_open_notional` attributes the WHOLE position to the OPENING intent's tag.
+   Reproduced: seed untagged $0.50, then six $200 `near_resolution` intents ALL execute against a $500
+   cap -- actual exposure $1,200.50, fence's view $0.00, forever. No malformed payload, no race, no
+   unusual config. `tests/services/test_near_resolution.py:292` passes only because it exercises the
+   case where the bucket intent opens the position itself.
+2. Two concurrent `submit()` calls breach the cap AND lose 900 filled contracts. Reproduced 3/3:
+   venue filled 1802 contracts across 3 `Trade` rows, position ledger recorded 902 -- a lost update
+   between two unguarded `_upsert_position` select-then-writes. Reachable from
+   `api/routes/trading.py:269` against the process-wide cached router. In live mode that is 900
+   contracts of real unrecorded exposure and every downstream fence reads a ledger understating the
+   account by half. The lost-update half predates T20; assigned to T21e anyway, because a fence built
+   on a lossy ledger is not a fence.
+10. Any bucket-tag spelling but the exact `"near_resolution"` silently disables the cap
+   (`"Near_Resolution"`, `" near_resolution"`, `""`, `"near-resolution"` all pass $10,000 against $500).
+   The leniency is deliberate and documented at `fences.py:274-279`; the gap is that NOTHING validates
+   the tag anywhere, so a strategy typo silently removes its own cap. Fix is a warning, not a raise.
+
+**CONFIRMED, dispatched as T21c (scanner/strategy):**
+3. The scanner hands `settlement_edge` the WRONG BOOK, overstating the NO-side return 4.0x.
+   `scanner.py:307-309` computes `primary_book`, `yes_book` AND `no_book`, then `:339` attaches only
+   `primary_book` (always YES for a binary market). `settlement_edge.py:230`'s outcome check then fails
+   and it prices the whole order at top-of-book. Verified in the tree. Identical real depth gives
+   annualized 1.7173 (honest, walking `asks=[(0.98,3.0),(0.995,500.0)]`) vs 6.8978 (shipped) -- it
+   prices 100 contracts at a level holding 3, on the exact path `near_resolution_pass` uses to RANK
+   what gets traded. And `tests/services/test_near_resolution.py:260` PINS the overstated number
+   (`6.897755102040822`), so the shipped acceptance test enshrines the bug.
+4. An observed EMPTY book reads as MAXIMUM liquidity. `_priced_fills` documents an optimistic
+   single-fill fallback for "book absent or mismatched" and silently applies it to a third case: a
+   present, outcome-matching, `depth_source="recorded"` book asserting there is NO liquidity. A book
+   with `asks=()` yields the same intent as one with 500 contracts of depth (`filled_size=100`,
+   `annualized=10.553`); real fill is zero. Chain verified end-to-end through collector and replayer.
+   An empty ask side is the NORMAL state of a near-resolution market -- exactly this strategy's target
+   population.
+
+**CONFIRMED, held for T21d (engine marking / snapshot identity) -- deliberately NOT dispatched in
+parallel, because the plausible fix touches `strategies/base.py::normalize_outcome`, which T21c reads:**
+5. The Phase-1 entry-price defect is STILL OPEN for the very labels T21 introduced. `normalize_outcome`
+   is the IDENTITY for anything that is not YES/NO (`base.py:86`, verified), so resolution is
+   case-insensitive while identity stays case-sensitive -- the exact asymmetry that function exists to
+   close. Position `"TRUMP"` vs payload `"Trump"` marks at entry price forever (equity 10020 vs a true
+   10062). Worse, a trailing space defeats BOTH the cache key and the resolver, so
+   `_check_position_exits` `continue`s past it every tick and **stop-loss and take-profit are silently
+   never evaluated**. And 5c: there is no counter, no log, no `errors` entry for an unmarkable position
+   -- grep for `unmarked|unpriced|mark_miss` across `app/` returns nothing.
+6. `book_snapshot.py:26-28` claims a lookup "can never miss a row purely because of a casing mismatch".
+   False for non-binary: four `collect_books` runs of the SAME book spelled `Trump`/`TRUMP`/`trump`/
+   `"Trump "` wrote FOUR rows. The guarantee holds exactly for the binary case that did not need it.
+7. `_upsert_book_snapshot` is a check-then-insert with a TOCTOU, not a dialect-safe upsert. Two
+   concurrent collectors both see `new=True`; the `IntegrityError` surfaces at the single end-of-run
+   commit, so one collision DISCARDS EVERY BOOK that run collected, across all venues and markets.
+8. `{"ask": null, "price": 0.62}` marks at entry price: `value.get("ask", value.get("price"))` returns
+   `None` when the key is present-and-null, so the default is never consulted.
+
+**RAISED, NOT CONFIRMED (recorded, no change):** 9 (two labels differing only in case both mark at the
+first one's price -- contrived market shape, red-team said so itself) and 11 (non-UTC-aware
+`BookSnapshot.ts` could produce look-ahead; `astimezone` appears nowhere in `app/`, but both adapters
+build book `ts` as UTC today, so it is latent, not reachable). 11 is worth a guard whenever a third
+venue lands.
+
+**WHAT SURVIVED THE ATTACK, worth recording as genuinely clean:** replayer window boundaries are exact
+in every direction (book at `ts` HIT, at `ts-120s` HIT inclusive, at `ts-120.001s` MISS, at **`ts+1us`
+MISS** -- no look-ahead); two equidistant books are impossible (the UNIQUE constraint fires); partial-fill
+gas basis is correct (40-contract book against a 100 request gives `gas_per_contract=0.00125`, divided
+by FILLED size, which is exactly what T20's retry was supposed to establish); extreme prices, NaN,
+negative, zero-qty levels and float dust all held; malformed `outcomes` payloads (`[]`, `["Trump"]`,
+`None`, `{}`) never raise; binary YES/NO casing is fully handled everywhere it was pushed. The Phase-1
+casing fix genuinely works -- it just was never extended to the non-binary labels T21 added.
+
+agent: T20-T21 id=a9324011c125ae8e7 role=red-team model=opus findings=11 confirmed=9 result=accepted
+
+### T21b adjudication (orchestrator)
+
+Verified independently rather than on report: `multi_outcome_bundle_arbitrage` now publishes BOTH
+`"net_edge"` and `"profit_margin"` (the latter kept because `tests/strategies/test_arbitrage_intents.py:245`
+still reads it), and `scoring._net_edge` is UNCHANGED -- still reading only `net_edge`/`edge`, correctly
+NOT aliased, which was the point: `profit_margin` and `cross_venue`'s `net_edge` are differently-defined
+quantities and must not compete on one ranking axis under two definitions. Suite 664.
+
+Scored bundle intent, before -> after: `net_edge` 0.0 -> 0.219625, `annualized_return` 0.0 -> 19.23915,
+`composite` 0.0 -> 16.3532775. A real 7.5%-class bundle arb is no longer ranked below every cross-venue
+intent that cleared its 1.5% floor.
+
+Both documentation defects fixed: `config.py`'s near-resolution cap comment now describes the T20
+bucket mechanism AND states the coverage gap honestly (only `SettlementEdgeStrategy` sets the tag, so
+`cross_venue_arbitrage` intents near resolution skip the cap), and `cross_venue_arbitrage.py:664-666`
+no longer asserts the false "amortized over the fill it is actually charged on" invariant -- it now
+states what the code does, the direction of the error, and the 0.86pp bound against a 0.015 gate.
+
+agent: T21b id=a52ca8dcf629e7894 role=implementer model=sonnet
+outcome: T21b model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T21c
+
+Both confirmed defects fixed, scoped to exactly `app/services/scanner.py`, `app/strategies
+/settlement_edge.py`, `tests/services/test_near_resolution.py`. `app/strategies/base.py` (in
+particular `normalize_outcome`) was NOT touched.
+
+**Defect 1 (wrong book).** Seam chosen: NOT a `MarketSnapshot.book` type change (wide blast radius,
+every existing reader preserved unchanged) and NOT a synthesized NO book. Instead
+`SettlementEdgeStrategy.evaluate`/`_priced_fills` gained an optional `outcome_books: Mapping[str,
+OrderBook] | None` parameter -- the REAL per-outcome book map, keyed by canonical outcome, preferred
+over `snapshot.book` when supplied. `near_resolution_pass` already builds exactly this map
+(`books_by_key`, all outcomes of the current market, same venue/market_id every iteration) and now
+passes it through (`outcome_books = {key[2]: book for key, book in books_by_key.items()}`).
+`on_market_data`/generic callers pass nothing, so the bare-`MarketSnapshot` (backtest) path is
+byte-for-byte unchanged. Reproduced against the pre-fix code with a closed market, YES near-worthless
+(mid 0.02, NO determined), real NO book `asks=[(0.98,3.0),(0.995,500.0)]`: buggy path priced all 100
+requested contracts at top-of-book in one phantom fill (`annualized_return=6.897755102040822`); fixed
+path walks 3@0.98 then 97@0.995 (`fill_count=2`, `ask=0.99455`), `annualized_return=1.7173083932431994`
+-- a confirmed 4.0x overstatement, matching the red-team's 6.8978-vs-1.7173 repro exactly.
+
+**Defect 2 (empty book read as max liquidity).** `_priced_fills` now distinguishes three cases (all
+three now named in its docstring, where before only two were documented): (1) no book observed for
+this outcome at all (`outcome_books` has no entry AND `snapshot.book` is absent/mismatched) -> the
+documented optimistic single top-of-book fill stands; (2) a book WAS observed, matches the outcome,
+and `book.walk(...)` returns no fills (`asks=()`, or every level `size=0.0`) -> returns `[]`, never the
+fallback, so `evaluate()` sees `filled_size<=0.0` and emits no intent; (3) a matching book with real
+depth -> walked as before. Fix is one line (`return book.walk("buy", size)` in place of the old
+`if not fills: return [(top_of_book, size)]`) -- `OrderBook.walk` already returns `[]` for an
+empty/zero-size ask side, so case 2 needed no new branch, only removing the branch that masked it.
+
+**Defect 3 (shipped test) -- NOT what it looked like.** Traced rather than assumed:
+`tests/services/test_near_resolution.py`'s existing `test_dispute_window_blocks_by_default_and_is
+_scored_when_allowed` (the test the red-team cited, `annualized_return=6.897755102040822`) determines
+the **YES** side (its YES book straddles 0.97 exactly, mid=0.97), so `snapshot.book` (always YES for a
+binary market) already matches the evaluated outcome -- it never took the mismatched-book path Defect
+1 fixes. Confirmed two ways: (a) manual trace of `_determined_side`/`_priced_fills` against this exact
+fixture, (b) re-ran the identical scenario against the fixed code -- `annualized_return`/`composite`
+came back byte-identical (`6.897755102040822`/`3.7937653061224523`). The "6.8977 IS the overstated
+figure" claim in the brief is a coincidence of arithmetic (both the buggy NO-side repro and this
+legitimate YES-side fixture happen to use `ask=0.98`, Polymarket's 0.05 rate, and a 24h floor, which is
+the entire input to the annualized formula) -- not the same code path. Left this test's numbers
+UNCHANGED (they were already correct) and added a `T21c NOTE` to its docstring recording the trace, per
+GUARDRAILS §3.4 ("a moved line number is fine; a missing symbol is not" -- this is neither, so no stop,
+just an on-the-record correction). `defect: T21c kind=mischaracterized-fixture` -- the brief's causal
+claim about an EXISTING test didn't hold; both underlying money defects it was based on did, and are
+fixed.
+
+Added three NEW tests that DO exercise the fixed paths directly: `test_no_side_prices_against_its
+_own_book_not_yes` (Defect 1: NO-determined market, real thin-then-deep NO book, asserts the honest
+`annualized_return=1.7173083932431994`, contrasted with the traced pre-fix `6.897755102040822` in a
+GUARDRAILS §5 hand-computed comment), `test_observed_empty_no_book_produces_no_intent` (Defect 2:
+`asks=()`, asserts `result == []`), and `test_observed_zero_size_ask_level_produces_no_intent` (Defect
+2's other repro shape, a single `size=0.0` level, same assertion).
+
+Verification: `python3 -m pytest -q` 667 passed (baseline 663 + this task's 3 new tests + concurrent
+agents' own additions; zero failures, none in `tests/strategies/test_settlement_edge.py` or any
+router/fences/backtesting file). `ruff check`/`mypy` scoped to the three changed files: clean (one
+`UP035` fixed inline -- `Mapping` imported from `collections.abc`, matching `scanner.py`'s own
+convention; the only remaining mypy findings in the test file are two PRE-EXISTING untyped-argument
+helpers this task did not touch). `git status --porcelain`: no files changed outside the three listed
+above (the large ambient diff in the wider repo predates this task and belongs to other in-flight
+work).
+
+agent: T21c id=implementer role=implementer model=sonnet
+outcome: T21c model=sonnet attempts=1 result=pass defects_fixed=2 tests_added=3 run=2026-09-05-3bd5
+
+### T21c adjudication (orchestrator) — and a red-team misattribution I propagated
+
+Defect 1 and 2 fixed and verified: `SettlementEdgeStrategy.evaluate()`/`_priced_fills()` gained an
+optional `outcome_books: Mapping[str, OrderBook] | None`, which `near_resolution_pass` now passes from
+the map it ALREADY built (`books_by_key`) and previously threw away. `MarketSnapshot.book`'s type is
+unchanged, so every existing reader and the bare-snapshot backtest path are untouched -- the narrow seam,
+correctly chosen over widening a field the whole engine reads. Measured 6.897755102040822 -> 
+1.7173083932431994 on the mismatch repro, exactly the 4.0x the red-team reported. Defect 2 collapsed to
+DELETING the `if not fills: return [(top_of_book, size)]` branch, because `OrderBook.walk` already
+returns `[]` for empty or zero-size asks -- the fallback was actively overriding a correct answer.
+
+**MY BRIEF'S DEFECT 3 WAS WRONG, and the implementer was right to refuse it.** I relayed red-team's
+claim that `test_near_resolution.py:260`'s `annualized_return == 6.897755102040822` "pins the overstated
+number". It does not. That fixture's YES book has bid 0.96 / ask 0.98, so `yes_book.mid()` is 0.97 --
+exactly AT the `>= 0.97` threshold -- and `outcome_determined` fires for the **YES** side, whose book IS
+`snapshot.book`. The mismatch branch is never reached. Verified independently by hand: Polymarket
+unknown-category 0.05 rate, `1 x 0.05 x 0.98 x 0.02 = 0.00098` (linear, no venue floor), residual
+`1 - 0.98 - 0.00098 - 0.0005 = 0.01852`, `0.01852/0.98 = 0.0188979...`, `x 8760/24 = 6.897755...`. The
+number is HONEST for that fixture.
+
+The two scenarios coincide at ~6.8977 because BOTH price 100 contracts at ask 0.98 in a single fill --
+honest in the test's Polymarket fixture, fabricated in red-team's Kalshi-style one where real depth was
+3@0.98 then 500@0.995. Red-team generalized from its own repro to a test it had not traced; I relayed
+that without checking. The implementer proved it by re-running the identical fixture against FIXED code
+and getting byte-identical output, then recorded
+`defect: T21c kind=mischaracterized-fixture` rather than "fixing" a correct assertion.
+
+LESSON, and it is the same one as the Kalshi fee-schedule slip earlier this run: a number that looks
+wrong in one context can be right in another, and the ONLY way to tell is to trace which branch the
+fixture actually takes. Red-team's precision on its own reproductions was excellent; its inference about
+a test it did not execute was not. Adjudicate per-claim, never per-agent.
+
+agent: T21c id=a3da929ee8a290d15 role=implementer model=sonnet
+outcome: T21c model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T21e
+
+Red-team remediation on the money fences. All three exploits reproduced against the pre-fix tree
+exactly as briefed, all three fixed, each with a regression test that FAILS against the pre-fix
+behavior and passes against the fixed one (proved by an in-memory un-fix plugin, scratch only).
+Files touched: `app/execution/router.py`, `app/execution/fences.py`, new
+`tests/execution/test_money_fences.py`. No migration was needed — see exploit 2.
+
+**Exploit 1 (untagged buy blinds the bucket cap).** Before: seed 1 contract untagged @ 0.50, then six
+`near_resolution` intents of $200 against a $500 cap — all six executed, `_bucket_open_notional` read
+`0.00` every time, real exposure $1,200.50. After: `$200 -> $400 -> rejected`, and it stays rejected;
+`_bucket_open_notional` reads `400.00` against actual `400.50` (the extra $0.50 is the untagged seed,
+correctly excluded).
+
+Mechanism chosen: a per-bucket ledger ON THE POSITION,
+`Position.extra_data["bucket_notional"] = {bucket: usd}`, credited by `_upsert_position` with each
+BUY's own `sum(price*size)` and shrunk pro rata on every SELL by the fraction of the position closed.
+`_bucket_open_notional` now sums that for positions and keeps intent-based attribution for RESTING
+ORDERS only — an `Order` belongs to exactly one intent for life, a `Position` does not. Invariant:
+`sum(bucket_notional.values()) <= size * avg_entry_price`, both fee-exclusive, both shrinking by the
+same factor on a sale, so the bucket view can never disagree with the account-wide view.
+
+Rewriting `Position.intent_id` on each fold was rejected as the brief required: it is documented in
+`app/models/position.py` and in `_upsert_position`'s own docstring as "the intent that OPENED this".
+Grepped first — `PositionRow.intent_id` has exactly one consumer in `app/` (`_bucket_open_notional`)
+and none in tests, so rewriting it would have been *silently* destructive rather than loudly so. The
+regression test asserts `position.intent_id == seed.intent_id` to pin that it was not taken.
+
+No migration: `Position.extra_data` is an existing JSON column. Rows written before this key exists
+fall back to the old opener-based attribution (absence of the key is the marker, which is why the key
+is written on every buy, empty mapping included) — the conservative reading for legacy rows, not the
+zero.
+
+**Exploit 2 (concurrent submits: cap breach + lost update).** Before, 3/3 identical runs: both 900-lot
+intents executed, $901 of near-resolution fills against a $500 cap, and the position ledger recorded
+902 contracts while 3 `Trade` rows totalled 1802 — one whole 900-lot lost. After, 3/3: one executes,
+one is `rejected`/`risk_limit`, bucket `451.00 <= 500`, trades 902 == positions 902. With the cap
+opened wide so both execute (lost-update half in isolation): positions 1802 == trades 1802,
+bucket 901.00.
+
+Mechanism: ONE per-router `asyncio.Lock` (`OrderRouter._submit_gate()`) held across the two
+read-then-write critical sections — (1) risk check -> reserve -> COMMITTED `PENDING` rows, and (2)
+`_settle`'s single session/commit. Section 1 works because a committed `PENDING` row already carries
+`remaining_size * price` into the next submit's aggregates, so the next submit measures against real
+exposure rather than a stale snapshot; section 2 makes the `PENDING`->`FILLED`+`Position` hand-off
+atomic, which is simultaneously what closes the "counted in neither place" window and what stops
+`_upsert_position`'s select-then-write losing an update.
+
+Trade-off, and what it does NOT protect: an `asyncio.Lock` covers ONE event loop in ONE process. A
+second API worker or a Celery worker sharing the database can still interleave and both failures
+return. Stated plainly in the class docstring rather than overclaimed. The portable cross-process fix
+is optimistic concurrency (a `version` column on `positions`, `UPDATE ... WHERE version = :seen`,
+retry) — `SELECT FOR UPDATE` and advisory locks are not portable across this repo's SQLite-in-tests /
+Postgres-in-prod pair, and a unique constraint does not help because the loss was an UPDATE overwrite,
+not a duplicate INSERT. That needs a schema change to `app/models/position.py`, which is another
+agent's file this task, so no `007` migration was written. Until it exists: run ONE order-routing
+process.
+
+To keep the gate cheap, `_settle` now hoists EVERY `get_fills` call above it (and `_book_unwind` takes
+its fills as an argument instead of fetching them). No venue call — placement, book reads, fill reads
+— happens under the gate, so a slow venue delays its own intent only.
+
+The lock is created lazily and rebound if the running loop changed, because `asyncio.Lock` binds to
+the first loop that awaits it and a process-wide cached router (`app/api/deps.py`) can outlive one.
+
+**Exploit 3 (any spelling but the exact one silently uncaps).** Behavior deliberately unchanged — an
+unrecognized tag still passes, `check_order_limits` still never raises over a bucket NAME, per the
+brief. What changed is that it is no longer silent: `KNOWN_BUCKETS` (a known set, not a validated
+enum) plus `warn_unknown_bucket()`, called from `check_order_limits` so every caller is covered, logs
+a WARNING naming the tag. Verified for `Near_Resolution`, `NEAR_RESOLUTION`, ` near_resolution`,
+`near_resolution `, `""`, `near-resolution`; the correct spelling stays silent and still caps. The
+router additionally skips `_bucket_open_notional` for an unrecognized tag (work for a fence that will
+never read it) and coerces the tag once, in `_bucket_tag()`, so the cap and the aggregate can never
+read different strings.
+
+Normalization (casefold/strip) was considered and rejected: it would have to be mirrored in
+`_bucket_open_notional` AND in `IntentRecord.extra_data["bucket"]` or the fence and its aggregate
+would disagree about which rows are in the bucket — a worse failure than the one being fixed.
+
+**Verification.** `python3 -m pytest -q` -> 679 passed, 0 failed (663 at task start; +12 mine, the
+rest from concurrent agents). `ruff check` and `mypy` clean on exactly the three files changed. No
+directory-wide ruff run, no legacy findings touched. `git status --porcelain` shows nothing outside
+those three files (`backend/app/tasks/bot_execution.py` was already modified at 15:12, before this
+session, and is not mine). No migration, no alembic run of any kind. TRADING_MODE stayed `paper`
+throughout; every test builds an explicit `Settings(...)` and routes through `FixtureAdapter`.
+
+No `defect:` to record — every finding matched repo reality, line numbers included.
+
+agent: T21e role=implementer model=opus
+
+### T21e adjudication (orchestrator)
+
+All three exploits fixed and verified independently: `asyncio.Lock` gate present in `router.py` with
+its limit documented at `:467`, `KNOWN_BUCKETS`/`warn_unknown_bucket` in `fences.py:264-288`,
+`_BUCKET_NOTIONAL_KEY` ledger at `router.py:149`, 12 money-fence tests, suite **679**, `alembic heads`
+still `006` -- no migration written, exactly as reported.
+
+Exploit 1 mechanism: a per-bucket ledger ON THE POSITION (`Position.extra_data["bucket_notional"]`,
+credited per BUY, shrunk pro rata per SELL) rather than rewriting `intent_id`. The implementer GREPPED
+before choosing -- `PositionRow.intent_id` has exactly one consumer in `app/` and none in tests, so
+rewriting it would have been silently destructive -- and pinned that decision with a test asserting
+`position.intent_id == seed.intent_id`. Rows without the key fall back to the old opener-based
+attribution, which is the CONSERVATIVE reading rather than zero. No migration needed: `extra_data` is
+an existing JSON column. Result: $200 -> $400 -> rejected, and it stays rejected; the untagged $0.50
+seed correctly excluded.
+
+Exploit 2 result, 3/3: one executes, one `rejected`/`risk_limit`, bucket `451.00 <= 500`, and trades
+902 == positions 902 (was 902 vs 1802). With the cap opened wide to isolate the lost-update half,
+1802 == 1802. `_settle` hoists every `get_fills` above the gate, so no venue call happens under it.
+The concurrency tests are DETERMINISTIC by construction -- a `_RendezvousAdapter` pins both submits at
+points outside the gate so arming cannot deadlock against the lock under test, and the assertions are
+interleaving-independent invariants. 3x repeat runs clean.
+
+TEST METHODOLOGY WORTH KEEPING: every new test was proven to FAIL against pre-fix behavior via a
+scratch-only un-fix plugin -- `['executed','executed']` vs `['executed','rejected']`, `902 == 1802`,
+`0.0 == 200.0`, and 7 warning tests failing with the warning removed. That is the discipline that
+catches the vacuous-test failure mode this kit already hit once (the first look-ahead test proved
+`0 == 0`). Adopt it for any future money-fence test.
+
+**RESIDUAL RISK, MUST REACH THE DOCS (T24) AND `CLAUDE.md`'s Money Invariants:** the gate is an
+`asyncio.Lock` scoped to ONE event loop in ONE process. A second API worker or a Celery worker sharing
+the database can still interleave, and BOTH failures return -- the cap breach and the lost 900-lot.
+`SELECT FOR UPDATE`/advisory locks are not portable across SQLite-in-tests and Postgres-in-prod; a
+unique constraint does not help, because the loss was an UPDATE overwrite, not a duplicate INSERT. The
+portable cross-process fix is optimistic concurrency (a `version` column on `positions` plus retry),
+which needs `app/models/position.py` -- NOT owned by any task in this kit. **Until that exists, the
+deployment must run exactly ONE order-routing process.** This is a deployment constraint, not a code
+comment: it belongs in `CLAUDE.md`'s Money Invariants section and in whatever T24 writes about running
+the system.
+
+agent: T21e id=ab6faae658e4a1ed7 role=implementer model=opus
+outcome: T21e model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T21d
+
+All five defects (5a, 5b, 5c, 6, 8) plus the lower-severity 9 reproduced against the pre-fix code,
+fixed, and covered by regression tests. Every finding in the brief matched repo reality — no
+`defect:` to record.
+
+**Root cause, restated.** An outcome name was serving two different jobs through one function.
+`normalize_outcome` canonicalized `"YES"`/`"NO"` and was the identity function for everything else,
+which was defensible while binary markets were the only markets. T21 gave arbitrary labels
+first-class positions and first-class depth, and the asymmetry became a money bug: everything that
+RESOLVED an outcome case-folded it, everything that KEYED on one did not.
+
+**The design call (the part the brief asked for judgment on).** I did NOT make `normalize_outcome`
+fold non-binary casing. It is called at nine sites that put its result on a SCREEN or in a record —
+`Leg.outcome`, `Position.outcome`, `TradeRecord.outcome`, `links.py`'s reviewer-supplied
+`outcome_map`, `scanner.py`'s book cache keys, `matcher.py`'s `_is_binary`,
+`cross_venue_arbitrage.observe_book` — and folding there would rewrite every venue's capitalization
+of a candidate name in the UI too. Instead I added `app.strategies.base.outcome_key()`:
+
+    outcome_key(o) = "YES"/"NO" for the binary pair, else o.strip().casefold()
+
+Two functions rather than one because identity and display are different questions with different
+right answers. `normalize_outcome` keeps its documented promise (it now also STRIPS whitespace for
+every label — a leading/trailing space is a serialization artifact, never part of what a venue meant
+to call an outcome, and that is a whitespace change, not the casing change the docstring reserved).
+`outcome_key` owns every key.
+
+The binary pair keeps `"YES"`/`"NO"` as its identity rather than folding to `"yes"`/`"no"`, so every
+identity written down before T21d — `"polymarket:M:YES"`, every existing `BookSnapshot` row, every
+test's expected position id — is byte-identical. Only non-binary labels change, and those had no
+working identity to preserve.
+
+**Display label: preserved everywhere except one place, deliberately.** `Position.outcome`,
+`Leg.outcome` and `TradeRecord.outcome` still carry the venue's own spelling (`"TRUMP"` stays
+`"TRUMP"`); only `position_id` folds. The one place the venue spelling is now LOST is
+`BookSnapshot.outcome`, which stores the identity (`"trump"`) because its whole job is to be found
+again by a lookup that matches exactly. Said so in that model's docstring, with the pointer that a
+caller wanting the venue's capitalization reads `VenueMarket.outcomes`.
+
+**Sites converted to the one canonicalization.** `engine.position_key(venue, market_id, outcome)` is
+new and is now the ONLY way a position/price id is built — `Position.position_id`,
+`_process_snapshot`'s two YES/NO writes and its other-outcome write, `_process_resolution`'s
+post-resolution marks, `_leg_plans`'s SELL-leg lookup, `_record_fill`'s new-position id. Also
+`_book_for`'s book match and its non-binary skip test, `_price_for_outcome`, `_other_outcomes`,
+`Intent`'s bundle distinct-outcome check, `DataCollector._upsert_book_snapshot`, and
+`DataReplayer._get_recorded_book`.
+
+**Defect 5a numbers, measured.** Position `outcome="TRUMP"`, entry 0.20, size 100; payload
+`{"outcomes": {"Trump": {"ask": 0.62}}}`; cash 10_000.
+
+    before: position_id polymarket:M:TRUMP, price key polymarket:M:Trump, marked 0.2,
+            total_equity 10020.0
+    after:  position_id polymarket:M:trump, price key polymarket:M:trump, marked 0.62,
+            total_equity 10062.0   (true)
+
+**Defect 5c — the one I was told to fix regardless.** New `Backtester._note_unmarked_positions`,
+called once per snapshot for that snapshot's own market and once over every open position at end of
+run (which catches a position opened on the final snapshot that no later snapshot revisits). Each
+position id is logged ONCE at WARNING with `position_id`/`outcome`/`entry_price`/`size`, and every
+id is published on the new `BacktestResult.unmarked_positions: tuple[str, ...]`. Separately,
+`_check_position_exits`'s silent `continue` now logs a WARNING naming the position when it skips a
+stop-loss/take-profit check — a protective order that is not being evaluated is worse than one that
+does not exist, because the result still reports it as set. NOT added to `BacktestResult.errors`:
+`tests/backtesting/test_engine_multileg.py:779` asserts `result.errors == []`, and `errors` is
+populated from exceptions, so a counter plus a WARNING is the honest surface.
+`Portfolio.total_equity` stays a pure function (it is called several times per snapshot and cannot
+tell a transient miss from a permanent one) but its docstring now says plainly that the
+`entry_price` fallback is not a safe default and points at the tracker.
+
+**Defect 8.** New `Backtester._payload_price` tries `"ask"` -> `"price"` -> `"bid"` in turn, skipping
+a null at each step, instead of `value.get("ask", value.get("price"))` — `dict.get`'s default is
+consulted only for a MISSING key, never for a present-and-null one. Per the brief,
+`multi_outcome_bundle_arbitrage.py:145-153` was left alone: the strategy refusing to trade is safe,
+the engine falling back to entry price is not.
+
+**Defect 9.** `_price_for_outcome` now resolves EVERY payload entry matching the outcome key. One
+distinct price -> use it (a redundant payload is not a contradictory one); more than one -> WARNING
+and `None`, which routes straight into 5c's unmarked-position report. Dict order is not a pricing
+rule.
+
+**Migration `007`** (`alembic heads` was `006`; nobody else had taken 007) canonicalizes existing
+`book_snapshots.outcome` values: DELETE the rows that would collide once folded (keeping `MIN(id)`
+per group), then UPDATE survivors. Both steps share one SQL `CASE` constant so the dedupe grouping
+and the rewrite cannot drift. No `DO $$` guard because it calls no TimescaleDB function — `UPDATE`/
+`DELETE` behave identically on a hypertable, and `006` enables no compression policy. Downgrade is a
+documented no-op (the original casings are unrecoverable). `lower()` vs Python's `casefold()` can
+differ for a handful of non-ASCII forms; noted in the migration, and any residual divergence now
+surfaces as an unmarked-position WARNING rather than a silent mismark. Verified with
+`alembic upgrade head --sql` ONLY — no database was contacted.
+
+**A sixth file, reported rather than hidden.** `app/services/backtesting/data_replay.py` is outside
+the five files I was assigned, but the brief's invariant names "the replayer's lookup" explicitly, so
+`_get_recorded_book` got a one-line change (`BookSnapshot.outcome == outcome_key(outcome)`) plus its
+docstring. Behavior-preserving for the only existing caller (which passes the literal `"YES"`); it is
+what makes a future non-binary caller find the row. Not owned by the concurrent agent (router.py,
+fences.py, tests/execution/).
+
+**ADJACENT FINDING, NOT FIXED — `app/execution/fill_engine.py:797`.** `_check_book_matches` compares
+`order.outcome` to `book.outcome` with `.casefold()` but no strip, so a book whose outcome carries a
+trailing space RAISES `ValueError: book outcome 'Trump ' does not match order outcome 'Trump'`. In
+the backtester that propagates to `run()`'s `except Exception`, which appends to `errors` and ABORTS
+THE WHOLE RUN — one whitespace-y venue payload kills the backtest. I hit this while writing the 5b
+regression test and restructured the test rather than edit a file outside my scope; the failure is
+LOUD (it raises) rather than silent, which is why it is not one of the five. After this task a
+whitespace-carrying `OrderBook` can still reach it from the live/scanner adapter path
+(`BookSnapshot` rows and `Leg`/`Position` outcomes are now all stripped). One line, same
+`outcome_key` fix — worth a follow-up task.
+
+**Verification.** `python3 -m pytest -q` -> **722 passed**, 0 failed (679 at task start, +43 mine).
+No failures in `tests/execution/`. `ruff check` clean on exactly the 7 files I touched (no
+directory-wide run; my new migration uses PEP 604 unions rather than copying `001`-`006`'s
+`typing.Union`, so it adds zero findings to the 139 baseline). `mypy` clean on 6 of them; the 7th,
+`app/services/data_collector.py`, reports 11 findings — all pre-existing, confirmed by re-running
+`mypy` with only my two lines reverted and getting the identical 11. `git status --porcelain` shows
+the kit's ambient uncommitted diff; by mtime, the files this task touched are exactly:
+
+    backend/app/strategies/base.py
+    backend/app/services/backtesting/engine.py
+    backend/app/models/book_snapshot.py
+    backend/app/services/data_collector.py
+    backend/app/services/backtesting/data_replay.py     (the one-line replayer lookup, above)
+    backend/alembic/versions/20260905_120000_007_canonicalize_book_snapshot_outcome.py   (new)
+    backend/tests/backtesting/test_outcome_identity.py                                   (new)
+
+`app/services/scanner.py` and `app/strategies/settlement_edge.py` were not touched, as instructed.
+`TRADING_MODE` stayed `paper`; no venue network call, no order-placement code, no secrets read.
+
+**Red-green discipline** (per T21e's note above, which is right). The 43 new tests were proven to
+fail against pre-fix behavior by temporarily reverting `outcome_key`/`normalize_outcome` in a scratch
+copy of `base.py`: **20 of 43 failed**, including every 5a/5b/5c/6/9 assertion and the exact
+`10062.00` vs `10020.00` equity pair. Defect 8's tests are unaffected by that revert (its fix lives in
+`_payload_price`, not in the canonicalization) and were verified separately with the standalone
+repro: `{"ask": None, "price": 0.62}` returned `None` before and `0.62` after,
+`{"bid": 0.60, "ask": None}` returned `None` before and `0.60` after.
+
+agent: T21d role=implementer model=opus
+outcome: T21d model=opus attempts=1 result=pass defects_fixed=6 tests_added=43 run=2026-09-05-3bd5
+
+### T21d adjudication (orchestrator)
+
+Verified independently: suite **722** (679 at T21d start, +43), `alembic heads` -> `007 (head)`, and the
+identity/display split behaves exactly as designed:
+
+    'YES'    -> key='YES'    display='YES'        'TRUMP'   -> key='trump'  display='TRUMP'
+    'Yes'    -> key='YES'    display='YES'        'Trump'   -> key='trump'  display='Trump'
+    ' YES '  -> key='YES'    display='YES'        'Trump '  -> key='trump'  display='Trump'
+
+THE LOAD-BEARING PROPERTY: every binary identity is BYTE-IDENTICAL to what was written before T21d
+(`"polymarket:M:YES"` stays `"polymarket:M:YES"`), so existing `BookSnapshot` rows, existing
+`position_id`s and every existing test's expected id are untouched. That is what made a wide identity
+change safe to land mid-kit.
+
+Design call was the right one and was reasoned, not defaulted: `normalize_outcome` was NOT widened to
+fold non-binary casing, because it has nine call sites that put its result on a SCREEN or in a RECORD
+(`Leg.outcome`, `Position.outcome`, `TradeRecord.outcome`, `links.py`'s reviewer outcome map,
+`matcher._is_binary`, ...) and folding there would rewrite every venue's capitalization of a candidate
+name in the UI. A separate `outcome_key()` now serves identity; `normalize_outcome` gained only a
+whitespace STRIP, which is not the casing change its docstring reserved. Display is preserved
+everywhere except `BookSnapshot.outcome`, which stores the identity because its entire job is to be
+found again by exact-match lookup -- documented in the model with a pointer to `VenueMarket.outcomes`
+for display.
+
+Defect 5c is fixed the way it needed to be: `_note_unmarked_positions` runs per snapshot AND over every
+open position at end of run, each logging once at WARNING with `position_id`/`outcome`/`entry_price`/
+`size`, and every id is published on the new `BacktestResult.unmarked_positions`. `_check_position_exits`
+now WARNs when it skips a stop-loss/take-profit check instead of silently `continue`-ing. Correctly NOT
+added to `errors` -- `test_engine_multileg.py:779` asserts `result.errors == []` and that field is
+exception-populated. A backtest can no longer report a fictional equity curve with nothing downstream
+able to tell.
+
+Red-green discipline again: reverting `outcome_key`/`normalize_outcome` in a scratch copy made **20 of
+43** new tests fail, including the exact `10062.00` vs `10020.00` pair. Defect 8's fix lives in
+`_payload_price` and is unaffected by that revert, so it was verified separately
+(`{"ask": None, "price": 0.62}` -> 0.62; `{"bid": 0.60, "ask": None}` -> 0.60).
+
+ADJACENT FINDING, correctly REPORTED rather than fixed out of scope (dispatched as T21f):
+`fill_engine.py:796` compares `order.outcome.casefold() != book.outcome.casefold()` -- casefold WITHOUT
+strip. Confirmed in the tree. A book outcome `"Trump "` raises `ValueError`, which propagates to
+`run()`'s `except Exception` and **aborts the entire backtest**. It is loud rather than silent, which is
+why it was not one of the five, but a whitespace-carrying `OrderBook` can reach it via the
+scanner/adapter path. The consistent fix is `outcome_key()` on both sides, not a second ad-hoc casefold.
+
+agent: T21d id=a26bdb2e2da2d6b4a role=implementer model=opus
+outcome: T21d model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T21f
+
+Fixed the adjacent finding T21d reported rather than fixed out of scope: `fill_engine.py`'s
+`_check_book_matches` compared `order.outcome.casefold() != book.outcome.casefold()` -- casefold
+WITHOUT strip -- so a book outcome carrying a stray trailing space (e.g. `"Trump "` reaching via the
+scanner/adapter path) raised `ValueError` against an order outcome of `"Trump"`, which propagates to
+`Backtester.run()`'s `except Exception` and aborts the entire run over one whitespace character.
+Changed both sides of the comparison to `outcome_key()` -- `app/strategies/base.py`'s single
+canonicalization for outcome IDENTITY (T21d) -- rather than adding a second ad-hoc
+`.strip().casefold()`. `outcome_key("Trump ") == outcome_key("Trump") == "trump"`;
+`outcome_key("Yes ") == outcome_key("YES") == "YES"` (binary pair keeps canonical casing); a genuine
+mismatch (`"Trump"` vs `"Biden"`) still returns different keys and still raises.
+
+Swept the rest of `fill_engine.py` for other bare `casefold()`/`==` outcome comparisons, per the
+brief's ask. Found exactly one more: `synthesize_book`'s dispatch (`key = outcome.casefold()`,
+branching on the literals `"yes"`/`"no"`). It is not a two-sided identity comparison like
+`_check_book_matches` -- it classifies a single caller-supplied string to pick which venue quotes to
+read -- but it has the identical defect shape: no strip, so `"Yes "` fails both branches and raises
+`ValueError: outcome must be 'YES' or 'NO'`. This is reachable for real: its only caller,
+`app/services/backtesting/engine.py:1114`, already gates the call with
+`outcome_key(outcome) not in ("YES", "NO")` before passing the RAW (non-canonicalized) `outcome`
+through, so a whitespace-carrying outcome that passes the gate would still blow up one line later
+inside `synthesize_book` on the old code. Fixed the same way: `key = outcome_key(outcome)`, compared
+against `"YES"`/`"NO"`. The raw `outcome` argument is still what gets recorded on the returned book
+(verbatim, per the function's documented contract that `_check_book_matches` needs the caller's
+original spelling to compare against) -- only the internal branch selection changed. No other
+`.outcome` reference in the file is a comparison; the other two hits (`order.outcome` in two
+`extra={}`/metadata dicts) are display-only.
+
+Tests added to `tests/execution/test_fill_engine.py`: whitespace-tolerance for a non-binary label
+(`"Trump "` vs `"Trump"`, fills), whitespace-tolerance on the binary pair (`"Yes "` vs `"YES"`,
+fills), and a genuine non-binary mismatch (`"Trump"` vs `"Biden"`, still raises `ValueError`).
+Red-green proved in a scratch copy under `$TMPDIR` (not the repo tree): reverted both fixed spots
+back to bare `.casefold()`, reran `-k outcome` -> the two whitespace-tolerance tests failed with
+`ValueError: book outcome 'Trump '/'Yes ' does not match order outcome ...` while the mismatch test
+and all other outcome tests still passed (as expected, since that test targets the guard itself, not
+the fix); restored, reran -> all 8 outcome tests green.
+
+Verification: `python3 -m pytest -q` -> **725 passed** (722 baseline + 3 new tests here). `ruff check
+app/execution/fill_engine.py tests/execution/test_fill_engine.py` -> clean. `mypy
+app/execution/fill_engine.py` -> clean. `git status --porcelain` shows the whole kit tree as
+untracked (ambient, pre-existing per GUARDRAILS.md §3); confirmed by mtime (`find ... -newer`) that
+only `fill_engine.py` and `test_fill_engine.py` were touched by this task. `TRADING_MODE` stayed
+`paper`; no venue network call, no order-placement code, no secrets read; did not touch
+`app/services/backtesting/`, `app/scripts/`, `app/api/routes/backtesting.py`, or
+`app/tasks/backtesting.py` (the concurrent agent's territory).
+
+agent: T21f role=implementer model=opus
+outcome: T21f model=opus attempts=1 result=pass defects_fixed=2 tests_added=3 run=2026-09-05-t21f
+
+### T21f adjudication (orchestrator)
+
+Verified: both fixes present (`fill_engine.py:802` `_check_book_matches`, `:1146` `synthesize_book`),
+suite **725**. Red-green proven in a `$TMPDIR` copy -- reverting both made the two whitespace tests fail
+with the exact `ValueError`, while the genuine-mismatch test correctly still passed (it targets the
+guard, not the fix). That asymmetry is the right shape: a fix must not make its own guard untestable.
+
+**THE SECOND INSTANCE IS THE INTERESTING ONE, AND T21d CREATED THE PATH TO IT.** `synthesize_book`
+dispatched on `key = outcome.casefold()` against the literals `"yes"`/`"no"`. Its only caller,
+`engine._book_for` (`engine.py:1112-1115`), gates on `outcome_key(outcome) not in ("YES","NO")` -- and
+T21d had just changed that gate to `outcome_key`, which STRIPS. So after T21d, `"YES "` passed the gate
+and then hit a consumer that still compared unstripped, raising one line later. T21d widened a gate
+without widening the consumer behind it.
+
+LESSON, worth carrying into any future canonicalization work: introducing a canonicalization at ONE
+layer does not just fix that layer -- it changes which inputs reach the layers BELOW it. Every consumer
+downstream of a newly-permissive gate has to be checked, or the fix relocates the failure instead of
+removing it. Neither the T21d implementer nor I caught this; the follow-up task found it while reading
+the file for an unrelated one-line change.
+
+agent: T21f id=aa7013932ae04278d role=implementer model=sonnet
+outcome: T21f model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T23 pre-check (orchestrator, while T22 runs) — the frontend gate is NOT trivial cleanup
+
+`node_modules` is present (T03's `npm ci` stands). Measured baseline BEFORE T23 starts:
+
+**`npx tsc -p tsconfig.app.json --noEmit` -- 8 errors across 5 files.** Seven are trivial
+(`TS6133`/`TS6196` unused imports/vars in `Backtesting.tsx`, `StrategySelector.tsx`, `useMarkets.ts`,
+`backtestApi.ts`). ONE is a real nullability bug: `BacktestResults.tsx:195` -- a recharts
+`Formatter<number, "Equity">` is handed `(value: number) => [string, "Equity"]`, but recharts passes
+`number | undefined`. That is a genuine runtime crash path on an undefined datapoint, not a lint nit.
+
+**`npm run lint` -- 14 errors across 5 files, and SEVEN OF THEM ARE REAL REACT CORRECTNESS BUGS,
+not unused imports:**
+  - `TradeList.tsx` lines 183/191/198/205/212/219 -- SIX x "Cannot create components during render"
+    (components defined inside the render body, all tracing back to `TradeList.tsx:91:20`). This is the
+    remount-on-every-render anti-pattern: it discards child state and defeats reconciliation on every
+    parent render.
+  - `BacktestForm.tsx:55` -- "Calling setState synchronously within an effect can trigger cascading
+    renders".
+
+**`grep -rn ": any\b" frontend/src` -- already CLEAN**, so T23's acceptance line 4 is satisfied
+at baseline and only needs to not regress.
+
+**NINTH instance of the recurring architect defect, and the worst-shaped one.** T23's acceptance lines
+1 and 2 demand `tsc` and `npm run lint` exit 0. Unlike the eight `ruff` cases, these CANNOT be scoped to
+the files a task touches -- `tsc` typechecks the project and `npm run lint` lints `src/`. So T23 cannot
+pass its own verify without fixing all 22 findings, and PLAN §2's "untouched legacy files are not a
+gate" exemption is unavailable to it by construction. Three of the five tsc files
+(`BacktestResults.tsx`, `StrategySelector.tsx`, `useMarkets.ts`, `backtestApi.ts`) are not even named
+in T23's brief.
+
+The seven React fixes are also in tension with PLAN §2's "No frontend redesign" fence. They are not a
+redesign -- they are correctness fixes to make a declared gate pass -- but T23's brief must say so
+explicitly, or the implementer will reasonably refuse them as out of scope and block. For a FUTURE kit
+the architect-side fix is the same shape as the ruff one: never write a whole-project gate
+(`tsc --noEmit`, `npm run lint`) as a task acceptance criterion unless the kit has first driven the
+baseline to zero, or scope the gate to changed files with a tool that supports it.
+
+### T22 — Capital sweep and `EdgeDecayReport`
+
+Brief's assumptions matched repo reality (`create_sample_snapshots` exists/exported, ruff/mypy scope
+pre-clean) -- no `defect:` to record. Files touched are exactly the five named plus the one new test
+file: `backend/app/services/backtesting/sweep.py` (new), `backend/app/services/backtesting/__init__.py`,
+`backend/app/scripts/sweep.py` (new), `backend/app/api/routes/backtesting.py`,
+`backend/app/tasks/backtesting.py`, `backend/tests/backtesting/test_sweep.py` (new). `engine.py` and
+`fill_engine.py` were READ extensively but never edited -- both traps below were solved from within the
+assigned file scope.
+
+**Carry-forward 2 (the "no edge" vs "not measurable" trap) -- handled in the report, not dodged.**
+`CapitalRow` gains `zero_trades_cause: str | None` (`"no_signal"` when the strategy itself never
+generated an intent -- a genuine no-edge reading -- else a `"structural: <FillReason> (...)"` string
+naming the dominant `rejection_reasons`/expiration cause) plus `rejection_reasons`,
+`tick_unvalidated_fills`, and `unmarked_positions` denormalized onto EVERY row (not just the result),
+because a row's own `annualized`/`net_return` is itself a backtest number GUARDRAILS.md §1.7 requires
+labeled wherever shown. `EdgeDecayReport` gains `unmeasurable_note: str | None`, set whenever
+`edge_dies_at` is anchored to a structurally-zero-trade row -- i.e. exactly the shape a real
+`multi_outcome_bundle_arbitrage`-style intent produces (a named-outcome leg can never get a book from a
+top-of-book-only `MarketSnapshot`, since `book` is a single field). Regression test
+`test_bundle_shaped_sweep_is_labeled_unmeasurable` constructs a 3-leg named-outcome `all_or_none`
+intent with no recorded book and asserts `zero_trades_cause` reads `"structural: no_eligible_levels
+(...)"` and `unmeasurable_note is not None`, DISTINCT from `test_no_gap_sweep_never_trades`'s
+`zero_trades_cause == "no_signal"` / `unmeasurable_note is None` for a genuine no-edge fixture -- same
+zero-trades signature at every level, different, inspectable cause.
+
+**Carry-forward 2 also flagged a second, related gap the brief did not name: `pct_intents_downsized`
+cannot be read off `BacktestResult` as shipped.** `TradeRecord` records what filled, never what was
+REQUESTED (`Backtester._LegPlan.size`, the post-capital-cap pre-book-walk order size, is computed and
+then discarded inside `_execute_intent`/`_commit_leg`, never propagated to the trade). Both files that
+own that data (`engine.py`, `fill_engine.py`) are outside this task's five files (`fill_engine.py`
+explicitly so -- concurrent edit; `engine.py` is PLAN.md D14's opus-pinned multi-leg/next-fill file).
+Rather than fabricate the number, silently return a constant `0.0`, or reach into `engine.py` anyway,
+`sweep.py::_RequestTrackingStrategy` wraps the swept strategy and uses ONLY the documented
+`BaseStrategy.calculate_position_size` callback contract: `on_market_data` keeps a reference to the
+`Intent` it just returned (one coroutine, one snapshot at a time -- no concurrency risk), and the
+engine's very next step for that cycle always calls `calculate_position_size` on it (even when the
+returned budget ends up unused, e.g. a strategy whose legs already declare `size_contracts`). The
+wrapper's override computes the SAME pre-cap per-leg contract count `Backtester._leg_sizes`'s first
+branch would (mirrored, not imported -- five lines, explicit `size_contracts` verbatim when every leg
+declares one, else `budget / sum(limit_price)` applied equally per leg) and stamps it onto the intent's
+OWN mutable `metadata` dict BEFORE the engine ever reads it for `TradeRecord.metadata = dict(intent.
+metadata)`. This is generic (no per-strategy special-casing) and non-invasive (zero lines changed in
+either engine file), with one documented, deliberate gap: it captures the PRE-CAP request, not
+`_leg_sizes`'s own capital/position-size scale-down, so `pct_intents_downsized` reports a fill
+shortfall from EITHER cause (book depth or the engine's own cap) without distinguishing them --
+replicating that scale-down step too would duplicate live portfolio state `_leg_sizes` already owns
+(PLAN.md D5: one engine, no divergent copies of its money math).
+
+**Test design forced by carry-forwards 1/3 together, and worth recording because it is not obvious.**
+`binary_complement_arbitrage`'s real shipped default sizes legs with explicit, CAPITAL-INDEPENDENT
+`size_contracts` (fixed at `min_position_size`) and `atomicity="all_or_none"` with the default
+`partial_tolerance=0.0` -- under that combination a leg either fills 100% or the WHOLE intent is
+REJECTED (`_atomicity_blocker`), never "executed but downsized". A capital sweep therefore cannot
+demonstrate `pct_intents_downsized` growing with capital using that strategy's real defaults at all:
+requested size does not scale with capital, and a book-depth shortfall shows up as a rejection, not a
+downsize. `tests/backtesting/test_sweep.py::_PlantedComplementStrategy` is a test-local, best-effort,
+capital-proportional-sizing strategy built specifically so BOTH conditions the brief's acceptance line
+needs (size grows with capital; partial fills commit rather than reject) hold -- registered into
+`app.strategies.STRATEGIES` via `monkeypatch.setitem` for the duration of one test (auto-reverts), since
+`run_sweep` resolves strategies through the real registry (`get_strategy`), not by taking an instance.
+Every dollar figure in the test's docstring is hand-computed from the planted 80%-gross-gap /
+fixed-500-contract-depth fixture (`0.05 * 0.10 * 0.90` fee per leg, `2 * 0.05` fixed resolution gas,
+`liquidity_fraction * volume_24h / price` depth) and reproduced exactly by the actual run (`355.85` /
+`395.40` / `395.40` profit at `500` / `2_000+`, `edge_dies_at == 10_000.0`) -- not asserted against the
+code under test.
+
+**The `--synthetic` CLI mode needed the SAME anti-vacuous-test discipline T10/T22-brief already
+flagged.** `create_sample_snapshots` is deliberately arbitrage-neutral (`no_price = 1 - yes_price` plus
+a strictly positive spread means `yes_ask + no_ask = 1 + spread > 1` always), so
+`app/scripts/sweep.py::plant_complement_gap` shaves a configurable `--gap` (default 6%) off every
+snapshot's `yes_ask`/`no_ask` before handing it to `binary_complement_arbitrage` (the CLI's default
+`--strategy`). Verified against the exact acceptance command: `python3 -m app.scripts.sweep --synthetic
+--levels 500,5000,50000 --out $TMPDIR/....json` exits 0, prints the `sweep_ceiling_note` caveat (PLAN.md
+D12: printed, not merely stored -- carry-forward 1), and the JSON has `rows` length 3 and an
+`edge_dies_at` key.
+
+**Carry-forwards 5/6 -- confirmed, not acted on (correctly, per the brief).** No fee call is made
+anywhere in `sweep.py`; every dollar in a `CapitalRow` flows through the one shared
+`SimulatedFillEngine`/`Backtester`, so Kalshi's per-fill fee fragmentation (carry-forward 6) is
+faithfully inherited, not collapsed, and the cross-strategy fee-basis mismatch (carry-forward 5) is
+real but out of this task's scope -- noted in `sweep.py`'s module docstring so a future cross-strategy
+comparison UI (T23) does not treat two strategies' rows as calibrated identically.
+
+**API/task wiring, smoke-tested outside the pytest suite (no test added -- the existing
+`start_backtest`/`run_backtest_task` pair has zero test coverage in this repo today, for the same
+reason: `.delay()` needs a live Celery broker this sandbox does not have).** A throwaway script
+(SQLite in-memory DB, `monkeypatch`-style stubbing of `get_session_context` and `run_sweep_task.delay`,
+never committed) drove `POST /sweep` -> `_run_sweep_async` -> `GET /{id}/edge-decay` end to end: one
+parent `BacktestRun` (`strategy_name="sweep:test_planted_complement"`) plus three child rows, `report[
+"edge_decay"]` matching the unit test's hand-computed numbers exactly (`0.7117`/`0.1977`/`0.03954`),
+`edge_dies_at == 10_000.0` both on the parent row and via the GET endpoint. `run_sweep` gained one
+additive, keyword-only `on_level_result: Callable[[float, BacktestResult], Awaitable[None]] | None`
+hook so the sweep task can persist each level's FULL `BacktestResult` (equity curve, trades, `build_
+report()`) as it is produced, instead of re-running every level's backtest a second time just to get
+DB-storable detail -- `_populate_run_from_result` (extracted from `_run_backtest_async`'s existing
+inline block, now shared) is what both the single-run task and the sweep task's per-level persistence
+call.
+
+**Verify.** Exact command from the brief, run clean:
+`python3 -m pytest -q tests/backtesting/test_sweep.py` (3 passed) `&& python3 -m app.scripts.sweep
+--synthetic --levels 500,5000,50000 --out "$TMPDIR/market-edge-sweep.json"` (exit 0, prints the
+ceiling note) `&& python3 -c "...assert len(d['rows'])==3 and 'edge_dies_at' in d"` (passes) `&& ruff
+check app/services/backtesting app/scripts/sweep.py app/api/routes/backtesting.py app/tasks/
+backtesting.py` (clean) `&& mypy app/services/backtesting` (clean, 5 source files) `&& python3 -m
+pytest -q` (**728 passed**, 0 failed; 722 at task start +3 mine +3 from a concurrently-landed agent).
+`git status --porcelain` confirms exactly the six files above touched (three `M`, three new `??`); no
+migration needed (`alembic heads` stays `007`, verified with `alembic upgrade head --sql` only -- no
+database contacted). One pre-existing (not mine) mypy finding on `app/api/routes/backtesting.py:107`
+(`validate_end_date`'s untyped pydantic `info` param, present at HEAD) and the celery-decorator/
+untyped-`task`-param findings on `app/tasks/backtesting.py` mirror the identical pre-existing pattern
+on `run_backtest_task`/`_run_backtest_async` exactly -- neither is required by this task's mypy scope
+(`app/services/backtesting` only) and neither is a new category of problem. `TRADING_MODE` stayed
+`paper`; no venue network call; no secrets read; no order-placement code anywhere in the diff.
+
+agent: T22 id=implementer role=implementer model=sonnet
+outcome: T22 model=sonnet attempts=1 result=pass tests_added=3 run=2026-09-05
+
+### T22 adjudication (orchestrator)
+
+Verify re-run independently and FULLY CLEAN -- 3/3 sweep tests, CLI exits 0, JSON has 3 rows and
+`edge_dies_at`, `ruff` clean on all four paths, `mypy` clean on 5 files, suite **728**, `alembic heads`
+`007` (no migration, correct). **This is the first task in the kit whose verify command ran exactly as
+written**, which the pre-check predicted -- the 8 prior failures were all the directory-scoped-ruff
+architect defect, and T22's scope happened to contain no legacy files.
+
+The CLI output demonstrates D12's whole point (an edge that lives at $500 and dies at $50k is a
+different product):
+
+    capital | net_return | annualized | trades | downsized |   util | depth_source | unvalidated | unmarked
+        500 |      4.53% |     71.49% |     12 |     16.7% |  96.1% |    synthetic |          12 |        0
+      5,000 |      4.18% |     64.67% |    104 |      0.0% |  91.0% |    synthetic |         104 |        0
+     50,000 |      2.45% |     34.20% |    582 |      0.0% |  32.1% |    synthetic |         582 |        0
+
+GUARDRAILS §1.7 labeling is satisfied at BOTH levels: `depth_source` and `fill_at` appear per row AND
+in aggregate, `tick_unvalidated_fills` rides beside every row (the recorded carry-forward), and
+T21d's new `unmarked_positions` is surfaced per row so a partly-fictional equity curve announces
+itself. PLAN D12's "the sweep ceiling is not proof" caveat is PRINTED, not merely stored.
+
+CHECKED FOR THE TEST-WRITTEN-FROM-IMPLEMENTATION FAILURE MODE, because the CLI's `downsized` column
+runs 16.7% -> 0.0% -> 0.0%, INVERTED from the brief's spec ("0 at $500 and > 0 at $250k"). The test
+asserts the BRIEF's direction (`by_capital[500.0].pct_intents_downsized == 0.0` and
+`by_capital[250_000.0].pct_intents_downsized > 0.0`) and passes -- the two fixtures simply have
+different binding constraints (the test's book supplies 500 against a 450 request, so nothing downsizes
+at $500; the CLI's `create_sample_snapshots` fixture has the capital cap binding at $500 instead).
+Written from the spec, not from the implementation. Correct.
+
+Carry-forward 2 solved rather than dodged: `CapitalRow.zero_trades_cause` distinguishes `"no_signal"`
+(genuine no edge) from `"structural: <reason>"` (an intent that could never obtain a book), and
+`EdgeDecayReport.unmeasurable_note` fires whenever `edge_dies_at` is anchored to a structurally-zero
+row. A dedicated test proves a bundle-shaped sweep is distinguishable from a genuine no-edge sweep --
+so the kit can no longer report "no edge at any size" for a strategy that was never measurable.
+
+One honest limitation recorded by the implementer: `pct_intents_downsized` is NOT derivable from
+`BacktestResult` as shipped (`TradeRecord` never records the REQUESTED size, only what filled, and the
+two files that could supply it were out of scope). It is obtained via `_RequestTrackingStrategy`, a
+wrapper using only the documented `calculate_position_size` callback to stamp the pre-cap requested
+size onto each intent's own metadata. No engine changes. Limitation: it does not capture the engine's
+own capital-cap scale-down.
+
+agent: T22 id=ac65f4f9043b4e241 role=implementer model=sonnet
+outcome: T22 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T24 — Docs and project skills reflect the new shape
+
+defect: T24 kind=unrunnable-verify Acceptance line 5 assumed a committed baseline that does not exist; `git diff --stat -- backend frontend` against pre-kit HEAD shows ~95 files of prior tasks' work, not just T24's changes. Substituted: capture `git status --porcelain` before and after, diff them.
+
+Docs updated per brief: CLAUDE.md Project Overview (multi-venue, paper-first, mimicry removal reason), Tech Stack (React 19 / Tailwind 4 from frontend/package.json), Project Structure (added venues/, execution/, services/matching/, services/scoring.py, services/scanner.py, services/backtesting/sweep.py, models/event_link.py, models/book_snapshot.py, models/intent.py), Commands (added `python3 -m app.scripts.sweep --synthetic`, `alembic upgrade head --sql`), Environment Variables (added TRADING_MODE, LIVE_TRADING_CONFIRMATION, Kalshi, cost variables from .env.example), Money Invariants section (3 bullets + 1 concurrency limitation bullet).
+
+README.md: replaced setup-kit narrative with 40–80 line description of repo purpose (multi-venue inefficiency engine), how to run tests (pytest), how to run synthetic sweep, and paper/live fence. Included standing limitation on multi-outcome bundle backtesting and statement that synthetic depth results are labeled as such.
+
+.claude/skills/kalshi-api/SKILL.md created: ~120 lines copying Kalshi facts from PLAN.md §3 Venue facts subsection — base URLs, auth (RSA-PSS), market payload fields, orderbook format (bids-only, derive asks from NO bids), order V2 structure, fees (rate × C × P × (1−P), ceil 6dp per fill, ceil 2dp for non-direct), capital (ACH/wire settlement). No network fetch; facts pinned from vendor docs on 2026-09-04.
+
+.claude/skills/polymarket-api/SKILL.md: added Fee Model section with formula `C × rate × p × (1−p)`, category table (Crypto 0.07, Sports/Econ/Culture/Weather/Other 0.05, Finance/Politics/Mentions/Tech 0.04, Geopolitics 0.0), note on per-market CLOB payload override, taker-only note.
+
+No code changes. Verified with git status substitution (see acceptance 5 note above).
+
+
+### T24 adjudication (orchestrator)
+
+Verify re-run independently: all 8 checks PASS. Both facts I mandated are present VERBATIM and were
+checked in the files rather than taken on report:
+  - `CLAUDE.md:384` -- the "Run exactly ONE order-routing process" bullet, complete with the lock scope,
+    the concurrent-worker breach, and the plain statement that the portable fix is not implemented. This
+    is the T21e residual risk reaching a future operator, which is the only place it does any good.
+  - `README.md:53` -- the multi-outcome backtest limitation, including that the LIVE scanning path is
+    fine and the limitation is backtest-specific, and that such a sweep is labeled
+    `zero_trades_cause="structural: ..."` rather than reported as having no edge.
+  - `README.md:55` -- the `depth_source`/`fill_at` labeling rule stated as a standing project rule with
+    a pointer to GUARDRAILS §1.7, not as a footnote.
+
+A LATENT TAUTOLOGY IN T24'S OWN VERIFY, worth recording for the architect's brief-defect floor even
+though it did not bite: `test -z "$(grep -n 'polymarket-setup\|cp -r /path/to' README.md)"` PASSES when
+`README.md` does not exist at all, because grep on a missing file writes to stderr and prints nothing to
+stdout. The command's leading `cd` makes it correct in practice, but the PATTERN is a verify that cannot
+fail for the reason it looks like it is checking. I demonstrated this accidentally by running the grep
+from the kit directory and briefly reading a present limitation as missing. A `test -f README.md &&`
+prefix would close it. Same family as the eight directory-scoped-`ruff` defects: the check's scope and
+the check's intent are not the same thing.
+
+agent: T24 id=a61aa730df0ed1993 role=implementer model=haiku
+outcome: T24 model=haiku attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T23 — Frontend: Opportunities tab and edge-decay table
+
+Both gates were failing at baseline as the dispatch note predicted, and both close cleanly:
+`npx tsc -p tsconfig.app.json --noEmit` went from 8 errors to 0; `npm run lint` went from 14
+errors to 0. Final verify command run exactly as specified in the brief — all steps passed,
+including `grep -q synthetic`, `grep -q LIVE`, and the `: any\b` emptiness check.
+
+Baseline gate fixes (in scope per the dispatch note, done surgically, no redesign):
+- `TradeList.tsx`: `SortIcon` was defined inside `TradeList`'s render body, closing over
+  `sortField`/`sortDirection` from component scope — a new component type every render, so React
+  remounted the six header icons instead of reconciling them. Hoisted to module scope as a plain
+  component taking `field`/`sortField`/`sortDirection` as props; the six call sites now pass
+  `sortField={sortField} sortDirection={sortDirection}` explicitly.
+- `BacktestForm.tsx`: the `useEffect` resetting `strategyConfig` on strategy change unconditionally
+  called `setStrategyConfig` from the effect body (`react-hooks/set-state-in-effect`). Replaced with
+  React's documented "adjusting state when a prop changes" pattern — a `configForStrategy` tracking
+  state and a plain `if (configForStrategy !== selectedStrategy) { ...; setStrategyConfig(...) }`
+  guard evaluated during render. Verified this does not trip `react-hooks/set-state-in-render`: that
+  rule (read from `eslint-plugin-react-hooks`'s compiled source) only flags setState calls reachable
+  from an UNCONDITIONAL block; a guarded, self-terminating conditional is the officially exempted
+  case and the lint run confirms it (0 errors).
+- `BacktestResults.tsx:195`: recharts' `Tooltip formatter` for a `dataKey="equity"` series passes
+  `value: number | undefined` (a real "no datapoint" runtime case), but the handler was typed
+  `(value: number) => ...`. Fixed by widening the parameter to `number | undefined` and using
+  `value ?? 0` — not a cast, an actual handled fallback.
+- Six stale unused imports removed (`formatCurrency` in `Backtesting.tsx`, `categoryIcons` in
+  `StrategySelector.tsx`, `useMutation`/`useQueryClient`/`Market` in `useMarkets.ts`,
+  `Backtest`/`StrategyInfo` in `backtestApi.ts`).
+
+Brief implementation, typed against the backend's actual response builders (read, not guessed):
+- `backend/app/api/routes/arbitrage.py`'s `OpportunityOut` → `types/index.ts`'s `Opportunity`
+  (plus `OpportunityLeg` for `_leg_out`'s exact 7 keys, and `OpportunitiesResponse`/`ScanResponse`
+  for the two endpoints' envelopes). `OpportunityScore`'s 9 fields (7 scoring keys + `link_status`
+  + `depth_source`) mirror `app/services/scoring.py`'s dataclass docstring verbatim.
+- `backend/app/services/backtesting/sweep.py`'s `capital_row_to_dict`/`edge_decay_report_to_dict`
+  (the dict BUILDERS, per the dispatch note's instruction, not the dataclass field lists directly,
+  though they matched here) → `EdgeDecayRow`/`EdgeDecayReport`. `ResultDepthSource`/`FillAt` copied
+  from `engine.py`'s `Literal` definitions (`"synthetic"|"recorded"|"mixed"`, `"same"|"next"`).
+- `GET /api/v1/trading/mode` (`trading.py`'s `TradingModeResponse`, not `arbitrage.py` — that route
+  lives under the `trading` router, prefix `/trading`) → `TradingMode`/`TradingModeResponse`.
+- `api.ts`: replaced `getArbitrageOpportunities`/`scanArbitrage` (which called a nonexistent
+  `min_profit` query param and returned the stale, no-longer-real `ArbitrageOpportunity` shape) with
+  `getOpportunities(params)`, `triggerScan(strategies?)`, `getEdgeDecay(backtestId)`,
+  `getTradingMode()`. Deleted `hooks/useArbitrage.ts` (dead code — nothing imported it; it only
+  wrapped the two removed methods) rather than leave it broken. `ArbitrageOpportunity` removed from
+  `types/index.ts` (last remaining reference was `api.ts`, now gone).
+- New hooks `useOpportunities.ts` (query + `useTriggerScan` mutation, 10s poll matching the old
+  arbitrage hook's cadence), `useEdgeDecay.ts` (query, `enabled` on non-null id, `retry: false` since
+  a 404 there is a normal "not a sweep yet" state, not a transient failure), `useTradingMode.ts`
+  (30s poll).
+- `components/opportunities/OpportunitiesTable.tsx`: sortable by composite/annualized/hours
+  (client-side sort, ascending/descending toggle, same UX pattern as the pre-existing
+  `TradeList.tsx` sort but with the hoisted-component lesson applied from the start — `SortHeader`
+  is a module-scope component here too). Columns per the brief plus one GUARDRAILS §1.7 addition
+  not in the brief's column list: a `depth_source` badge, because `OpportunityOut` carries
+  `depth_source` specifically so an operator can tell a synthetic-depth score apart, and §1.7 is
+  absolute ("wherever it is shown") — an opportunities table showing scored intents is exactly such
+  a place, so I added the column rather than silently satisfying only the brief's list. Includes a
+  "Scan Now" button wired to `triggerScan`.
+- `components/backtesting/EdgeDecayTable.tsx`: renders `sweep_ceiling_note` unconditionally (PLAN
+  D12), `unmeasurable_note` when present, a `synthetic`/`mixed` depth badge and `same`/`next` fill-at
+  badge on both the aggregate and every row, highlights the row where `capital === edge_dies_at`,
+  and gives zero-trade rows one of three visually distinct treatments instead of a bare `0.00%`:
+  real trades (normal %), `zero_trades_cause === "no_signal"` (muted "0.00% (no signal)"), or a
+  `"structural: ..."` cause (a warning-colored "not measurable" badge, title-tooltip carries the
+  full cause string — never rendered as a percentage at all). `unmarked_positions` non-empty renders
+  a warning badge reading "N unmarked — equity partly fictional", not a silent count.
+- `App.tsx`: `'arbitrage'` tab now renders `OpportunitiesTable`; header pill reads `useTradingMode()`
+  and shows `PAPER` (muted) or `LIVE` (red, `bg-destructive/20 text-destructive`), plus a ⛔ suffix
+  and tooltip when `kill_switch` is engaged (small addition beyond the brief's ask, cheap and
+  directly relevant to the same endpoint).
+- `Backtesting.tsx`: renders `EdgeDecayTable` when `strategyName?.startsWith('sweep:')` OR
+  `report?.edge_decay` is present. This required plumbing `strategy_name`/`report` through, since
+  neither field existed ANYWHERE in the frontend's backtest types/hooks before this task — the
+  frontend's `backtestApi.ts` `BacktestStatusResponse` interface predates the backend settling and
+  is missing several real fields (it also has `backtest_id`/`message` fields the real
+  `GET /backtests/{id}` response does not return; that pre-existing drift is out of scope and NOT
+  touched here). Added `strategy_name?: string` and `report?: BacktestReport` (new minimal type,
+  `{ edge_decay?: EdgeDecayReport }` — the real `report` dict carries much more, but that is all
+  this task reads) to the existing interface, both optional to match the surrounding interface's
+  already-approximate honesty level rather than asserting a stronger contract than what's around it
+  actually has.
+
+Judgment calls, not brief defects (none blocked the acceptance criteria, so none use `defect:`
+grammar):
+- Brief names a "net edge %" column, but `OpportunityScore.net_edge`'s docstring
+  (`services/scoring.py`) is explicit: "Per-contract riskless edge, USD" — a dollar amount, not a
+  percentage (`annualized_return` is the fraction). Rendered as currency under a "Net Edge" header
+  rather than mislabeling a dollar figure with a `%` sign.
+  `near_resolution_hours` (`Settings`, default 72) is a server-side setting; `GET /opportunities`
+  exposes it only as a boolean query-time filter, never as a readable value. `OpportunitiesTable`
+  approximates the badge threshold with a local constant (`NEAR_RESOLUTION_HOURS = 72`, commented
+  as an approximation of the backend default, not a live read of the running instance's setting).
+- "Market" column: no strategy guarantees a human-readable question/title in `Intent.metadata` (it's
+  a free-form `dict[str, Any]` strategies populate independently), so rather than guess a metadata
+  key that might not exist, the column shows each leg's actual `market_id`(s), which the payload
+  does guarantee.
+
+Files touched (all under `frontend/`): `src/App.tsx`, `src/types/index.ts`, `src/services/api.ts`,
+`src/services/backtestApi.ts`, `src/hooks/useBacktesting.ts`, `src/hooks/useMarkets.ts` (unused-import
+fix only), new `src/hooks/useOpportunities.ts`, `src/hooks/useEdgeDecay.ts`,
+`src/hooks/useTradingMode.ts`, deleted `src/hooks/useArbitrage.ts`, new
+`src/components/opportunities/OpportunitiesTable.tsx`, new
+`src/components/backtesting/EdgeDecayTable.tsx` (+ exported from `components/backtesting/index.ts`),
+`src/components/backtesting/{Backtesting,BacktestForm,BacktestResults,StrategySelector,TradeList}.tsx`.
+`git status --porcelain` confirmed nothing touched outside `frontend/`; the pre-existing ambient diff
+(backend files, docs, and one unrelated frontend deletion, `hooks/useTraders.ts`, already gone before
+this task started — part of the prior trader-mimicry removal, not touched by this task) was left as
+found.
+
+No backend command run; `TRADING_MODE` never set; no network to venues.
+
+agent: T23 id=pending role=implementer model=sonnet
+outcome: T23 model=sonnet attempts=1 result=pass review=pending run=2026-09-05
+
+### T23 adjudication (orchestrator)
+
+Verify re-run independently, all green: `tsc` **8 errors -> 0**, `npm run lint` **14 -> 0**, `synthetic`
+badge present in `EdgeDecayTable.tsx`, `LIVE` present in `App.tsx`, `: any` still empty, backend suite
+still **728**, and `git status --porcelain` shows nothing changed outside `frontend/` and the docs paths
+T24 owned.
+
+The seven baseline React fixes were done surgically, as the fence required: `SortIcon` hoisted out of
+`TradeList.tsx`'s render body (threading `sortField`/`sortDirection` as props at all six call sites)
+rather than restructuring the component; `BacktestForm.tsx`'s effect replaced with React's documented
+adjust-state-during-render pattern; and `BacktestResults.tsx:195` fixed with a real `value ?? 0`
+fallback rather than a cast or a `@ts-ignore` -- which matters, because a cast would have silenced the
+gate while leaving the undefined-datapoint crash path intact.
+
+TWO JUDGMENT CALLS WORTH KEEPING, both caught by reading the backend rather than trusting the brief:
+1. The brief's "net edge %" column is NOT a percentage -- the backend docstring says the field is a USD
+   value. Displayed as currency. A percent sign on a dollar figure would have been a silent unit lie in
+   the one surface a human actually reads before trading.
+2. The `near_resolution` threshold is not exposed via any API, so the badge uses a documented local
+   constant. Recorded rather than silently hardcoded.
+
+The implementer also added a `depth_source` badge to `OpportunitiesTable` that the brief did NOT ask
+for, reasoning that GUARDRAILS §1.7 applies wherever a number is shown. Correct reading of the rule.
+
+agent: T23 id=a123fd7b0682881a0 role=implementer model=sonnet
+outcome: T23 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+## Routing scorecard — measured, not asserted
+
+Ran `bin/routing_scorecard.py market-edge` and `--roles` against this kit. Two corrections to the
+ledger came out of it, both mine to make:
+
+1. The five remediation tasks (T21b-T21f) were being DROPPED entirely -- "outcome for unknown task id
+   'T21b' ignored" -- because the scorecard only scores task ids present in TASKS.md, and I had
+   dispatched them without adding entries. Five real dispatches with real briefs and real verify
+   results were invisible to the kit's own routing evidence. Added them to TASKS.md under a
+   `## Phase 3R` heading, explicitly marked as added during execution rather than by the architect.
+   Verdict moved from **18/24 first-try** to **23/29 first-try**, cheap-model review survival 69% ->
+   74%. The second number is the honest one; the first silently omitted six dispatches' worth of work.
+2. There were FIVE remediation tasks (T21b, T21c, T21d, T21e, T21f), not six. I said six more than
+   once during the run.
+
+### Per-role value, this kit (R8 roster)
+
+| Role | Dispatches | Findings | Confirmed | Precision | Marginal rate |
+|---|---:|---:|---:|---:|---:|
+| red-team | 5 | 32 | 28 | 88% | **425%** |
+| reviewer | 4 | 38 | 36 | **95%** | unmeasured |
+| security-auditor | 2 | 6 | 6 | 100% | 250% |
+| test-author | 2 | 6 | 5 | 83% | 200% |
+| second-verifier | 3 | 5 | 5 | 100% | 167% |
+| scout | 1 | 1 | 1 | 100% | 100% |
+| **verifier** | 2 | 3 | 2 | **67%** | **50%** |
+| implementer | 40 | -- | -- | n/a | n/a |
+
+THE ROSTER FINDING, and it is consistent with what happened in the run: **the plain `verifier` is the
+weakest role in this roster and the `red-team` is by far the strongest.** Red-team found 28 confirmed
+defects across 5 dispatches -- including the two severe money bugs (the cap blinded by a $0.50 untagged
+order, and the concurrent submit that lost a 900-lot) -- on code that had ALREADY passed both its
+verifier and a phase reviewer. The reviewer's 95% precision over 38 findings is the other standout.
+The verifier's 67% precision / 50% marginal rate says it mostly re-checked what the verify command
+already proved. For the next kit: keep `red-team` and `reviewer`, and consider spending the
+`verifier`'s budget on a second `red-team` pass instead. Sample sizes below the evidence floor are
+flagged `insufficient sample` by the tool and should be read as directional, not settled.
+
+### Process defect: implementers wrote their own ledger lines
+
+The scorecard reported `unrecognized agent line: 'agent: T21e role=implementer model=opus'` (and the
+same for T21d, T21f) -- lines lacking `id=`, written by the implementers themselves -- plus a stale
+`outcome: T23 ... review=pending run=2026-09-05` at NOTES.md:3773 carrying a review value outside the
+vocabulary and a run id missing its 4-hex suffix. All were harmless (the malformed `agent:` lines are
+ignored; the scorecard takes the LAST `outcome:` per task id, which was mine), but the ledger is
+EXECUTE-OWNED and an implementer writing to it can corrupt the kit's own evidence. Future kit briefs
+should tell implementers to append prose notes only, and never a line beginning `outcome:`, `agent:`,
+`reviewer:`, `defect:`, `reroute:` or `session:`.
+
+## Final review (Phase 4 + whole kit) — adjudication
+
+Reviewer left the tree byte-identical (114 porcelain lines before and after, one file written to
+`$TMPDIR`). Reproduced 728 passed, `alembic heads` 007, frontend gates green. All GUARDRAILS §6 drift
+checks clean, including the public-surface check diffed against `git show HEAD` (all 13 baseline
+`__all__` names survive verbatim; T22's six additions are strictly additive).
+
+**THE FINDING THAT MATTERS: the user's headline ask is dead code.** `scanner.near_resolution_pass()`
+is called from EXACTLY ONE place in the repo -- `tests/services/test_near_resolution.py`. Verified
+independently: every other hit in `backend/app` is a docstring reference. No Celery beat entry
+(`tasks/__init__.py` schedules only `scan_opportunities` -> `scan()`), no API route, no frontend caller.
+And the general path cannot substitute: `settlement_edge` is in the `"edge"` category so
+`ARBITRAGE_STRATEGIES` never runs it, and even forced via `?strategies=settlement_edge`, `scan()` calls
+`score()` WITHOUT `allow_past_close=True`, so `scoring.py:354` raises `UnscorableIntent` for every
+past-close market -- which is, by `scanner.py:57-91`'s own docstring, every settlement-edge intent.
+100% silently skipped.
+
+Everything built on that bucket is consequently INERT IN PRODUCTION though correct and well-tested:
+the `check_order_limits` bucket cap, `warn_unknown_bucket`, `_bucket_open_notional`, and the
+`Position.extra_data["bucket_notional"]` ledger T21e built to close a severe exploit. The exploit was
+real; the fence now guards a path nothing walks.
+
+The failure mode is the worst kind: an operator opens the Opportunities tab, filters `near_resolution`,
+sees an empty list, and concludes "no near-resolution edges right now". The truth is that no code path
+can produce one.
+
+**Two of my own adjudications were wrong, and the reviewer showed the work:**
+
+1. `pct_intents_downsized` -- I recorded the limitation as "misses the engine's own capital-cap
+   scale-down". INVERTED. `sweep.py:136-140` says the opposite and is correct: it measures "filled short
+   of what the STRATEGY asked for", which SUMS depth-driven and capital-cap-driven shortfall. It
+   OVER-counts. And it is contaminated in exactly the dimension a capital sweep varies:
+   `binary_complement_arbitrage` sets `size_contracts = min_position_size = 100` regardless of capital,
+   so the stamped request is FIXED, the engine's cash cap binds at low capital and vanishes at high, and
+   the series runs 16.7% -> 4.8% -> 1.0% -> 0.0% -> 0.0% DOWNWARD. That reads as "downsizing improves as
+   you deploy more capital" -- the precise inverse of the depth-exhaustion signal D12 exists to show.
+   It also fails PLAN R4's own tripwire ("must be > 0 at the top capital level on the synthetic
+   fixture") on the repo's shipped demo. `tests/backtesting/test_sweep.py:46-62` deliberately picks
+   `size_fraction=0.18 < max_position_pct=0.20` so the cap never binds -- it DODGES the confound rather
+   than characterizing it, which is why the suite is green while the demo trips the tripwire.
+2. The single-process constraint -- documented accurately, but `docker/backend/Dockerfile:83` ships
+   `CMD [... "--workers", "4"]`. Verified. `docker-compose.yml` is safe only BY ACCIDENT (its
+   `command:` override happens to be single-worker). Anyone building the image as written gets four
+   order-routing processes and both failure modes. An accepted limitation the repo already violates is
+   a live bug, not a limitation.
+
+**Fee-basis divergence (my deferral was right, but record the DIRECTION):** measured against the real
+models, the divergence is EXACTLY ZERO on Polymarket (linear, no per-fill rounding) and exists only on
+Kalshi. Crucially the two size-1.0 strategies OVERSTATE the fee (safe -- they reject genuine edges),
+while `cross_venue_arbitrage.py:680` UNDERSTATES it by up to 0.53c/contract, ~35% of its own
+`min_net_edge` gate of 0.015. So the one strategy erring toward ADMITTING marginal opportunities is
+also the one carrying real cross-venue settlement risk. Fix `cross_venue_arbitrage` first.
+
+reviewer: P4 model=opus findings=13 confirmed=11 result=accepted
+
+### T26
+
+Fixed the five defects the final review found, touching only `docker/backend/Dockerfile`, `CLAUDE.md`,
+`.claude/skills/kalshi-api/SKILL.md`, and `.claude/skills/polymarket-api/SKILL.md`. Read the cited
+source line for every claim before writing a correction; all of them held up against the current code.
+
+Defect 1 (the shipped image violating the one-process rule): confirmed `docker/backend/Dockerfile`'s
+production-stage `CMD` ran `--workers 4`, contradicting the Money Invariants section and the earlier
+Phase-4 review finding that the reviewer had already flagged as a live bug (see above). Changed it to
+`--workers 1` and added a comment at the `CMD` explaining that this is a money-safety requirement, not
+a tuning default, pointing at the `asyncio.Lock`-in-one-process constraint in `app/execution/router.py`
+and the reproduced 1802-vs-902 ledger loss, and telling a future maintainer not to raise it. Did not
+touch `docker-compose.yml` — its `backend` service builds this same stage with no `target:`, but its
+`command:` override already pins one worker, so no change was needed there; if a safe multi-worker
+deployment arrangement exists (e.g. sharding by venue into separate single-worker processes) it is not
+implemented here, per the brief's instruction not to invent one.
+
+Defect 2 (kill-switch variable name): confirmed `backend/app/config.py` binds the kill-switch path to
+the alias `KILL_SWITCH_PATH`, that `extra="ignore"` swallows the wrong name silently, and that
+`.env.example` already uses the correct name. Fixed `CLAUDE.md`'s Live Trading Fences block from
+`TRADING_KILL_SWITCH_PATH=...` to `KILL_SWITCH_PATH=...`, matching `.env.example`. Left `config.py`
+alone as instructed.
+
+Defect 3 (Kalshi orderbook encoding, 100x price error): confirmed `adapter.py`'s `_to_dollars`/`_levels`
+path treats the bare `yes`/`no` fields as legacy integer cents (divides by 100) and `yes_dollars`/
+`no_dollars` as the current fixed-point shape needing no conversion — the opposite of what the skill
+file's "Key Implementation Notes" item 1 said. Fixed that item to state the correct direction and to
+note that the encoding is decided by the field's own suffix, not by which top-level key
+(`orderbook_fp` vs `orderbook`) the container came from — the code checks suffixes inside the container
+regardless of the outer key. The separate §Order Book block later in the same file was already correct
+per the brief, so left it alone. Also added a new "Orders (Legacy — NO side and all cancels)" section
+documenting `POST /portfolio/orders` (`side="no"` + `action`) and `DELETE /portfolio/orders/{id}`,
+matching `backend/app/venues/kalshi/live.py`'s `ORDER_ROUTES` table and module docstring exactly,
+including that both are marked `verified=False` there because GUARDRAILS.md §1.4 blocks re-fetching
+kalshi.com/kalshi.co to confirm the legacy body shape — stated as an assumption, not a confirmed fact.
+
+Defect 4 (Polymarket fee and market-key errors): confirmed `adapter.py` divides `taker_base_fee`/
+`maker_base_fee` by `10_000` because those CLOB payload fields are basis points, and that
+`_fetch_clob_market` keys on `condition_id`, not `token_id`. Fixed the skill file's fee-override
+paragraph to say the fields are basis points and require the `/10_000` conversion before building a
+`FeeSchedule`, and fixed the `GET /markets/{token_id}` endpoint line to `GET /markets/{condition_id}`
+with a note distinguishing the market key from the per-outcome book key used by `/price`, `/midpoint`,
+and `/book`.
+
+Defect 5 (CLAUDE.md path/command/phantom-feature errors): confirmed `backend/app/api/__init__.py`
+mounts `trading.router` under `/trading` and that `frontend/src/services/api.ts` calls
+`/trading/orders` and `/trading/positions`; fixed the three REST endpoint lines accordingly. Confirmed
+`--cov-report=term-only` is not a valid pytest-cov choice and copied `backend/Makefile`'s
+`--cov-report=html --cov-report=term` form. Confirmed zero implementation of the five documented
+WebSocket events anywhere in the repo (backend or frontend; `socket.io-client` is an unused frontend
+dependency) and replaced that section with a note that it is not implemented rather than deleting it
+silently, so a reader isn't left wondering whether it was overlooked. Confirmed `frontend/package.json`
+has no `vitest`/`@testing-library` dependency and no `test` script, and corrected the Testing
+Requirements bullet to say so instead of claiming Vitest + RTL. Confirmed no `components.json` and no
+`components/ui/` directory anywhere in `frontend/`, and corrected the tech-stack bullet to stop
+claiming shadcn/ui. Confirmed `backend/tests/test_fences.py` exempts three files, not two —
+`LIVE_MODULES` (the two `live.py` files) plus `WRAPPER_MODULE` (`app/services/polymarket/client.py`,
+the sanctioned wrapper around `py_clob_client`) — and rewrote the Money Invariants bullet to name all
+three and point at `test_fences.py`'s own `LIVE_MODULES`/`WRAPPER_MODULE` names rather than
+understating the allow-list.
+
+Ran the four required gate checks after all edits; all four passed (`Money Invariants` appears exactly
+once in `CLAUDE.md`, `I_UNDERSTAND_REAL_MONEY` and `test_fences.py` are still present in `CLAUDE.md`,
+`external-api.kalshi.com` is still present in the Kalshi skill file). Confirmed via `git status
+--porcelain` and `git diff --stat` that no file under `backend/` or `frontend/` was touched by this
+task — the large diff there (62 files, thousands of lines) predates this session and belongs to other
+agents' concurrent work per the brief's own note about the ambient diff. `docker-compose.yml` shows no
+diff because no change to it was needed. Ran no backend/frontend command, no `alembic`, no `docker`, and
+made no network requests, per the task's constraints.
+
+### T26 adjudication (orchestrator)
+
+Verified in the tree: `docker/backend/Dockerfile:93` now `--workers 1` with a comment naming the
+money-safety reason and explicitly warning against raising it (the portable fix is separate
+deployments, not more workers in-process) -- which matters, because the bare flag would otherwise read
+as a tuning default and get "optimized" back. `CLAUDE.md:328` now `KILL_SWITCH_PATH`, agreeing with
+`.env.example:178` and `config.py`'s actual alias. All four gate greps still pass. The Polymarket skill
+now states the basis-points division explicitly and names the consequence ("Skipping the division is a
+10,000x fee error") rather than just correcting the line -- the right way to write a doc fix, because
+the next reader learns why the rule exists.
+
+`docker-compose.yml` correctly left untouched: its `command:` override already pins single-worker, so
+there was nothing to fix. The implementer said so rather than editing it to look thorough.
+
+Every claim in the brief held against the source; nothing was left unfixed and nothing was found wrong.
+
+agent: T26 id=afc4de280b12979a4 role=implementer model=sonnet
+outcome: T26 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T27
+
+Confirmed both defects against repo reality before touching anything. `backend/app/tasks/backtesting.py`'s
+`build_report()` (lines ~28-76) writes `depth_source`, `fill_at`, and a `coverage` census into
+`BacktestRun.report` for every completed run, ordinary or sweep; `backend/app/api/routes/backtesting.py`'s
+`GET /backtests/{id}` returns it verbatim as `BacktestStatusResponse.report`. `frontend/src/hooks/
+useBacktesting.ts` already exposed `report` from that endpoint, but `Backtesting.tsx` only read
+`backtest.report?.edge_decay` to decide whether to render `EdgeDecayTable`, and never passed `report` to
+`BacktestResults.tsx`, which had no such prop. So a completed, non-sweep backtest rendered its full metrics
+and equity curve with `depth_source`/`fill_at` computed and available in the payload but displayed nowhere
+— exactly the §1.7 gap the brief described. One correction to the brief's framing: `build_report()` does
+NOT write `unmarked_positions` into a single run's top-level report (only `edge_decay.rows[].
+unmarked_positions` per sweep-level capital row, via `backend/app/services/backtesting/sweep.py`) — I
+modeled `unmarked_positions` on the frontend's `BacktestReport` type as optional and render it
+defensively when present, but on today's backend it will not currently appear for an ordinary run. Said so
+plainly in the type's doc comment (`frontend/src/types/index.ts`) rather than silently implementing a
+badge that can never fire, since the brief's own acceptance criterion #3 calls that out as the same defect
+in a new place.
+
+Fix for Defect 1: extended `BacktestReport` (`frontend/src/types/index.ts`) with optional `depth_source`,
+`fill_at`, `unmarked_positions`. Extracted the two visible-badge components (`DepthSourceBadge`,
+`FillAtBadge`) that `EdgeDecayTable.tsx` already implemented correctly out into a new shared file,
+`frontend/src/components/backtesting/DepthBadges.tsx`, and had both `EdgeDecayTable.tsx` and the newly
+labeled `BacktestResults.tsx` import from there, so the two surfaces render an identical label for an
+identical value instead of two copies of the same logic drifting apart. Added a `report` prop to
+`BacktestResults.tsx` and render a banner as the FIRST element of the completed-results view (before the
+metric cards, unconditionally visible, no hover/click/expand) whenever `report.depth_source` or
+`report.fill_at` is defined: it shows "Depth source: <badge>" and "Fill at: <badge>", using the same
+warning-styled badge for `synthetic`/`mixed`/`same` and the same neutral muted badge for `recorded`/`next`
+that `EdgeDecayTable` already used. A non-empty `unmarked_positions` array additionally renders a warning
+badge reading "<n> position(s) unmarked — equity curve partly fictional". Wired `Backtesting.tsx` to pass
+`report={backtest.report}` into `<BacktestResults>` (previously it passed no such prop at all). Reachability:
+for a `depth_source="recorded"`, `fill_at="next"` ordinary run, the banner still renders (report keys are
+defined) but with the neutral muted badges reading literally "recorded"/"next" — no warning styling, so a
+clean run doesn't look alarming. For a `depth_source="synthetic"`, `fill_at="same"` run, the same banner
+renders the warning-styled "synthetic" and "same" badges with an explanatory `title` tooltip (the visible
+text itself, not the tooltip, is what satisfies §1.7). A pre-migration-003 run whose `report` is `{}` shows
+no banner at all (both keys undefined) rather than fabricating a "recorded" default — deliberate, per the
+existing docstring on `BacktestStatusResponse.report` that an empty dict means "predates report capture,"
+not "known safe."
+
+Fix for Defect 2: the unguarded `report.rows.map(...)` in `EdgeDecayTable.tsx` (previously line 162) is the
+literal white-screen risk — `GET /backtests/{id}/edge-decay` is `-> dict[str, Any]` on the backend with no
+schema validation before the JSONB column reaches the frontend. Chose both remedies the brief offered,
+since they cover different failure classes: (1) a defensive `Array.isArray(report.rows)` check right after
+the existing `isError || !report` guard, rendering a readable "edge-decay report is malformed" message
+instead of calling `.map` on something that isn't an array — this is the direct fix for the named crash
+site, and I extended the same defensiveness to the per-row `unmarked_positions.length`/`.join` calls a few
+lines down (`Array.isArray(row.unmarked_positions) && ...`), since `rows` being an array doesn't guarantee
+every element's shape is sound. (2) A new `frontend/src/components/ErrorBoundary.tsx` (class component,
+`getDerivedStateFromError`/`componentDidCatch`), wrapped around `<Backtesting />` in `App.tsx` — this is
+the backstop for the app-wide claim in the brief ("there is no error boundary anywhere in the app"): any
+other unguarded payload assumption anywhere under the backtesting surface degrades to a scoped "something
+went wrong" message with a retry button instead of a blank page. Did not type anything as `any` to get
+here — `report.rows`/`row.unmarked_positions` keep their declared types (`EdgeDecayRow[]`, `string[]`) and
+`Array.isArray` narrows at the call site instead.
+
+Verification: `cd frontend && npx tsc -p tsconfig.app.json --noEmit && npm run lint` — both exit 0.
+`grep -rn ": any\b" frontend/src` — no matches. `git status --porcelain` shows a large ambient diff outside
+`frontend/` (other tasks' concurrent work, consistent with the brief's warning) plus a large ambient diff
+inside `frontend/src` predating this session; distinguished by `stat -f "%Sm"` mtimes — every file this
+task actually touched (`App.tsx`, `types/index.ts`, `services/backtestApi.ts`,
+`components/backtesting/{Backtesting,BacktestResults,EdgeDecayTable}.tsx`, plus the two new files
+`components/ErrorBoundary.tsx` and `components/backtesting/DepthBadges.tsx`) carries a ~19:58-20:00
+timestamp, distinct from the ~19:30-19:35 ambient files it sits alongside. Ran no backend command, no
+`alembic`, set no `TRADING_MODE`.
+
+### T27 adjudication (orchestrator)
+
+Verified: `tsc` 0, `npm run lint` 0, `: any` still empty, `Backtesting.tsx:136` now passes
+`report={backtest.report}` (it previously passed nothing), and `DepthBadges.tsx` extracts the badge
+components so the sweep table and the ordinary-results banner render from ONE implementation rather
+than two that can drift. An `ErrorBoundary` now wraps `<Backtesting />`; there was none anywhere in the
+app before.
+
+Good judgment on the default: a pre-migration `report={}` renders NO banner rather than defaulting to
+"recorded". Defaulting would have been the §1.7 violation in a new costume -- an unlabeled synthetic run
+displaying a confident "recorded" badge is strictly worse than displaying nothing.
+
+**MY BRIEF WAS WRONG AND THE IMPLEMENTER CAUGHT IT.** I told it to "surface `unmarked_positions` if the
+payload carries it". Verified in the tree: `app/tasks/backtesting.py:51-52` writes ONLY `depth_source`
+and `fill_at` into an ordinary run's report. `unmarked_positions` appears only per-row inside a sweep's
+`edge_decay`. Rather than shipping a badge that could never fire, it modeled the field as optional and
+documented the gap in the type's doc comment.
+
+**NEW LOOSE END, discovered by that correction:** T21d added `BacktestResult.unmarked_positions`
+specifically so that a partly-fictional equity curve announces itself -- and `build_report()` DROPS it
+at the persistence boundary. The field is computed in-process, logged at WARNING, then never persisted,
+so `GET /backtests/{id}` cannot return it and no UI can ever show it. The in-process half of T21d's
+observability fix works; the persisted half does not exist. One line in `tasks/backtesting.py`. Batched
+rather than dispatched immediately, to avoid a fifth concurrent agent for a one-line change.
+
+agent: T27 id=ac7f1583b0d58e598 role=implementer model=sonnet
+outcome: T27 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5

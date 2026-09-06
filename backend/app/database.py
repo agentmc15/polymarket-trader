@@ -2,12 +2,12 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import NullPool
 
 from app.config import settings
 
@@ -72,7 +72,7 @@ async def init_db() -> None:
     """
     async with engine.begin() as conn:
         # Just verify we can connect
-        await conn.execute("SELECT 1")
+        await conn.execute(text("SELECT 1"))
 
 
 async def close_db() -> None:

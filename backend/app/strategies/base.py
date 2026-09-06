@@ -3,7 +3,153 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
+
+from app.utils.time import ensure_aware, utcnow
+from app.venues.types import OrderBook, OrderSide, VenueId
+
+#: Shape of an `Intent` (PLAN.md D7):
+#: - `"single"`: one leg, back-compat with a plain `Signal` (`Signal.to_intent()`).
+#: - `"complement"`: 2 legs, same venue+market, outcomes `{"YES", "NO"}` —
+#:   `binary_complement_arbitrage`.
+#: - `"cross_venue"`: 2 legs on different venues — cross-venue complement arb
+#:   (PLAN.md D8): YES on venue A + NO on venue B.
+#: - `"bundle"`: >= 3 legs, same market, distinct outcomes —
+#:   `multi_outcome_bundle_arbitrage`.
+IntentKind = Literal["single", "complement", "bundle", "cross_venue"]
+
+#: Execution semantics for an `Intent`'s legs: `"all_or_none"` means every leg
+#: must fill or the whole intent is unwound; `"best_effort"` accepts partial
+#: execution. T08 is where this is actually enforced; T06 only carries it.
+AtomicityMode = Literal["all_or_none", "best_effort"]
+
+#: `Intent.metadata` key by which a strategy declares that its intent may
+#: be DOWNSIZED to what the poorer venue can fund, rather than rejected
+#: outright, when a venue comes up short at reserve time
+#: (`app.execution.router.OrderRouter._downsize_to_capital`).
+#:
+#: Opt-in, and it is the STRATEGY's call to make, because only the
+#: strategy knows whether its edge is scale-free. A cross-venue or
+#: same-venue complement held to resolution earns a fixed edge PER
+#: CONTRACT, so a smaller pair is the same trade at a smaller size —
+#: `min(available_A / ask_A, available_B / ask_B, max_contracts)` (PLAN.md
+#: D8) is a BOUND on the size, and turning that bound into a refusal
+#: throws away a trade the capital could actually support. A directional
+#: single-leg bet is the opposite: the size was chosen deliberately
+#: against a view, and silently placing a third of it is a different
+#: trade, so it must still be rejected. The router therefore downsizes
+#: only for intents carrying this key, and every leg is scaled to the SAME
+#: contract count so the hedge is never left lopsided.
+DOWNSIZE_TO_CAPITAL_KEY = "downsize_to_capital"
+
+#: Canonical spelling for a binary market's two outcomes, keyed by their
+#: case-folded form. `normalize_outcome()` below is the ONLY table this
+#: maps through; every other outcome name (e.g. a multi-outcome bundle's
+#: named outcome such as `"Trump"`) keeps the venue's own casing.
+_CANONICAL_BINARY_OUTCOMES: dict[str, str] = {"yes": "YES", "no": "NO"}
+
+
+def normalize_outcome(outcome: str) -> str:
+    """Return the DISPLAY label for an outcome name.
+
+    An outcome name has two jobs, and T21d (NOTES.md) split them because
+    conflating them was a money bug:
+
+    - a DISPLAY label — what the venue called this outcome, which belongs
+      in the UI, in a `TradeRecord`, and in a log line. THIS function.
+    - an IDENTITY — what two references to the same outcome must agree
+      on so they land on the same dict key, position id, or database
+      row. `outcome_key()` below, and nothing else.
+
+    As a display label the only thing worth canonicalizing is the
+    binary pair, because the two venues genuinely disagree about it:
+    Polymarket's Gamma payload spells outcomes `"Yes"`/`"No"` verbatim
+    (`app/venues/polymarket/adapter.py`) while Kalshi's adapter forces
+    `"YES"`/`"NO"`, and every strategy in this kit hardcodes uppercase.
+    A multi-outcome bundle's named outcome (`"Trump"`) is NOT a casing
+    convention this function owns — a venue that capitalizes a candidate
+    name one way is not making an error, and rewriting it would put a
+    label on the screen that no venue ever printed.
+
+    Surrounding whitespace is the one thing this DOES strip for every
+    label, binary or not (T21d defect 5b): a leading or trailing space
+    is never part of what a venue meant to call an outcome, it is a
+    serialization artifact, and leaving it in place produced a `Leg`
+    whose `"Trump "` was a different outcome from its own market's
+    `"Trump"` — distinct enough to defeat `Intent`'s bundle
+    distinct-outcome check and every identity built downstream.
+
+    Args:
+        outcome: Outcome name as supplied by a strategy or venue
+            payload, e.g. `"Yes"`, `"yes"`, `"YES"`, or an arbitrary
+            multi-outcome bundle name like `"Trump"`.
+
+    Returns:
+        str: `"YES"`/`"NO"` for any case-insensitive spelling of
+            either; otherwise `outcome` with surrounding whitespace
+            stripped and its casing untouched.
+    """
+    stripped = outcome.strip()
+    return _CANONICAL_BINARY_OUTCOMES.get(stripped.casefold(), stripped)
+
+
+def outcome_key(outcome: str) -> str:
+    """Return the canonical IDENTITY for an outcome name.
+
+    T21d (NOTES.md). This is the ONE canonicalization every site that
+    KEYS on an outcome must use: `Backtester._current_prices`'s keys,
+    `Position.position_id`, `Intent`'s bundle distinct-outcome check,
+    `BookSnapshot.outcome` at persist, and
+    `DataReplayer._get_recorded_book`'s lookup. Two references to the
+    same outcome agree here or they are, silently, two different
+    outcomes.
+
+    WHY THIS IS NOT `normalize_outcome()`. Before T21d one function
+    served both jobs, and it was case-insensitive for `"YES"`/`"NO"`
+    only. That was defensible while binary markets were the only
+    markets; T21 gave arbitrary outcome labels first-class depth
+    (`BookSnapshot`) and first-class positions (a bundle leg), and the
+    asymmetry became a money bug: everything that RESOLVED an outcome
+    case-folded it, while everything that KEYED on one did not. A
+    position `outcome="TRUMP"` therefore keyed
+    `polymarket:M:TRUMP` while the payload's `"Trump"` keyed
+    `polymarket:M:Trump`, so `Portfolio.total_equity` fell through to
+    `pos.entry_price` and the position marked at its ENTRY PRICE
+    forever — word for word the `"Yes"`-vs-`"YES"` failure Phase-1 FIX 1
+    closed for binary markets, moved to the labels T21 added.
+
+    WHY TWO FUNCTIONS RATHER THAN ONE. Making `normalize_outcome()`
+    itself fold non-binary casing would fix the keys, but it is called
+    at nine sites that put its result on a SCREEN or in a record
+    (`Leg.outcome`, `Position.outcome`, `TradeRecord.outcome`,
+    `links.py`'s reviewer-supplied outcome map, `scanner.py`'s book
+    cache), and it would silently rewrite every venue's candidate name
+    to lower case there too. Identity and display are different
+    questions with different right answers, so they get different
+    functions; `normalize_outcome()` keeps its promise, and every key
+    goes through this one.
+
+    The binary pair keeps its canonical `"YES"`/`"NO"` spelling as its
+    identity rather than folding to `"yes"`/`"no"`, so every identity
+    already written down (`"polymarket:M:YES"`, every `BookSnapshot`
+    row, every test's expected position id) is byte-identical to what
+    it was before T21d. Only non-binary labels change, and those had no
+    working identity to preserve.
+
+    Args:
+        outcome: Outcome name in any spelling, e.g. `"Yes"`, `"TRUMP"`,
+            `"Trump "`.
+
+    Returns:
+        str: `"YES"`/`"NO"` for the binary pair; otherwise the label
+            stripped of surrounding whitespace and case-folded, so
+            `"TRUMP"`, `"Trump"`, `"trump"` and `"Trump "` all key
+            identically.
+    """
+    normalized = normalize_outcome(outcome)
+    if normalized in _CANONICAL_BINARY_OUTCOMES.values():
+        return normalized
+    return normalized.casefold()
 
 
 class SignalType(str, Enum):
@@ -26,7 +172,11 @@ class Signal:
         price: Target execution price.
         size: Position size in dollars.
         confidence: Strategy confidence level (0.0 to 1.0).
-        timestamp: When the signal was generated.
+        timestamp: When the signal was generated. Aware UTC, defaulting
+            to `app.utils.time.utcnow()` — NOT `datetime.utcnow()`, which
+            returns a naive value that would blow up the moment it met a
+            tz-aware `PriceHistory.timestamp` or `MarketSnapshot`
+            (GUARDRAILS.md §4, PLAN.md R9).
         stop_loss: Optional stop loss price.
         take_profit: Optional take profit price.
         metadata: Additional signal metadata.
@@ -39,19 +189,266 @@ class Signal:
     price: float
     size: float
     confidence: float
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=utcnow)
     stop_loss: float | None = None
     take_profit: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate signal fields after initialization."""
+        """Validate signal fields after initialization.
+
+        Raises:
+            TypeError: If `timestamp` is not a `datetime`.
+            ValueError: If `timestamp` is naive, if `confidence` is
+                outside `[0, 1]`, if `size` is negative, or if `price` is
+                outside `[0, 1]`.
+        """
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError(f"Confidence must be between 0 and 1, got {self.confidence}")
         if self.size < 0:
             raise ValueError(f"Size must be non-negative, got {self.size}")
         if not 0.0 <= self.price <= 1.0:
             raise ValueError(f"Price must be between 0 and 1, got {self.price}")
+        ensure_aware(self.timestamp)
+
+    def to_intent(
+        self,
+        *,
+        venue: VenueId = "polymarket",
+        expected_resolution_ts: datetime | None = None,
+    ) -> "Intent":
+        """Convert this `Signal` into an equivalent one-leg `Intent` (PLAN.md D7).
+
+        This is the back-compat path: every strategy already written
+        against `Signal` keeps working unchanged, while the engine (and,
+        from T08, `OrderRouter`) can normalize on `Intent` as the single
+        execution unit. `size` (documented above as "Position size in
+        dollars") becomes `Leg.size_usd`; `Leg.size_contracts` is left
+        `None`.
+
+        `Signal` itself carries no `venue`/resolution-time field to pull
+        from, and this method has no snapshot to read one from either —
+        so BOTH must be supplied by the caller that DOES have the
+        triggering snapshot (Phase-1 remediation FIX 2 / FIX 4:
+        `Backtester._process_snapshot` calls this as
+        `result.to_intent(venue=snapshot.venue,
+        expected_resolution_ts=snapshot.end_date)`). Defaulting `venue`
+        to `"polymarket"` (matching `Leg.venue`'s own default) preserves
+        every existing caller that constructs a `Signal` and converts it
+        with no snapshot in hand at all (e.g. a unit test); a caller that
+        DOES have a snapshot must pass its `venue` explicitly, or every
+        leg silently becomes `"polymarket"` regardless of which venue's
+        data produced the signal — the exact defect FIX 2 closes.
+
+        Args:
+            venue: The venue to stamp on the resulting `Leg`. See above.
+            expected_resolution_ts: Stamped on the resulting `Intent`
+                verbatim (must be aware UTC if not `None` — enforced by
+                `Intent.__post_init__`). `None` when the caller has no
+                real resolution time to supply; never invented.
+
+        Returns:
+            Intent: `kind="single"`, one `Leg` on `venue`,
+                `hold_to_resolution=False`, `atomicity="best_effort"`,
+                `confidence` and `metadata` carried over unchanged.
+
+        Raises:
+            ValueError: If `self.type` is `SignalType.HOLD` — a HOLD
+                signal is not an order and has no `Leg` representation.
+        """
+        if self.type == SignalType.HOLD:
+            raise ValueError("cannot convert a HOLD signal to an Intent")
+
+        leg = Leg(
+            market_id=self.market_id,
+            outcome=self.outcome,
+            side="BUY" if self.type == SignalType.BUY else "SELL",
+            limit_price=self.price,
+            size_usd=self.size,
+            venue=venue,
+        )
+        return Intent(
+            kind="single",
+            legs=[leg],
+            hold_to_resolution=False,
+            atomicity="best_effort",
+            confidence=self.confidence,
+            expected_resolution_ts=expected_resolution_ts,
+            metadata=dict(self.metadata),
+        )
+
+
+@dataclass
+class Leg:
+    """One order-shaped component of a multi-leg `Intent` (PLAN.md D7).
+
+    A `Leg` is a strategy-layer intent, not yet a validated venue order —
+    `OrderRouter` (T14) is responsible for turning an approved `Intent`'s
+    legs into `app.venues.types.OrderRequest`s. Units follow GUARDRAILS.md
+    §4: `limit_price` is a probability in [0.0, 1.0]; sizes are contracts
+    (each pays $1.00 at resolution) or USD, never both.
+
+    Attributes:
+        market_id: Venue-native market identifier.
+        outcome: Outcome being traded, e.g. `"YES"`/`"NO"`. This is the
+            DISPLAY label: `normalize_outcome()` runs on it in
+            `__post_init__` (Phase-1 remediation FIX 1, extended by
+            T21d), so any case-insensitive spelling of `"yes"`/`"no"`
+            becomes `"YES"`/`"NO"` and surrounding whitespace is
+            stripped from every label — but a bundle's named outcome
+            keeps the venue's own casing. Everything that KEYS on this
+            leg's outcome (`Position.position_id`, `Intent`'s bundle
+            distinct-outcome check, the engine's `_current_prices` and
+            SELL-leg position lookup) runs it through
+            `outcome_key()` instead, so `"TRUMP"` and `"Trump"` are one
+            outcome no matter which venue spelled which.
+        side: `"BUY"` or `"SELL"`.
+        limit_price: Limit price, a probability in [0.0, 1.0].
+        size_contracts: Size in contracts, or `None` if not yet sized.
+        size_usd: Size in USD, or `None` if not yet sized. Exactly one of
+            `size_contracts`/`size_usd` may be set at construction; both
+            may be `None`, meaning this leg is sized later by
+            `BaseStrategy.calculate_position_size`.
+        venue: `"polymarket"` or `"kalshi"`. Defaults to `"polymarket"`
+            since same-venue legs (complement, bundle) are the common
+            case; a `cross_venue` intent's second leg must set this
+            explicitly.
+    """
+
+    market_id: str
+    outcome: str
+    side: OrderSide
+    limit_price: float
+    size_contracts: float | None = None
+    size_usd: float | None = None
+    venue: VenueId = "polymarket"
+
+    def __post_init__(self) -> None:
+        """Normalize `outcome` casing and validate the size fields.
+
+        Raises:
+            ValueError: If both `size_contracts` and `size_usd` are set.
+        """
+        self.outcome = normalize_outcome(self.outcome)
+        if self.size_contracts is not None and self.size_usd is not None:
+            raise ValueError(
+                "at most one of size_contracts/size_usd may be set at "
+                f"construction, got size_contracts={self.size_contracts!r} "
+                f"and size_usd={self.size_usd!r}"
+            )
+
+
+@dataclass
+class Intent:
+    """Multi-leg execution unit that replaces the one-leg `Signal` (PLAN.md D7).
+
+    `on_market_data` may return a `Signal` (back-compat, normalized via
+    `Signal.to_intent()`) or an `Intent` directly. `binary_complement_arbitrage`
+    emits a `"complement"` intent (YES+NO on one venue);
+    `multi_outcome_bundle_arbitrage` emits a `"bundle"` intent (N legs, one
+    market); cross-venue arbitrage emits a `"cross_venue"` intent (YES on
+    venue A, NO on venue B). Position ids downstream become
+    `f"{venue}:{market_id}:{outcome}"`.
+
+    Attributes:
+        kind: Intent shape — see `IntentKind`.
+        legs: The intent's `Leg`s. Validated against `kind` in
+            `__post_init__` (see there for the exact per-kind rules).
+        hold_to_resolution: If `True`, legs are held to market resolution
+            rather than closed early (PLAN.md D8: the riskless complement
+            form is buy-and-hold-to-resolution, not buy/sell).
+        atomicity: `"all_or_none"` or `"best_effort"` — see `AtomicityMode`.
+        confidence: Strategy confidence level, in [0.0, 1.0].
+        expected_resolution_ts: Aware UTC expected resolution time, or
+            `None` if unknown.
+        metadata: Additional intent metadata.
+
+    Raises (in `__post_init__`):
+        ValueError: If `legs` is empty, if `kind`'s per-kind leg
+            constraints are violated, or if `confidence` is out of
+            `[0.0, 1.0]`.
+        TypeError: If `expected_resolution_ts` is set but not a
+            `datetime`.
+        ValueError: If `expected_resolution_ts` is set but naive.
+    """
+
+    kind: IntentKind
+    legs: list[Leg]
+    hold_to_resolution: bool
+    atomicity: AtomicityMode
+    confidence: float
+    expected_resolution_ts: datetime | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate leg count/shape against `kind`, `confidence`, and
+        `expected_resolution_ts` (PLAN.md D7 / R9).
+        """
+        if len(self.legs) < 1:
+            raise ValueError("Intent must have at least one leg")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError(f"confidence must be between 0 and 1, got {self.confidence}")
+        if self.expected_resolution_ts is not None:
+            ensure_aware(self.expected_resolution_ts)
+
+        if self.kind == "complement":
+            if len(self.legs) != 2:
+                raise ValueError(
+                    f"complement intent must have exactly 2 legs, got {len(self.legs)}"
+                )
+            leg_a, leg_b = self.legs
+            if leg_a.venue != leg_b.venue:
+                raise ValueError("complement intent legs must be on the same venue")
+            if leg_a.market_id != leg_b.market_id:
+                raise ValueError("complement intent legs must be on the same market")
+            outcomes = {leg_a.outcome, leg_b.outcome}
+            if outcomes != {"YES", "NO"}:
+                raise ValueError(
+                    f"complement intent legs must be outcomes {{'YES', 'NO'}}, "
+                    f"got {outcomes}"
+                )
+        elif self.kind == "cross_venue":
+            if len(self.legs) != 2:
+                raise ValueError(
+                    f"cross_venue intent must have exactly 2 legs, got {len(self.legs)}"
+                )
+            leg_a, leg_b = self.legs
+            if leg_a.venue == leg_b.venue:
+                raise ValueError("cross_venue intent legs must be on different venues")
+            # Phase-1 remediation FIX 1: `complement` already required
+            # exactly {"YES", "NO"}; `cross_venue` had NO outcome check
+            # at all, so two YES legs (or any non-YES/NO pairing) on two
+            # venues would construct without complaint. `Leg.outcome` is
+            # normalized in its own `__post_init__`, which has already
+            # run by the time this reads it, so this check is meaningful
+            # regardless of which venue's casing convention produced it.
+            outcomes = {leg_a.outcome, leg_b.outcome}
+            if outcomes != {"YES", "NO"}:
+                raise ValueError(
+                    f"cross_venue intent legs must be outcomes {{'YES', 'NO'}}, "
+                    f"got {outcomes}"
+                )
+        elif self.kind == "bundle":
+            if len(self.legs) < 3:
+                raise ValueError(
+                    f"bundle intent must have at least 3 legs, got {len(self.legs)}"
+                )
+            venues = {leg.venue for leg in self.legs}
+            market_ids = {leg.market_id for leg in self.legs}
+            if len(venues) != 1 or len(market_ids) != 1:
+                raise ValueError("bundle intent legs must all be on the same market")
+            # T21d: distinctness is an IDENTITY question, so it is asked
+            # of `outcome_key()` and not of the display label. Two legs
+            # spelled `"Trump"` and `"trump"` are the SAME outcome
+            # bought twice, not a two-outcome bundle — and left
+            # undetected they would collapse onto one `position_id`
+            # downstream while the bundle's own arithmetic still assumed
+            # two independent legs.
+            outcome_keys = [outcome_key(leg.outcome) for leg in self.legs]
+            if len(set(outcome_keys)) != len(outcome_keys):
+                raise ValueError("bundle intent legs must have distinct outcomes")
+        elif self.kind != "single":
+            raise ValueError(f"unknown intent kind: {self.kind!r}")
 
 
 @dataclass
@@ -78,6 +475,10 @@ class MarketSnapshot:
         category: Market category.
         end_date: Market end date.
         resolution_rules: Market resolution criteria.
+        venue: `"polymarket"` or `"kalshi"`. Defaults to `"polymarket"`
+            (every snapshot predates T06 was single-venue).
+        book: Normalized `OrderBook` for this (market, outcome), if
+            available; `None` until depth is wired in (PLAN.md D10).
     """
 
     market_id: str
@@ -99,6 +500,21 @@ class MarketSnapshot:
     category: str | None = None
     end_date: datetime | None = None
     resolution_rules: str | None = None
+    venue: VenueId = "polymarket"
+    book: OrderBook | None = None
+
+    def __post_init__(self) -> None:
+        """Validate that `timestamp` is aware UTC.
+
+        This is the naive-datetime tripwire (PLAN.md R9): a naive
+        `timestamp` anywhere in the backtesting or execution path is a
+        defect, not an environment quirk (GUARDRAILS.md §4).
+
+        Raises:
+            TypeError: If `timestamp` is not a `datetime`.
+            ValueError: If `timestamp` is naive (`tzinfo is None`).
+        """
+        ensure_aware(self.timestamp)
 
     @property
     def mid_price(self) -> float:
@@ -158,17 +574,23 @@ class BaseStrategy(ABC):
         return self._is_initialized
 
     @abstractmethod
-    def on_market_data(self, snapshot: MarketSnapshot) -> Signal | None:
+    def on_market_data(self, snapshot: MarketSnapshot) -> Signal | Intent | None:
         """Process market data and optionally generate a trading signal.
 
         This is the main strategy logic method. Called for each market
         data update during backtesting or live trading.
 
+        A strategy may return a one-leg `Signal` (back-compat; the engine
+        normalizes it via `Signal.to_intent()`) or a multi-leg `Intent`
+        directly (PLAN.md D7) — e.g. `binary_complement_arbitrage` returns
+        a `"complement"` `Intent` with YES+NO legs.
+
         Args:
             snapshot: Current market state snapshot.
 
         Returns:
-            Signal if a trade should be executed, None otherwise.
+            Signal | Intent | None: A `Signal` or `Intent` if a trade
+                should be executed, `None` otherwise.
         """
         pass
 
@@ -193,10 +615,13 @@ class BaseStrategy(ABC):
         """
         pass
 
-    def on_trade_executed(self, trade: dict[str, Any]) -> None:
+    def on_trade_executed(self, trade: dict[str, Any]) -> None:  # noqa: ARG002
         """Called when a trade is successfully executed.
 
-        Override to implement post-trade logic like logging or state updates.
+        Override to implement post-trade logic like logging or state
+        updates. The base implementation only bumps `_trade_count`; `trade`
+        is unused here on purpose — it exists for overriders, not for this
+        base hook.
 
         Args:
             trade: Executed trade details including:
@@ -210,10 +635,13 @@ class BaseStrategy(ABC):
         """
         self._trade_count += 1
 
-    def on_position_closed(self, position: dict[str, Any], pnl: float) -> None:
+    def on_position_closed(self, position: dict[str, Any], pnl: float) -> None:  # noqa: ARG002
         """Called when a position is closed.
 
-        Override to implement position close logic like performance tracking.
+        Override to implement position close logic like performance
+        tracking. The base implementation only accumulates `_total_pnl`;
+        `position` is unused here on purpose — it exists for overriders,
+        not for this base hook.
 
         Args:
             position: Closed position details including:

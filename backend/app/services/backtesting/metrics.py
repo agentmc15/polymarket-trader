@@ -3,8 +3,8 @@
 Provides comprehensive risk-adjusted performance metrics for
 evaluating trading strategy results.
 """
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -310,18 +310,21 @@ def _resample_to_daily(
         return np.array([])
 
     # Group returns by date
-    daily_returns_dict: dict[datetime, list[float]] = {}
+    # Keyed by `date`, not `datetime`: the loop below buckets each
+    # timestamp by its CALENDAR DAY (`ts.date()`), so the key type has to
+    # be the type actually used or every lookup is a latent type error.
+    daily_returns_dict: dict[date, list[float]] = {}
 
-    for ts, ret in zip(timestamps, returns):
-        date = ts.date() if hasattr(ts, 'date') else ts
-        if date not in daily_returns_dict:
-            daily_returns_dict[date] = []
-        daily_returns_dict[date].append(ret)
+    for ts, ret in zip(timestamps, returns, strict=False):
+        day = ts.date() if hasattr(ts, 'date') else ts
+        if day not in daily_returns_dict:
+            daily_returns_dict[day] = []
+        daily_returns_dict[day].append(ret)
 
     # Compound intraday returns
     daily_returns = []
-    for date in sorted(daily_returns_dict.keys()):
-        day_returns = daily_returns_dict[date]
+    for day in sorted(daily_returns_dict.keys()):
+        day_returns = daily_returns_dict[day]
         # Compound: (1+r1) * (1+r2) * ... - 1
         compounded = np.prod([1 + r for r in day_returns]) - 1
         daily_returns.append(compounded)
@@ -358,7 +361,7 @@ def _calculate_drawdowns(
     current_duration = 0.0
     drawdown_start = None
 
-    for i, (ts, is_dd) in enumerate(zip(timestamps, in_drawdown)):
+    for ts, is_dd in zip(timestamps, in_drawdown, strict=False):
         if is_dd:
             if drawdown_start is None:
                 drawdown_start = ts

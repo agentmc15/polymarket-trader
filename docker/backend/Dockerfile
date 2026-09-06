@@ -79,5 +79,15 @@ USER appuser
 # Expose port
 EXPOSE 8000
 
-# Production command with multiple workers
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Production command — MUST stay single-worker. This is a money-safety
+# requirement, not a tuning default: CLAUDE.md "Money Invariants" states
+# that exactly one order-routing process may run, because the
+# near-resolution bucket cap and the position ledger are serialized by an
+# asyncio.Lock scoped to one event loop in one process
+# (app/execution/router.py). A second worker sharing the database can
+# breach the cap and lose filled positions to a concurrent-update
+# overwrite (reproduced: 1802 contracts filled at the venue vs. 902
+# recorded in the ledger). Do NOT raise --workers here; the portable fix
+# (optimistic concurrency on `positions`) is not implemented. Scale by
+# running separate deployments, not additional workers in this process.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

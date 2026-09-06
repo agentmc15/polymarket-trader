@@ -3,11 +3,9 @@
 Systematically trades high-probability outcomes to compound
 small gains with high win rate.
 """
-from datetime import datetime, timedelta
 from typing import Any
 
 from app.strategies.base import BaseStrategy, MarketSnapshot, Signal, SignalType
-
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # Minimum probability to consider a favorite
@@ -84,9 +82,11 @@ class FavoriteCompounderStrategy(BaseStrategy):
             return None
 
         # Check category preference
-        if self.config["preferred_categories"]:
-            if snapshot.category not in self.config["preferred_categories"]:
-                return None
+        if (
+            self.config["preferred_categories"]
+            and snapshot.category not in self.config["preferred_categories"]
+        ):
+            return None
 
         # Check liquidity
         if snapshot.volume_24h < self.config["min_liquidity"]:
@@ -108,11 +108,9 @@ class FavoriteCompounderStrategy(BaseStrategy):
         if yes_prob >= no_prob:
             favorite_outcome = "YES"
             favorite_price = yes_prob
-            underdog_price = no_prob
         else:
             favorite_outcome = "NO"
             favorite_price = no_prob
-            underdog_price = yes_prob
 
         # Check probability thresholds
         if favorite_price < self.config["min_probability"]:
@@ -144,7 +142,6 @@ class FavoriteCompounderStrategy(BaseStrategy):
         # Calculate confidence
         confidence = self._calculate_confidence(
             favorite_price,
-            estimated_prob,
             edge,
             snapshot,
         )
@@ -208,7 +205,6 @@ class FavoriteCompounderStrategy(BaseStrategy):
     def _calculate_confidence(
         self,
         market_price: float,
-        estimated_prob: float,
         edge: float,
         snapshot: MarketSnapshot,
     ) -> float:
@@ -240,11 +236,10 @@ class FavoriteCompounderStrategy(BaseStrategy):
         self,
         signal: Signal,
         portfolio_value: float,
-        positions: dict[str, Any],
+        positions: dict[str, Any],  # noqa: ARG002 - interface parity
     ) -> float:
         """Calculate position size using Kelly criterion variant."""
-        # Get edge and probability from signal
-        edge = signal.metadata.get("edge", 0.02)
+        # Get probability and payout from signal
         prob = signal.metadata.get("estimated_probability", 0.90)
         payout = signal.metadata.get("payout_ratio", 0.1)
 

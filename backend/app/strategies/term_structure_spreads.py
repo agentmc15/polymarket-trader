@@ -3,11 +3,10 @@
 Trades spreads between related markets with different
 resolution dates (e.g., monthly vs quarterly).
 """
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from app.strategies.base import BaseStrategy, MarketSnapshot, Signal, SignalType
-
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # Minimum spread to trade

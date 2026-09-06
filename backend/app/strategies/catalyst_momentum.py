@@ -8,7 +8,6 @@ from typing import Any
 
 from app.strategies.base import BaseStrategy, MarketSnapshot, Signal, SignalType
 
-
 DEFAULT_CONFIG: dict[str, Any] = {
     # Minimum price change to trigger momentum signal
     "min_price_change": 0.05,

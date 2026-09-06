@@ -1,7 +1,7 @@
 """Price history model for backtesting (TimescaleDB hypertable)."""
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, Index, String, text
+from sqlalchemy import DateTime, Float, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base

@@ -25,7 +25,7 @@ def sync_prices() -> dict:
 
 
 @celery_app.task(name="app.tasks.market_sync.sync_orderbooks")
-def sync_orderbooks(market_ids: list[str] | None = None) -> dict:
+def sync_orderbooks(market_ids: list[str] | None = None) -> dict:  # noqa: ARG001
     """Sync orderbooks for specified markets.
 
     Args:
@@ -34,5 +34,9 @@ def sync_orderbooks(market_ids: list[str] | None = None) -> dict:
     Returns:
         dict: Sync results.
     """
-    # TODO: Implement orderbook sync
+    # TODO: Implement orderbook sync. `market_ids` is part of this
+    # Celery task's declared signature (callers already pass it by
+    # name), so it is kept and the unused-argument warning suppressed
+    # rather than the parameter removed — dropping it would break the
+    # task's published shape for a stub that is about to use it.
     return {"status": "success", "orderbooks_synced": 0}

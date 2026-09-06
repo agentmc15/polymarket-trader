@@ -12,7 +12,6 @@ Create a new trading strategy: $ARGUMENTS
    - Arbitrage: Cross-market price discrepancies
    - Momentum: Trend-following signals
    - Mean Reversion: Counter-trend signals
-   - Copy Trading: Following other traders
    - Event-Based: News/event-driven signals
    - Statistical: Quantitative signals
 

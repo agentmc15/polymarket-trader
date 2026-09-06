@@ -13,30 +13,6 @@ def reset_daily_stats() -> dict:
     return {"status": "success", "bots_reset": 0}
 
 
-@celery_app.task(name="app.tasks.bot_execution.execute_copy_trade")
-def execute_copy_trade(
-    trader_address: str,
-    trade_data: dict,
-    follow_config: dict,
-) -> dict:
-    """Execute a copy trade based on tracked trader activity.
-
-    Args:
-        trader_address: Address of trader being copied.
-        trade_data: Original trade details.
-        follow_config: Copy trading configuration.
-
-    Returns:
-        dict: Execution results.
-    """
-    # TODO: Implement copy trade execution
-    return {
-        "status": "success",
-        "trader": trader_address,
-        "executed": False,
-    }
-
-
 @celery_app.task(name="app.tasks.bot_execution.check_stop_loss")
 def check_stop_loss() -> dict:
     """Check and execute stop-loss orders for all positions.
