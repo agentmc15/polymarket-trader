@@ -35,7 +35,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from app.api.deps import AsyncSessionDep, MarketDataAdaptersDep
@@ -181,6 +181,15 @@ class ApproveRequest(BaseModel):
     outcome map would build legs whose position ids match nothing (T18).
     """
 
+    #: T33: an unknown body key is a 422 naming the field, never a
+    #: silently discarded value. See `app.api.routes.backtesting.
+    #: BacktestRequest`'s docstring for the full rationale. It matters
+    #: doubly here: this body is one half of a HUMAN REVIEW record, and
+    #: a misspelled `reviewed_by`/`outcome_map` that vanished silently
+    #: would attribute an approval to nobody, or approve a non-binary
+    #: pair with no outcome map at all.
+    model_config = ConfigDict(extra="forbid")
+
     reviewed_by: str = Field(min_length=1, max_length=100)
     notes: str = Field(default="", max_length=4000)
     outcome_map: dict[str, str] | None = None
@@ -193,6 +202,11 @@ class RejectRequest(BaseModel):
     in this table: "Kalshi settles on the AP call, Polymarket on state
     certification" is knowledge no score can rediscover.
     """
+
+    #: T33, same rule and same reason as `ApproveRequest` above: a
+    #: misspelled `notes` key would throw away exactly the text this
+    #: model exists to capture.
+    model_config = ConfigDict(extra="forbid")
 
     reviewed_by: str = Field(min_length=1, max_length=100)
     notes: str = Field(default="", max_length=4000)

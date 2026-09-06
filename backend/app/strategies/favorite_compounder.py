@@ -5,7 +5,14 @@ small gains with high win rate.
 """
 from typing import Any
 
-from app.strategies.base import BaseStrategy, MarketSnapshot, Signal, SignalType
+from app.strategies.base import (
+    EDGE_BASIS_DIRECTIONAL,
+    EDGE_BASIS_KEY,
+    BaseStrategy,
+    MarketSnapshot,
+    Signal,
+    SignalType,
+)
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # Minimum probability to consider a favorite
@@ -162,9 +169,21 @@ class FavoriteCompounderStrategy(BaseStrategy):
                 "is_favorite": True,
                 "market_probability": favorite_price,
                 "estimated_probability": estimated_prob,
+                # `edge` here is a DIRECTIONAL mispricing estimate
+                # (estimated_prob - favorite_price), not the fee-netted,
+                # settlement-realized, per-contract USD figure
+                # `app.strategies.base.SCORING_EDGE_KEY` means (T34,
+                # NOTES.md). It happens to share that key's spelling
+                # for historical reasons -- `calculate_position_size`
+                # and `_calculate_confidence` below both read it as a
+                # probability gap, not a dollar amount. `EDGE_BASIS_KEY`
+                # says so explicitly, so `app.services.scoring.score()`
+                # refuses this intent instead of reading `edge` as a
+                # riskless arbitrage edge and ranking it as one.
                 "edge": edge,
                 "expected_value": expected_value,
                 "payout_ratio": payout_ratio,
+                EDGE_BASIS_KEY: EDGE_BASIS_DIRECTIONAL,
             },
         )
 

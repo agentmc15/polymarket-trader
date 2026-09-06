@@ -77,20 +77,15 @@ The queue from the final review is **cleared**. What was item 1-7 is now:
 
 ### Open, lower priority
 
-1. **`extra="ignore"` hides client mistakes.** The slippage bug (client posted `slippage_bps`, backend
-   wanted `slippage_value`, FastAPI silently discarded it, so every backtest used default slippage)
-   and the earlier `TRADING_KILL_SWITCH_PATH` bug are the same shape. **Every request model with
-   pydantic's default `extra="ignore"` is a place a client can be wrong without being told.** Worth a
-   systematic sweep.
-2. **`edge_basis` is persisted but not a first-class `OpportunityOut` column.** It reaches
-   `/opportunities` inside the payload's `metadata`, not as a typed field.
-3. **`favorite_compounder` / `no_bias_exploit` publish an `"edge"` that is a directional mispricing.**
-   Unscored today, but it would mean the wrong thing under T31's new contract if either joins a
-   scanner pass.
-4. **Only 4 of 15 `TradeMetrics`/`RiskMetrics` fields are populated** by `get_backtest_status`. Typed
-   but deliberately unrendered, so the UI never shows an unpopulated metric as a real `0.00`.
-5. **Scan request volume** — ~800 sequential `get_book` calls per scan pass every 120s.
-6. **`mypy`**: one untyped-celery-decorator finding on the new task module, identical to what all four
+The six items listed here at the last pause are **all closed** (T33/T34/T35). What remains:
+
+1. **`frontend/src/types/index.ts` types all 15 metrics fields as `number`; 11 can now be `null`.**
+   Nothing renders wrongly today (only the 4 column-backed ones are shown), but those interfaces need
+   `number | null`.
+2. **`win_rate` / `sharpe_ratio` / `max_drawdown` still coerce a NULL column to `0.0`.** Left that way
+   deliberately — the frontend does `max_drawdown * 100` with no null guard, so nulling them before
+   the frontend change would trade a silent zero for a rendered one. **Do item 1 first**, then this.
+3. **`mypy`**: one untyped-celery-decorator finding on the new task module, identical to what all four
    existing task modules report. Left unsilenced deliberately.
 
 ---

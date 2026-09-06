@@ -2,7 +2,7 @@
 from typing import Any
 
 from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.deps import AsyncSessionDep
 
@@ -10,7 +10,12 @@ router = APIRouter()
 
 
 class BotConfig(BaseModel):
-    """Bot configuration schema."""
+    """Bot configuration schema — the body of `POST`/`PUT /bots`."""
+
+    #: T33: an unknown body key is a 422 naming the field, never a
+    #: silently discarded value. See `app.api.routes.backtesting.
+    #: BacktestRequest`'s docstring for the full rationale.
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     strategy_id: str

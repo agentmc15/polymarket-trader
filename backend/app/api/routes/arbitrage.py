@@ -22,11 +22,13 @@ surface rather than adding one.
 
 Every payload item carries `net_edge`, `annualized_return`,
 `hours_to_resolution`, `fill_confidence`, `resolution_risk`,
-`capital_lockup_usd`, `composite` (PLAN.md D10) PLUS `depth_source` and
-`link_status` (GUARDRAILS.md §1.7 / PLAN.md D9): an opportunity scored
-against `synthesize_book`'s invented depth, or one built on a
-`"proposed"` (unexecutable) event link, must say so in the payload
-itself — an operator reading this endpoint has no other way to tell.
+`capital_lockup_usd`, `composite` (PLAN.md D10) PLUS `depth_source`,
+`link_status` and `edge_basis` (GUARDRAILS.md §1.7 / PLAN.md D9): an
+opportunity scored against `synthesize_book`'s invented depth, one built
+on a `"proposed"` (unexecutable) event link, or one whose edge rests on
+an ESTIMATED identity probability rather than on observed prices alone,
+must say so in the payload itself — an operator reading this endpoint
+has no other way to tell.
 """
 from datetime import datetime
 from typing import Any
@@ -56,9 +58,28 @@ class OpportunityOut(BaseModel):
     """One scored, persisted opportunity — PLAN.md D10's payload contract.
 
     Every field named in T19's acceptance line is present and typed
-    `float` (never `None`), plus `link_status`/`depth_source` (see the
-    module docstring) and enough identity (`id`, `strategy`, `kind`,
-    `legs`) for a caller to act on the row without a second lookup.
+    `float` (never `None`), plus `link_status`/`depth_source`/
+    `edge_basis` (see the module docstring) and enough identity (`id`,
+    `strategy`, `kind`, `legs`) for a caller to act on the row without a
+    second lookup.
+
+    Attributes:
+        edge_basis: `app.services.scoring.OpportunityScore.edge_basis`,
+            promoted out of the generic `metadata` blob to a column of
+            its own (T33). `"observed_costs"` means every term of
+            `net_edge` is an observed price or a published fee/gas rate;
+            `"identity_estimated"` means it also carries a haircut
+            driven by the MATCHER'S SIMILARITY SCORE, which is not a
+            calibrated probability. Two rows with the same `composite`
+            are the same expected return only to the extent that
+            estimate is calibrated, so a consumer sorting by `composite`
+            needs this beside the sort key, not buried in a dict.
+            `None` — never one of the two labels by default — when the
+            persisted row carries no basis at all (written before
+            `edge_basis` existed). Guessing `"observed_costs"` there
+            would make an unlabeled row indistinguishable from a
+            genuinely arithmetic one, which is the exact failure mode
+            GUARDRAILS.md §1.7 exists to prevent.
     """
 
     id: str
@@ -77,6 +98,7 @@ class OpportunityOut(BaseModel):
     composite: float
     link_status: str | None
     depth_source: str
+    edge_basis: str | None
     metadata: dict[str, Any]
 
 
@@ -205,6 +227,15 @@ def _opportunity_out_from_record(row: IntentRecord) -> OpportunityOut:
         composite=float(score.get("composite", 0.0)),
         link_status=score.get("link_status"),
         depth_source=str(score.get("depth_source", "synthetic")),
+        # NO DEFAULT LABEL. `depth_source` above can fall back to
+        # `"synthetic"` because that is the CONSERVATIVE reading of an
+        # absent value. `edge_basis` has no conservative default —
+        # `"observed_costs"` would understate the row's model risk and
+        # `"identity_estimated"` would invent a haircut that was never
+        # applied — so an unlabeled row reports `None` and says nothing.
+        edge_basis=(
+            str(score["edge_basis"]) if score.get("edge_basis") is not None else None
+        ),
         metadata=dict(row.extra_data or {}),
     )
 
@@ -239,6 +270,7 @@ def _opportunity_out_from_scored(item: ScoredIntent) -> OpportunityOut:
         composite=opportunity_score.composite,
         link_status=opportunity_score.link_status,
         depth_source=opportunity_score.depth_source,
+        edge_basis=opportunity_score.edge_basis,
         metadata=dict(item.intent.metadata),
     )
 

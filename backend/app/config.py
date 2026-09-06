@@ -407,6 +407,29 @@ class Settings(BaseSettings):
     # bps of tolerance would report a thick, perfectly-priced book as
     # unfillable over float noise alone.
     scan_top_n: int = Field(default=200, alias="SCAN_TOP_N")
+    # `scan_book_fetch_concurrency` bounds how many `get_book` calls
+    # `app.services.scanner.scan()` has IN FLIGHT AT ONCE, summed across
+    # every venue in `adapters` together (one shared semaphore, not one
+    # per venue — see `scan()`'s docstring for why a per-venue bound
+    # would not fix the problem this exists for). `scan_top_n`'s default
+    # of 200 markets x 2 outcomes x 2 venues means a single pass has up
+    # to 800 `get_book` calls to make. Awaited one at a time (T19's
+    # original shape) that is minutes of serialized HTTP round-trips —
+    # against TWO price feeds a cross-venue arbitrage signal claims are
+    # simultaneous, and against request budgets now shared by THREE
+    # beats (`scan_opportunities`, `scan_near_resolution`,
+    # `propose_event_links`), none of which publishes a limit generous
+    # enough to assume 800 back-to-back requests is safe. Unbounded
+    # concurrency (`asyncio.gather` over all 800 at once) trades that
+    # risk for a worse one: a burst indistinguishable from abuse to
+    # whatever is rate-limiting on the other end. This default is
+    # deliberately conservative rather than tuned for minimum wall time —
+    # enough overlap to turn "minutes" into low single-digit seconds
+    # without opening hundreds of sockets at once; lower it further if a
+    # venue's actual published limit (once known) demands it.
+    scan_book_fetch_concurrency: int = Field(
+        default=20, alias="SCAN_BOOK_FETCH_CONCURRENCY"
+    )
     scan_interval_s: float = Field(default=120.0, alias="SCAN_INTERVAL_S")
     near_resolution_scan_interval_s: float = Field(
         default=300.0, alias="NEAR_RESOLUTION_SCAN_INTERVAL_S"

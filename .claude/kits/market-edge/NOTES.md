@@ -4790,3 +4790,390 @@ mean the wrong thing under this contract if either ever joins a scanner pass.
 
 agent: T31 id=a549f9a8a67cfdf61 role=implementer model=opus
 outcome: T31 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T34
+
+The brief matched repo reality exactly, down to the T31 implementer's own closing paragraph
+predicting this exact gap: `favorite_compounder`/`no_bias_exploit` publish `"edge"` as a directional
+mispricing, unscored today only because neither is in `STRATEGY_CATEGORIES["arbitrage"]`. No
+`defect:` line. One thing worth recording that the brief did not name: `POST /arbitrage/scan` (a
+route file outside this task's scope) takes an arbitrary `strategies=` query list and only refuses
+`settlement_edge` by name — `?strategies=favorite_compounder` already reaches `scan()` -> `score()`
+today, with no category change needed at all. That makes the enforcement belong in `scoring.py`
+even more than the brief's framing suggested: a route-level allowlist would have missed a path that
+is already live, not merely one line away.
+
+I picked a combination of the brief's second and third options rather than either alone. A fourth
+`EDGE_BASIS_KEY` value, `EDGE_BASIS_DIRECTIONAL` (`app/strategies/base.py`), is the "declare the
+basis honestly" half — it says, in the same vocabulary `EDGE_BASIS_OBSERVED`/
+`EDGE_BASIS_IDENTITY_ESTIMATED` already use, "whatever this intent published under `SCORING_EDGE_KEY`
+is not that number." `favorite_compounder` and `no_bias_exploit` now stamp it alongside their
+existing `"edge"` key, unchanged — no trading-logic edit, just a label. The "scoring refuses rather
+than reading and hoping" half lives in `scoring._published_edge`, which now checks
+`intent.metadata.get(EDGE_BASIS_KEY)` before it ever reads `SCORING_EDGE_KEY`/
+`SCORING_EDGE_LEGACY_KEY`: a value outside `_SCORABLE_EDGE_BASES` (`{observed_costs,
+identity_estimated}`) raises `UnscorableIntent` immediately. Deliberately an ALLOWLIST rather than a
+check for the one literal string `"directional_mispricing"` — a fifth strategy inventing its own
+unrecognized basis value fails the same way, by default, without this module ever being taught its
+name. An intent that declares NO basis at all is untouched: absence stays the pre-T34 default (the
+plain per-unit edge), which is what keeps every existing test and all four legitimate strategies
+scoring identically. I rejected making `EDGE_BASIS_KEY` mandatory for any intent publishing
+`SCORING_EDGE_KEY` (the strict reading of the third option) because it would have required touching
+every pre-T31 test fixture and persisted-row shape that carries a bare `"edge"`/`"net_edge"` with no
+basis at all, for a guarantee this repo does not need yet — the two actual offenders are closed by
+name, and any future one is closed by the allowlist, without breaking backward compatibility on
+value absence.
+
+Regression: all 761 pre-existing tests pass unchanged, including every hand-computed `composite` in
+`tests/services/test_scoring.py` for the complement/bundle/cross-venue/settlement_edge shapes — none
+of those four declare an incompatible basis, so `_published_edge` falls through to the exact same
+two `if` branches it always had. Four new tests, none vacuous: the two refusal tests build a REAL
+`Signal` from the actual `FavoriteCompounderStrategy`/`NoBiasExploitStrategy.on_market_data()` (not a
+hand-assembled metadata blob), hand-verify its `"edge"` value first (0.02 and 0.06 respectively —
+0.02 not by coincidence, it is the identical digit-for-digit number
+`test_hand_computed_composite_for_a_complement_intent` scores a real `composite` for, which is the
+whole point: nothing about the metadata SHAPE distinguishes the two), then assert `score()` raises
+with the market/context otherwise fully valid so the refusal is provably `_published_edge`'s and not
+an unrelated `UnscorableIntent` path. A third test uses an arbitrary unrecognized basis string to
+prove the allowlist generalizes past the one named constant. A fourth pins that an intent declaring
+no basis at all still scores exactly as before (`net_edge=0.03`, `edge_basis=observed_costs`) —
+the regression half the brief called out as equally important as the refusal.
+
+Red-green, both ways. A full revert of all four behavioural files to HEAD in a `$TMPDIR` copy
+produced an `ImportError` at collection (`EDGE_BASIS_DIRECTIONAL` does not exist pre-fix) — a valid
+red, but one that proves the tests depend on the change existing at all rather than pinning a
+behavior. So I also ran a narrower revert: `base.py` and both strategy files left at their new
+(fixed) versions in the copy, only `scoring.py` reverted to HEAD. That isolates the actual
+discriminating change. Result: the two refusal tests and the unrecognized-basis test failed with
+`Failed: DID NOT RAISE <class 'app.services.scoring.UnscorableIntent'>` — `score()` silently
+produced a ranked `OpportunityScore` for a directional intent, which is the T34 defect itself,
+reproduced on demand — while the fourth (regression) test still passed, exactly as it should since
+it exercises no code path the fix touches. Restoring `scoring.py` and re-running the same four gave
+4 passed; the full suite from the real working tree (never altered during this exercise) is 765
+passed, 0 failed.
+
+`ruff check` on the four touched app files plus the test file: clean. `mypy` on the same four app
+files: the same 5 pre-existing errors as HEAD (`favorite_compounder.py`/`no_bias_exploit.py`, all
+`no-any-return`/int-vs-float on lines this task never touched, confirmed by diffing mypy output
+against a `git stash` of my changes) — 0 new. `git status --porcelain` shows exactly
+`app/services/scoring.py`, `app/strategies/base.py`, `app/strategies/favorite_compounder.py`,
+`app/strategies/no_bias_exploit.py`, and `tests/services/test_scoring.py`; the other modified files
+in the tree (`app/api/routes/*`, `app/config.py`, `app/services/scanner.py`) are the two concurrent
+agents' in-progress work, untouched by me. No trading logic changed in either strategy — both still
+compute the exact same `edge`/`expected_value`/`confidence` numbers; the only addition is one
+metadata key per strategy and one guard clause in the scorer.
+
+### T34 adjudication (orchestrator)
+
+**MY BRIEF UNDERSTATED THE SEVERITY AND THE IMPLEMENTER CORRECTED IT.** I wrote that
+`favorite_compounder`/`no_bias_exploit` were "not scanned today... latent, not live", reasoning from
+`ARBITRAGE_STRATEGIES` being built off `STRATEGY_CATEGORIES["arbitrage"]`. Verified in the tree:
+`app/api/routes/arbitrage.py:352` takes `strategies: list[str] | None = Query(...)` -- an ARBITRARY
+list of registry names, not restricted to the category -- and `favorite_compounder` IS in `STRATEGIES`.
+So `POST /arbitrage/scan?strategies=favorite_compounder` already reached `scan()` -> `score()` and
+would have annualized a DIRECTIONAL mispricing as a settlement edge, ranking it against real arbitrage
+with nothing visibly wrong. Live and reachable, not latent. My reasoning covered the default beat path
+and I generalized it to "today" without checking the explicit-parameter path.
+
+The fix is at the SCORING layer, which closes it regardless of route -- the right level, since the
+route was outside the task's file set and a route-level fix would have left the next caller exposed.
+
+Design is an ALLOWLIST, not a blocklist, and that is the part worth keeping: `_published_edge()`
+checks `EDGE_BASIS_KEY` BEFORE reading the edge, and refuses any declared basis outside
+`_SCORABLE_EDGE_BASES = {observed_costs, identity_estimated}`. So a future strategy inventing its own
+basis string is refused BY DEFAULT rather than silently scored. An intent declaring no basis at all is
+untouched, which is what preserves all four legitimate strategies unchanged -- the regression half
+that matters, since an over-broad guard refusing real opportunities would be worse than the bug.
+
+Test construction worth copying: the refusal tests build real `Signal`s from the ACTUAL
+`FavoriteCompounderStrategy`/`NoBiasExploitStrategy.on_market_data()` rather than hand-rolled fixtures,
+and one deliberately uses a directional edge of **0.02 -- the same number as the legitimate arbitrage
+edge used elsewhere in the file** -- to demonstrate that the two metadata shapes are INDISTINGUISHABLE
+without the label. That is the defect made visible rather than merely asserted.
+
+Red-green done properly, including rejecting its own first attempt: a full 4-file revert gave
+`ImportError`, which the implementer correctly called "valid but non-discriminating" and redid --
+reverting ONLY `scoring.py` while keeping the new constants importable produced
+`DID NOT RAISE UnscorableIntent` on exactly the three refusal tests while the regression test still
+passed. An ImportError proves nothing about an assertion; this is the second task this session to
+notice that and correct for it.
+
+agent: T34 id=a05945f04a89c3138 role=implementer model=sonnet
+outcome: T34 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T35
+
+`scan()`'s book fetch was serial: up to `scan_top_n` (200) x 2 outcomes x 2 venues = 800 `get_book`
+calls, awaited one at a time, every `scan_interval_s` (120s default). Two risks stacked on that shape
+— rate-limit exposure now shared by three beats (`scan_opportunities`, `scan_near_resolution`,
+`propose_event_links`), and the sharper one: a cross-venue arbitrage signal claims two prices are
+inconsistent at the same moment, and a multi-minute serial walk can compare a book read at t=0 against
+one read at t=180s, manufacturing an "edge" that is a clock artifact rather than a real mispricing.
+
+Fix: `settings.scan_book_fetch_concurrency` (new field, default 20, conservative rather than
+throughput-tuned — no venue publishes a real limit to size against) bounds one `asyncio.Semaphore`
+shared across every venue in a pass, not one per venue. Every `(venue, market, outcome)` this pass
+needs a book for is fetched together under that one semaphore via `asyncio.gather`; `_fetch_book`
+catches `VenueError` INSIDE itself and returns `None` rather than letting it propagate, which is the
+part that actually matters for resilience — `gather`'s default `return_exceptions=False` cancels every
+other in-flight fetch (any venue) the instant one coroutine raises, so catching outside the gather (or
+matching the isolation only at the `list_markets` level, the way `near_resolution_pass`/the link-
+proposal beat's `_open_markets` do for THEIR one call per venue) would have turned "one bad book" into
+"every book this pass was fetching, from every venue, lost." Per-book isolation is unchanged from the
+serial code otherwise — still exactly one `except VenueError`, still logged at `debug`, still skipped
+without effect on any other book — and a wholly-unreachable venue gets the same treatment for free
+(all its books resolve to `None`) with no separate branch.
+
+One subtlety the brief didn't call out and I want on record: a SHARED semaphore alone does not fix the
+skew problem. `asyncio.Semaphore` queues blocked waiters FIFO in the order they first tried to acquire
+— the order `asyncio.gather`'s coroutines were listed in. A naive venue-by-venue spec list (every one
+of venue A's ~400 specs before venue B's first) would still let venue A monopolize the front of that
+queue, so venue B's earliest book could not even start until roughly `len(A's specs) / bound` admission
+waves had drained — reproducing "fetch A fully, then B" one layer down, which is the exact skew this
+task exists to close, just measured in fetch batches instead of minutes. Added `_interleave_fetch_specs`
+to round-robin every venue's fetch targets before handing them to `gather`, so every admitted batch
+contains a mix of venues from the first one. This is a scheduling-order change only — `books_by_key`
+(a dict) and `snapshots`' construction order (built separately, from the venue-ordered market lists, in
+a distinct Phase 3) are both untouched, so which opportunities a given fixture yields is unchanged.
+
+Measured skew: chose a single wall-clock timer around the whole concurrent fetch phase
+(`fetch_elapsed_s`, logged as `scan_book_fetch_complete` with `books_requested`/`books_fetched`/
+`concurrency_bound`), not a persisted per-book-pair skew table. The elapsed time of that phase already
+lower-bounds "how close together in time could any two books in this pass have been" (the first task
+starts essentially at phase start, the last completes at phase end), so it answers the operator's real
+question — "is this pass fast enough for its own signals to mean anything" — as an operational health
+log line, without a schema/API change outside this task's file set (`scanner.py`, `config.py`, tests).
+A finer per-pair measurement would need scoring.py or the API layer to carry it through, both out of
+scope and under concurrent edit by other agents this session.
+
+Before/after: before, 800 `get_book` calls awaited strictly one at a time (concurrency of exactly 1,
+worst-case wall time bounded only by 800x per-call latency). After, the same 800 calls are issued
+together under one shared semaphore bounded at `scan_book_fetch_concurrency` (default 20), round-robined
+across venues, so the pass's wall time is roughly `ceil(800 / 20) = 40` admission waves x one venue
+round-trip, and any two books fetched anywhere in the pass are at most one fetch-phase-width apart in
+time rather than up to the full pass duration apart.
+
+Four new tests in `tests/services/test_scanner_concurrency.py`, all against a `ConcurrencyProbeAdapter`
+(`FixtureAdapter` subclass adding only an in-process `asyncio.sleep` delay, a shared in-flight counter,
+and optional forced `VenueError`s — no network, no real adapter, GUARDRAILS §1.4 clean). Red-green run
+in a `$TMPDIR` copy of `backend/` with `scanner.py`/`config.py` reverted to the pre-T35 commit: 3 of 4
+failed as designed —
+`test_scan_fetches_books_concurrently_not_serially` (`1.53s` actual vs the asserted `< 0.9s` threshold,
+against a `1.5s` serial floor derived by hand in the test comment), `test_scan_book_fetch_respects_the_
+concurrency_bound` (`max_in_flight == 1` vs the asserted `4`), and `test_scan_interleaves_both_venues_
+books_instead_of_one_then_the_other` (`kx_first (0.865s) < pm_last (0.844s)` failed — kalshi's books
+only started arriving after polymarket's were essentially done). The fourth,
+`test_scan_survives_a_venue_whose_every_book_fetch_fails`, passed against BOTH the reverted and the
+finished code — correctly so, since per-book `VenueError` isolation already existed before this task
+and this test is a regression proof for that existing guarantee under the new concurrent path, not a
+T35-discriminating test; noting that here so it isn't mistaken for a vacuous one. Restoring the finished
+`scanner.py`/`config.py` in the same scratch copy turned all four green again. Full suite from
+`backend/`: 761 at session start, 782 at finish (the delta is other agents' concurrently-added tests,
+not mine); `ruff check`/`mypy` scoped to `app/services/scanner.py`, `app/config.py`,
+`tests/services/test_scanner_concurrency.py` both clean. `git status --porcelain` shows only those
+three files plus this NOTES.md entry as my changes; everything else touched in the tree this session
+belongs to the two concurrent agents on `app/api/routes/`, `app/strategies/`, and
+`app/services/scoring.py` (read, not edited, per the brief).
+
+### T35 adjudication (orchestrator)
+
+Suite **782**, `alembic heads` `007`. Bound is `settings.scan_book_fetch_concurrency` (default 20, a
+knob not a literal), and `_fetch_book` catches `VenueError` INSIDE itself rather than relying on
+`gather` -- necessary, because `asyncio.gather`'s default `return_exceptions=False` would let one bad
+book cancel every other in-flight fetch across BOTH venues. Getting that wrong would have turned a
+per-book failure into a whole-pass outage, which is strictly worse than the serial code it replaced.
+
+**THE FINDING BEYOND THE BRIEF IS THE GOOD ONE, and it is the difference between fixing the symptom
+and fixing the problem.** I framed snapshot skew as the real cost -- a cross-venue signal is a claim
+that two prices are inconsistent AT THE SAME MOMENT, so legs read minutes apart make the "edge" a
+clock artifact. The obvious fix (a shared semaphore) would NOT have solved that:
+`asyncio.Semaphore` admits blocked waiters **FIFO in the order the coroutines are listed**, so a
+venue-grouped spec list still drains one venue's entire batch before the other's begins. Concurrency
+would have gone up, wall-clock down, and the skew between venues would have survived intact --
+a fix that passes every throughput test while leaving the correctness bug untouched.
+
+`_interleave_fetch_specs` round-robins fetch targets across venues so both venues' books land
+throughout the whole window. Pure scheduling-order change; `books_by_key` and `snapshots` ordering are
+untouched. Before/after: 800 calls serially -> 800 calls under one shared round-robined semaphore
+bounded at 20 (~40 admission waves), with any two books in a pass now at most one fetch-phase-width
+apart instead of up to the full pass duration.
+
+Skew is measured rather than assumed: one wall-clock timer around the whole fetch phase, logged as
+`scan_book_fetch_complete` with `books_requested`/`books_fetched`/`concurrency_bound`/`fetch_elapsed_s`.
+Deliberately NOT a persisted per-book-pair table -- that needs schema and API changes outside this
+task's file set, and the aggregate is what tells an operator whether a pass is fast enough for its own
+signals to mean anything.
+
+Honest reporting on the fourth test: it passed against BOTH old and new code, because per-venue failure
+isolation pre-dates this task. The implementer said so explicitly rather than counting it as proof --
+the same discipline the T29 Polymarket control needed. Three of four failed on revert (timing, bound,
+interleaving), which is the right count.
+
+agent: T35 id=a70861e96fa9887db role=implementer model=sonnet
+outcome: T35 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T33
+
+Three pieces of API-schema hygiene on `app/api/routes/`. The brief matched repo reality on all three;
+no `defect:` line is warranted.
+
+CLASSIFICATION FIRST, THEN THE SETTING. The 37 `BaseModel` subclasses across `app/api/routes/` are
+38 once `SweepRequest` (which subclasses `BacktestRequest`, not `BaseModel` directly) is counted, and
+the request/response split is not a judgment call — it is derivable. Walking the LIVE FastAPI route
+table for `route.dependant.body_params` returns exactly six models that parse a request body:
+`BacktestRequest`, `SweepRequest`, `BotConfig`, `ApproveRequest`, `RejectRequest`, `OrderRequest`.
+The other thirty-two are response-only, and the intersection of the body-model set with the
+`response_model` set is EMPTY — no model faces both directions, so the "some may be used both ways"
+case the brief warned about does not arise here and nothing had to be compromised on. `extra="forbid"`
+is set explicitly on those six and on nothing else; the full rationale lives once, in
+`BacktestRequest`'s docstring (the model the `slippage_bps` bug landed on), with a one-line pointer
+at the other five, so `grep 'extra="forbid"'` still returns six hits and a reader can tell at a
+glance which models face a client.
+
+THE FENCE DERIVES ITS OWN TARGET SET rather than listing it, which is the only version that survives
+the 38th model. `tests/api/test_request_models_forbid_extras.py` walks the app's routes, recurses
+into nested models (so a body model that ever nests another is covered), and requires
+`model_config["extra"] == "forbid"` on every one. Two controls guard the walker in the spirit of
+`test_fences.py`: a positive one asserting it finds all six known names (a fence that passes because
+it looked nowhere is indistinguishable from one that passes because there is nothing wrong), and a
+NEGATIVE one that builds a throwaway FastAPI app with a deliberately permissive body model and
+requires the check to flag it. A fourth test asserts no RESPONSE model forbids extras — that is what
+stops the setting from being applied by a blanket base class, which would satisfy the fence while
+destroying the marker's meaning.
+
+THE FRONTEND WAS VERIFIED, NOT ASSUMED, and it is clean where it is live. `BacktestForm`'s two
+submit literals, `LinkReview`'s approve/reject bodies and `createBot`'s config send only declared
+fields, and `strategy_config` is a `dict[str, Any]` so arbitrary strategy keys inside it are still
+untouched by the top-level rule. TWO PRE-EXISTING DRIFTS FOUND, NEITHER CAUSED NOR WORSENED BY THIS
+CHANGE: the frontend's `OrderRequest` type is `{condition_id, token_id, side, size, price,
+order_type}` while the backend's is `{market_id, outcome, side, size, price, venue}` — every required
+backend field is missing, so that call already 422s today; it is dead code (`usePlaceOrder` has no
+component caller), which is presumably why nobody noticed. And `updateBot` posts a `Partial<>` to a
+`BotConfig` whose `name`/`strategy_id` are required, which also already 422s. Both are frontend work,
+outside this task's file set.
+
+WHAT THE TIGHTENING ACTUALLY BUYS ON THE ORDER PATH is narrower than it looks, and worth stating
+precisely: every `OrderRequest` field except `venue` is required, so a misspelling of one of those
+already failed loudly on the MISSING field. `venue` is the exception — it defaults to
+`"polymarket"`, so a body saying `"exchange": "kalshi"` was accepted and routed to the WRONG VENUE
+with real money. The red-green run proves exactly that: with `extra="forbid"` removed, the route test
+fails with a captured `intent_routed ... status: executed` log line and an HTTP 200.
+
+`edge_basis` IS PROMOTED WITH NO DEFAULT LABEL, which is the whole decision in that defect. It rides
+BOTH paths already — `scanner._persist` writes `asdict(OpportunityScore)`, so it is in `row.score`,
+and the strategies stamp `EDGE_BASIS_KEY` into `Intent.metadata` — but `OpportunityOut` builds its
+fields explicitly, so neither reached the payload as a column. It is now `str | None`. The `None` is
+deliberate and tested: `depth_source` can fall back to `"synthetic"` because that is the
+CONSERVATIVE reading of an absent value, but `edge_basis` has no conservative default —
+`"observed_costs"` would understate a row's model risk and `"identity_estimated"` would invent a
+haircut that was never applied — so a row persisted before the field existed reports nothing rather
+than a guess. A one-line mutation defaulting it to `"observed_costs"` fails exactly one test.
+
+DEFECT 3 IS RECOMPUTATION, NOT A NEW COMPUTATION, and that choice is what makes it work on rows
+already in the table. `_populate_run_from_result` calls `calculate_metrics` and then keeps SIX of its
+values; the other eleven are computed at run time and thrown away, which is why the endpoint could
+not report them. But that function's INPUTS are persisted in full (`equity_curve`, `trades_list`), so
+the route runs the same function over the same inputs and gets the same numbers — no migration, no
+second definition of any metric, and every historical run gains the eleven fields too. Persisting
+them from the Celery task instead would have needed a file outside this task's set AND would have
+left every existing row blank.
+
+ALL ELEVEN ARE HONESTLY POPULATABLE; NONE HAD TO BE LEFT PERMANENTLY `None`. What is left `None` is
+CONDITIONAL and is the point: the four `BacktestRun` columns (`total_trades`, `win_rate`,
+`sharpe_ratio`, `max_drawdown`) still come from the columns, and the eleven recomputed fields report
+`None` when the inputs cannot support them — a sweep PARENT row, whose `equity_curve`/`trades_list`
+are empty because its results live on its children, is the common real case, and a run whose fills
+are all still open gets `winning_trades`/`losing_trades` of `0` (a true statement) but `None` for
+`profit_factor`/`avg_win`/`avg_loss`/`largest_win`/`largest_loss` (which `calculate_metrics` returns
+as `0.0` from its "no closing trades" branch without computing anything). Two conventions inside
+`metrics.py` are DOCUMENTED rather than re-litigated from a route: `profit_factor` is `999.99` when
+there are no losing trades (a finite stand-in for infinity, not a measurement), and `sortino_ratio`
+stays `0.0` when there is no losing day. Both are stated in the model docstrings so a consumer is not
+misled; changing them belongs in `metrics.py`, not here.
+
+RESIDUAL, STATED RATHER THAN HIDDEN: `frontend/src/types/index.ts` types all fifteen fields as
+`number`, and eleven of them can now be `null`. The frontend deliberately renders only the four
+column-backed ones, so nothing displays wrongly today, but those two interfaces need `number | null`
+and are the natural follow-up. `win_rate`/`sharpe_ratio`/`max_drawdown` also still coerce a NULL
+column to `0.0` (`... or 0.0`) — the same category of lie, left alone deliberately because the
+frontend multiplies them (`max_drawdown * 100`) without a null guard, so making them nullable
+without the frontend change would trade a silent zero for a rendered one.
+
+RED-GREEN, FOUR MUTATIONS, EACH SCOPED. Deleting the six `extra="forbid"` lines fails exactly four
+tests (the fence, the two model tests, the route test) and leaves the three controls green. Reverting
+`arbitrage.py` fails exactly the two `edge_basis` tests on `KeyError: 'edge_basis'`. Reverting
+`backtesting.py` fails three of the four metrics tests on VALUES (`0 == 2`, `[0, 0, 0.0, ...] ==
+[None, ...]`, `0.0 is None`) while the unchanged-behaviour test stays green. Then the precise one:
+changing ONLY the eleven `else None` branches to `else 0.0`, keeping everything else, fails exactly
+the two "not computed" tests and leaves the hand-computed value test green — so the value assertions
+and the null assertions are each load-bearing on their own. Every metric expectation is hand-derived
+in the test body from four daily returns (+10%, -10%, +20%, -20%) and four closed trades
+(+60, -20, +40, -80): `var_95` is `-0.185` by numpy's interpolation rule, `max_drawdown_pct` is
+`20.0` from 11880 -> 9504, `volatility` is `sqrt(0.025) * sqrt(252)`.
+
+Suite 782 passed (761 at task start; the delta is 13 tests from this task and 8 from the two
+concurrent tasks whose files were in the tree). `ruff` on the five changed route files plus the four
+test files: 10 findings, all `ARG001` on `bots.py`'s TODO-stub endpoints, byte-identical to the same
+check run against those files at `HEAD` — zero introduced. `mypy` on the same nine: 5 errors, all
+five present at `HEAD` (3 in `backtesting.py`'s pre-existing `field_validator`/`datetime` code, 2 on
+`ASGITransport(app=...)` in the two test fixtures I did not touch). The three `type: ignore[call-arg]`
+in the new fence test are load-bearing rather than suppressive: `pyproject.toml` sets pydantic-mypy's
+`init_forbid_extra`, so mypy flags the deliberately-wrong kwargs those tests exist to prove are
+rejected at runtime — the ignore records that the call is wrong on purpose.
+
+### T33 adjudication (orchestrator)
+
+Suite **782**, `alembic heads` `007`. Six real `model_config = ConfigDict(extra="forbid")` lines
+(my raw `grep -c` said 7; the seventh is docstring prose at `backtesting.py:67` -- the same
+count-is-not-evidence trap as the `net_edge` grep in T31, checked rather than assumed in both
+directions).
+
+**THE SWEEP FOUND A REAL-MONEY BUG ON THE ORDER PATH, which is more than I expected from a hygiene
+task.** `OrderRequest.venue` is `VenueId = "polymarket"` -- it DEFAULTS. Every other field is
+required, so misspellings there already failed loudly; `venue` was the one field where a wrong name
+was survivable. A body carrying `"exchange": "kalshi"` was **accepted, silently discarded, and the
+order routed to Polymarket** -- the wrong venue, with real money in live mode. The red run captured it
+exactly: `intent_routed ... status: executed`, HTTP 200. Verified post-fix: now refused, naming
+`exchange`. This is the third instance of the same failure family in this kit (`slippage_bps` silently
+discarded, `TRADING_KILL_SWITCH_PATH` inert) and the first where the silence could move money to the
+wrong venue.
+
+Classification was DERIVED, not guessed: walking the live FastAPI route table's
+`route.dependant.body_params` gives exactly 6 request models against 32 response-only, and the
+intersection with the `response_model` set is EMPTY -- so the dual-use case I warned about needed no
+compromise, because it does not exist. That is the right way to answer a "classify all 37" question:
+ask the framework, not the reader.
+
+The structural fence is the best-built one in the kit. It RE-DERIVES the request set from the route
+table each run (recursing into nested models) so model 38 cannot slip through, and carries THREE
+controls: a positive one (finds all six), a NEGATIVE one (a throwaway app with a permissive body model
+must be flagged), and a test that **no response model forbids extras** -- which is what stops a blanket
+base class from satisfying the fence while destroying the marker's meaning. That third control is the
+one most people would omit, and it is the one that keeps the fence honest.
+
+`edge_basis` promoted with NO fallback label, and the reasoning is exactly right: `depth_source` may
+default to `"synthetic"` because that is the CONSERVATIVE reading, but `"observed_costs"` would
+understate model risk and `"identity_estimated"` would invent a haircut, so an unlabeled legacy row
+reports `None`. A one-line mutation defaulting it to `"observed_costs"` fails exactly one test.
+
+All 11 metrics fields populated, and none had to be permanently `None`: the route reruns
+`calculate_metrics` over the persisted `equity_curve`/`trades_list`, so historical rows benefit too --
+no migration, no second metric definition. `None` is used CONDITIONALLY and meaningfully: a sweep
+PARENT row (empty curve, results live on its children) reports all 11 as null; a run with only open
+fills reports `0` for the counts that are truly zero but `None` for `profit_factor`/`avg_win` etc.,
+which `calculate_metrics` returns as `0.0` WITHOUT computing. The distinction between "computed zero"
+and "never computed" is preserved rather than flattened.
+
+Two `metrics.py` conventions documented rather than re-litigated (`profit_factor = 999.99` means
+infinite; `sortino_ratio = 0.0` means undefined) -- correct restraint, those are load-bearing
+conventions in a file outside the task's set.
+
+RESIDUAL, correctly reported not fixed: `frontend/src/types/index.ts` types all 15 metrics as `number`
+and 11 can now be `null`. Nothing renders wrongly today (only the 4 column-backed ones are shown), but
+those interfaces need `number | null`. And `win_rate`/`sharpe_ratio`/`max_drawdown` still coerce a NULL
+column to `0.0`, left alone DELIBERATELY because the frontend does `max_drawdown * 100` with no null
+guard -- nulling them without the frontend change would trade a silent zero for a rendered one. That is
+the right call: the fix order matters, and doing half of it is worse than neither half.
+
+agent: T33 id=a3eb28c72e41e963a role=implementer model=opus
+outcome: T33 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5

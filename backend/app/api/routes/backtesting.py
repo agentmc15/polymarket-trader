@@ -4,6 +4,7 @@ Provides REST endpoints for running backtests, viewing results,
 and managing backtest history.
 """
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -15,7 +16,11 @@ from sqlalchemy import desc, func, select
 
 from app.api.deps import AsyncSessionDep
 from app.models.backtest_run import BacktestRun, BacktestRunStatus
-from app.services.backtesting import DEFAULT_CAPITAL_LEVELS
+from app.services.backtesting import (
+    DEFAULT_CAPITAL_LEVELS,
+    PerformanceMetrics,
+    calculate_metrics,
+)
 from app.strategies import (
     STRATEGIES,
     STRATEGY_CATEGORIES,
@@ -47,7 +52,32 @@ class SlippageModelEnum(str, Enum):
 
 
 class BacktestRequest(BaseModel):
-    """Request schema for starting a backtest."""
+    """Request schema for starting a backtest.
+
+    UNKNOWN BODY KEYS ARE A 422, NEVER A SILENT DEFAULT (T33). This is
+    the model the `slippage_bps`/`slippage_value` bug landed on: the
+    frontend posted `slippage_bps`, pydantic's DEFAULT `extra="ignore"`
+    discarded the key, `slippage_value` fell back to `0.001`, and every
+    backtest ever run used the default slippage no matter what the form
+    said — no error, no warning, wrong numbers. (`CLAUDE.md`'s
+    `TRADING_KILL_SWITCH_PATH` against `Settings`' `KILL_SWITCH_PATH`
+    was the same failure with a worse blast radius: an operator halting
+    trading during an incident would have halted nothing.)
+
+    `extra="forbid"` turns both of those into a 422 that NAMES the
+    offending field. It is set here, explicitly and identically, on
+    every model that parses a request body — `SweepRequest` below,
+    `bots.BotConfig`, `links.ApproveRequest`/`RejectRequest`,
+    `trading.OrderRequest` — and on NO response model: a response model
+    serializes outward and has no caller input to reject, so the setting
+    there would be meaningless at best and, for a model ever fed back
+    through `model_validate`, actively harmful.
+    `tests/api/test_request_models_forbid_extras.py` re-derives the
+    request set from the live route table and fails if a new body model
+    ships without it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     strategy: str = Field(
         ...,
@@ -128,6 +158,11 @@ class SweepRequest(BacktestRequest):
     not strategy behavior).
     """
 
+    #: Restated rather than inherited (T33): this line is what a reader
+    #: greps for, and it keeps the rule if this model ever stops
+    #: extending `BacktestRequest`. See that model's docstring.
+    model_config = ConfigDict(extra="forbid")
+
     capital_levels: list[float] | None = Field(
         default=None,
         description=(
@@ -158,28 +193,70 @@ class SweepResponse(BaseModel):
 
 
 class TradeMetrics(BaseModel):
-    """Trade statistics."""
+    """Trade statistics for one COMPLETED run.
+
+    `None` MEANS "NOT COMPUTED", AND IS THE ONLY HONEST WAY TO SAY IT
+    (T33, GUARDRAILS.md §1.7). Before T33 every field here defaulted to
+    `0.0` and `get_backtest_status` populated two of them, so a metric
+    that had never been computed left this endpoint as a `0.0`
+    indistinguishable from a measured zero — which is exactly why the
+    frontend refused to render seven of these nine fields at all. The
+    unpopulated fields are now nullable and are filled from
+    `app.services.backtesting.metrics.calculate_metrics` re-run over the
+    run's own persisted `equity_curve`/`trades_list` (see
+    `_recompute_metrics`); when that is not possible they stay `None`
+    rather than becoming a zero.
+
+    `total_trades` and `win_rate` keep their non-null types and come
+    from the `BacktestRun` COLUMNS, as before — those are the numbers
+    the run itself recorded, and for a sweep PARENT row (whose
+    `equity_curve`/`trades_list` are empty because the results live on
+    its children) the column is the only meaningful `total_trades`
+    there is.
+
+    Attributes:
+        profit_factor: Gross profit / gross loss. `999.99` is
+            `calculate_metrics`' finite stand-in for an INFINITE ratio
+            (there were winning trades and no losing ones), not a
+            measured value — do not plot it as one.
+    """
 
     total_trades: int = 0
-    winning_trades: int = 0
-    losing_trades: int = 0
+    winning_trades: int | None = None
+    losing_trades: int | None = None
     win_rate: float = 0.0
-    profit_factor: float = 0.0
-    avg_win: float = 0.0
-    avg_loss: float = 0.0
-    largest_win: float = 0.0
-    largest_loss: float = 0.0
+    profit_factor: float | None = None
+    avg_win: float | None = None
+    avg_loss: float | None = None
+    largest_win: float | None = None
+    largest_loss: float | None = None
 
 
 class RiskMetrics(BaseModel):
-    """Risk statistics."""
+    """Risk statistics for one COMPLETED run.
+
+    Same `None`-means-not-computed contract as `TradeMetrics`, same
+    reason. `sharpe_ratio`/`max_drawdown` come from the `BacktestRun`
+    columns; the other three are recomputed by `_recompute_metrics` and
+    are `None` when the persisted equity curve cannot support the
+    calculation.
+
+    Attributes:
+        sortino_ratio: `calculate_metrics` leaves this at `0.0` when
+            downside volatility is zero (no losing day in the window) —
+            an undefined ratio, not a measured zero. It is reported as
+            given rather than re-derived here; `metrics.py` owns that
+            convention.
+        var_95: The 5th percentile of DAILY returns, a fraction (e.g.
+            `-0.02` = -2%). Negative for any run that had a losing day.
+    """
 
     sharpe_ratio: float = 0.0
-    sortino_ratio: float = 0.0
+    sortino_ratio: float | None = None
     max_drawdown: float = 0.0
-    max_drawdown_pct: float = 0.0
-    volatility: float = 0.0
-    var_95: float = 0.0
+    max_drawdown_pct: float | None = None
+    volatility: float | None = None
+    var_95: float | None = None
 
 
 class BacktestStatusResponse(BaseModel):
@@ -304,6 +381,166 @@ class BacktestListResponse(BaseModel):
     total: int
     skip: int
     limit: int
+
+
+# ============================================================================
+# Metric recomputation (T33)
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class _PersistedTrade:
+    """One `BacktestRun.trades_list` row, in the shape metrics code reads.
+
+    `app.services.backtesting.metrics._calculate_trade_metrics` reaches
+    for `t.pnl`/`t.fee`/`t.price`/`t.size` by ATTRIBUTE, each behind a
+    `hasattr` guard. Handing it the persisted DICTS would therefore not
+    raise — every `hasattr` would simply be `False`, the function would
+    take its "no closing trades" branch, and it would return zeros for
+    every field. A zero that means "I was handed the wrong type" is the
+    precise failure `TradeMetrics`' nullability exists to avoid, so the
+    dicts are converted into real objects here.
+
+    `slippage` is deliberately absent: `_populate_run_from_result` does
+    not persist it, and the `hasattr` guard means its absence costs only
+    `total_slippage`, which this endpoint does not report.
+
+    Attributes:
+        pnl: Realized P&L in USD, or `None` for an OPENING fill (a row
+            with no `pnl` is not a closed round trip and is excluded
+            from every win/loss statistic).
+        fee: Fee paid on this fill, USD.
+        price: Fill price, a probability in `[0, 1]`.
+        size: Fill size in contracts.
+    """
+
+    pnl: float | None
+    fee: float
+    price: float
+    size: float
+
+
+@dataclass(frozen=True)
+class _RecomputedMetrics:
+    """`calculate_metrics` re-run over one run's persisted results.
+
+    Attributes:
+        metrics: The recomputed metrics.
+        has_closing_trades: Whether `trades_list` held at least one row
+            with a `pnl` — i.e. whether the win/loss statistics
+            (`profit_factor`, `avg_win`/`avg_loss`, `largest_win`/
+            `largest_loss`) were computed from anything at all. When
+            `False`, `calculate_metrics` returns `0.0` for each of them
+            by construction, and the endpoint reports `None` instead.
+    """
+
+    metrics: PerformanceMetrics
+    has_closing_trades: bool
+
+
+def _persisted_equity_curve(run: BacktestRun) -> list[tuple[datetime, float]]:
+    """Return `run.equity_curve` in `calculate_metrics`' input shape.
+
+    Tolerates both persisted shapes for the same reason
+    `get_backtest_equity_curve` does: `_populate_run_from_result` writes
+    `{"timestamp": iso, "equity": float}` dicts, but older rows may hold
+    `[timestamp, equity]` pairs. An unparseable point is SKIPPED rather
+    than defaulted to zero — a fabricated `(epoch, 0.0)` point would
+    invent a drawdown of the entire book.
+
+    Args:
+        run: The persisted backtest row.
+
+    Returns:
+        list[tuple[datetime, float]]: `(timestamp, equity)` pairs, in
+            stored order.
+    """
+    points: list[tuple[datetime, float]] = []
+    for point in run.equity_curve or []:
+        if isinstance(point, dict):
+            raw_ts, raw_equity = point.get("timestamp"), point.get("equity")
+        elif isinstance(point, list | tuple) and len(point) >= 2:
+            raw_ts, raw_equity = point[0], point[1]
+        else:
+            continue
+
+        if isinstance(raw_ts, str):
+            try:
+                timestamp = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        elif isinstance(raw_ts, datetime):
+            timestamp = raw_ts
+        else:
+            continue
+
+        if not isinstance(raw_equity, int | float):
+            continue
+        points.append((timestamp, float(raw_equity)))
+    return points
+
+
+def _persisted_trades(run: BacktestRun) -> list[_PersistedTrade]:
+    """Return `run.trades_list` as `_PersistedTrade` objects.
+
+    Args:
+        run: The persisted backtest row.
+
+    Returns:
+        list[_PersistedTrade]: One entry per persisted fill; malformed
+            rows are skipped.
+    """
+    trades: list[_PersistedTrade] = []
+    for trade in run.trades_list or []:
+        if not isinstance(trade, dict):
+            continue
+        pnl = trade.get("pnl")
+        trades.append(
+            _PersistedTrade(
+                pnl=float(pnl) if isinstance(pnl, int | float) else None,
+                fee=float(trade.get("fee") or 0.0),
+                price=float(trade.get("price") or 0.0),
+                size=float(trade.get("size") or 0.0),
+            )
+        )
+    return trades
+
+
+def _recompute_metrics(run: BacktestRun) -> _RecomputedMetrics | None:
+    """Re-run `calculate_metrics` over one run's own persisted results.
+
+    WHY RECOMPUTE RATHER THAN READ. `app.tasks.backtesting.
+    _populate_run_from_result` already calls `calculate_metrics` and
+    then keeps only SIX of its values (`final_value`, `total_return`,
+    `sharpe_ratio`, `max_drawdown`, `win_rate`, `total_trades`) — the
+    other eleven `TradeMetrics`/`RiskMetrics` fields are computed at run
+    time and thrown away, which is why this endpoint could not report
+    them. The inputs those eleven are derived from ARE persisted in
+    full, though (`equity_curve` and `trades_list`), so running the same
+    function over the same inputs reproduces the same numbers, for every
+    row already in the table as well as for new ones — no migration, no
+    second definition of any metric.
+
+    Args:
+        run: The persisted backtest row.
+
+    Returns:
+        _RecomputedMetrics | None: `None` when the row's equity curve has
+            fewer than two usable points, which is exactly the input
+            `calculate_metrics` refuses (it returns an all-zero
+            `PerformanceMetrics`, and reporting those zeros as measured
+            values is the thing being fixed). A sweep PARENT row is the
+            common case: its results live on its children, so its own
+            `equity_curve` is empty and it can honestly report nothing.
+    """
+    curve = _persisted_equity_curve(run)
+    if len(curve) < 2:
+        return None
+    trades = _persisted_trades(run)
+    return _RecomputedMetrics(
+        metrics=calculate_metrics(curve, trades, run.initial_capital),
+        has_closing_trades=any(trade.pnl is not None for trade in trades),
+    )
 
 
 # ============================================================================
@@ -501,14 +738,35 @@ async def get_backtest_status(
     risk_metrics = None
 
     if backtest.status == BacktestRunStatus.COMPLETED:
+        # T33: the four fields `BacktestRun` persists as columns still
+        # come from the columns (they are what the run itself recorded);
+        # the other eleven are recomputed from the same persisted
+        # `equity_curve`/`trades_list` the run's own metrics came from,
+        # and are `None` — never `0.0` — when that is not possible. See
+        # `_recompute_metrics` and `TradeMetrics`' docstring.
+        recomputed = _recompute_metrics(backtest)
+        derived = recomputed.metrics if recomputed is not None else None
+        closed = recomputed.has_closing_trades if recomputed is not None else False
+
         trade_metrics = TradeMetrics(
             total_trades=backtest.total_trades,
             win_rate=backtest.win_rate or 0.0,
+            winning_trades=derived.winning_trades if derived else None,
+            losing_trades=derived.losing_trades if derived else None,
+            profit_factor=derived.profit_factor if derived and closed else None,
+            avg_win=derived.avg_win if derived and closed else None,
+            avg_loss=derived.avg_loss if derived and closed else None,
+            largest_win=derived.largest_win if derived and closed else None,
+            largest_loss=derived.largest_loss if derived and closed else None,
         )
 
         risk_metrics = RiskMetrics(
             sharpe_ratio=backtest.sharpe_ratio or 0.0,
             max_drawdown=backtest.max_drawdown or 0.0,
+            sortino_ratio=derived.sortino_ratio if derived else None,
+            max_drawdown_pct=derived.max_drawdown_pct if derived else None,
+            volatility=derived.volatility if derived else None,
+            var_95=derived.var_95 if derived else None,
         )
 
     return BacktestStatusResponse(

@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -57,6 +57,20 @@ class OrderRequest(BaseModel):
     on that venue. `OrderRouter` derives the venue-native token id FROM
     the canonical outcome, not the other way around.
     """
+
+    #: T33: an unknown body key is a 422 naming the field, never a
+    #: silently discarded value (see `app.api.routes.backtesting.
+    #: BacktestRequest`'s docstring). Every field here except `venue` is
+    #: required, so a misspelling of one of those already failed loudly
+    #: on the MISSING field. `venue` is the exception and the reason
+    #: this matters on an order path: it defaults to `"polymarket"`, so
+    #: a body saying `"exchange": "kalshi"` (or `"venu"`) was accepted
+    #: and routed to the WRONG VENUE with real money, silently. It also
+    #: closes the mass-assignment shape this module's docstring
+    #: describes: a body carrying `mode`, `client_order_id` or
+    #: `venue_order_id` is now refused outright rather than accepted and
+    #: ignored.
+    model_config = ConfigDict(extra="forbid")
 
     market_id: str = Field(..., description="Venue-native market identifier.")
     outcome: str = Field(..., description='Outcome to trade, e.g. "YES"/"NO".')

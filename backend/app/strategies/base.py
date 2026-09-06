@@ -71,6 +71,13 @@ DOWNSIZE_TO_CAPITAL_KEY = "downsize_to_capital"
 # same formula `cross_venue_arbitrage` used internally — to any intent
 # that publishes them, and leaves the edge alone for any intent that
 # does not.
+#
+# T34: a strategy whose published `SCORING_EDGE_KEY` is not that
+# per-unit, fee-netted, settlement-realized dollar figure at all — a
+# directional mispricing bet, not an arbitrage edge — must not let the
+# scorer find that out. It opts OUT via `EDGE_BASIS_DIRECTIONAL`, and
+# `score()` refuses (`UnscorableIntent`) rather than scoring it. See
+# that constant's docstring below.
 
 #: Per-UNIT USD edge, net of fees and gas, BEFORE any risk haircut. The
 #: one number `app.services.scoring` annualizes. "Unit" = one contract of
@@ -116,6 +123,31 @@ EDGE_BASIS_OBSERVED = "observed_costs"
 #: calibrated — see `app.services.scoring`'s "WHAT REMAINS
 #: INCOMPARABLE".
 EDGE_BASIS_IDENTITY_ESTIMATED = "identity_estimated"
+
+#: T34 (NOTES.md). The published `SCORING_EDGE_KEY`/`SCORING_EDGE_LEGACY_KEY`
+#: value, if any, is a DIRECTIONAL mispricing estimate — "I think this
+#: price is wrong and will move" — not a fee-netted, settlement-realized,
+#: per-contract USD edge. `favorite_compounder` and `no_bias_exploit`
+#: both happen to spell their directional signal's metadata key `"edge"`
+#: (the same string as `SCORING_EDGE_KEY`) for reasons that predate this
+#: contract, but it is not the same NUMBER: it is `estimated_probability
+#: - market_price`, a probability-space gap with no fee/gas netting and
+#: no per-unit dollar meaning, and `app.services.scoring` has no formula
+#: that turns it into a real annualized return.
+#:
+#: A strategy stamps this value on `EDGE_BASIS_KEY` to say, explicitly,
+#: "whatever I published under `SCORING_EDGE_KEY` is not that number" —
+#: `app.services.scoring._published_edge` refuses (`UnscorableIntent`)
+#: any intent that declares it, rather than reading the bare `"edge"` key
+#: and hoping it means the scoring contract's edge. This is what makes
+#: the contract SURVIVE the day someone adds `favorite_compounder` or
+#: `no_bias_exploit` to `STRATEGY_CATEGORIES["arbitrage"]` (a one-line,
+#: innocuous-looking change): without this label the scorer would read
+#: their directional gap as a riskless per-contract edge, annualize it,
+#: and rank it against real arbitrage — with no error and nothing
+#: visibly wrong. With it, routing either strategy's intent through
+#: `score()` raises instead.
+EDGE_BASIS_DIRECTIONAL = "directional_mispricing"
 
 #: Canonical spelling for a binary market's two outcomes, keyed by their
 #: case-folded form. `normalize_outcome()` below is the ONLY table this

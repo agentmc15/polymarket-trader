@@ -23,14 +23,18 @@ from app.services.scoring import (
     score,
 )
 from app.strategies.base import (
+    EDGE_BASIS_DIRECTIONAL,
     EDGE_BASIS_IDENTITY_ESTIMATED,
+    EDGE_BASIS_KEY,
     EDGE_BASIS_OBSERVED,
     Intent,
     Leg,
 )
+from app.strategies.favorite_compounder import FavoriteCompounderStrategy
 from app.strategies.multi_outcome_bundle_arbitrage import (
     MultiOutcomeBundleArbitrageStrategy,
 )
+from app.strategies.no_bias_exploit import NoBiasExploitStrategy
 from app.utils.time import utcnow
 from app.venues.types import BookLevel, OrderBook, VenueId, VenueMarket
 from tests.helpers import make_book, make_snapshot
@@ -810,4 +814,193 @@ def test_bundle_intent_scores_a_nonzero_net_edge_and_composite():
     assert result.composite == pytest.approx(25.6522 * 1.0 * 0.85)
     assert result.composite == pytest.approx(21.80437)
     assert result.composite != 0.0
+    assert result.edge_basis == EDGE_BASIS_OBSERVED
+
+
+# --------------------------------------------------------------------------
+# T34 -- a directional strategy's `"edge"` must never be scored as if it
+# were the scoring contract's fee-netted, per-unit, settlement-realized
+# figure. `favorite_compounder` and `no_bias_exploit` are not in
+# `STRATEGY_CATEGORIES["arbitrage"]` today, so this is latent -- these
+# tests simulate exactly the one-line category change that would make it
+# live: one of their real intents reaching `score()`.
+
+
+def test_favorite_compounder_intent_reaching_score_is_refused_not_ranked():
+    """The one-line-category-change failure, simulated exactly.
+
+    HAND-COMPUTED, to prove this is a REAL directional signal and not a
+    degenerate no-op (GUARDRAILS.md §5). `make_snapshot(yes=0.90)` (all
+    other args at the helper's defaults: `spread=0.02`,
+    `volume_24h=50_000.0`) drives `FavoriteCompounderStrategy
+    ._estimate_true_probability`:
+
+        bias_adjustment = (0.90 - 0.5) * 0.05 = 0.02
+        volume_factor   = 1.0   (50_000 is not > 50_000, nor < 10_000)
+        spread_factor   = 1.0   (0.02 is not < 0.02, nor > 0.05)
+        estimated_prob  = (0.90 + 0.02) * (1.0 * 1.0) ** 0.5 = 0.92
+
+        edge = estimated_prob - favorite_price = 0.92 - 0.90 = 0.02
+
+    -- a directional probability gap that happens to equal, digit for
+    digit, the PRE-risk arbitrage edge `test_hand_computed_composite_
+    for_a_complement_intent` (top of this file) scores a real
+    `composite` for. Nothing about the metadata SHAPE tells the two
+    apart -- both are a bare `0.02` under `"edge"`; only `EDGE_BASIS_KEY`
+    does, which is exactly why this guard exists.
+
+    payout_ratio = 1/0.90 - 1 = 0.1111111...; expected_value =
+    0.92 * 0.1111111... - 0.08 = 0.0222222... >= min_edge (0.02), so the
+    strategy actually emits a `Signal` here rather than filtering it out
+    -- this is a real, on-the-record trade the strategy would take, not
+    a contrived metadata blob nothing would ever produce.
+
+    The market this intent references is open, well-documented, and 100
+    hours from a resolution time the intent itself carries, so
+    `_leg_markets`/`_hours_to_resolution` both pass before
+    `_published_edge` ever runs -- the refusal below comes from THIS
+    guard, not from an unrelated `UnscorableIntent` path.
+    """
+    now = utcnow()
+    snapshot = make_snapshot(
+        market_id="M1", ts=now, yes=0.90, end_date=now + timedelta(hours=100),
+    )
+    strategy = FavoriteCompounderStrategy()
+    signal = strategy.on_market_data(snapshot)
+
+    assert signal is not None
+    assert signal.metadata["edge"] == pytest.approx(0.02)
+    assert signal.metadata["expected_value"] == pytest.approx(1.0 / 45.0)
+    assert signal.metadata[EDGE_BASIS_KEY] == EDGE_BASIS_DIRECTIONAL
+
+    intent = signal.to_intent(venue=PM, expected_resolution_ts=snapshot.end_date)
+    # `Signal.to_intent()` carries `metadata` over verbatim -- this is
+    # the exact mechanism by which the label survives to `score()`.
+    assert intent.metadata[EDGE_BASIS_KEY] == EDGE_BASIS_DIRECTIONAL
+    assert intent.metadata["edge"] == pytest.approx(0.02)
+
+    market = _open_market(PM, "M1")
+    ctx = ScoreContext(
+        now=now,
+        books={
+            (PM, "M1", "YES"): make_book(
+                bids=[(0.88, 100.0)], asks=[(0.90, 100.0)],
+                venue=PM, market_id="M1", outcome="YES",
+            ),
+        },
+        markets={(PM, "M1"): market},
+        settings=settings,
+    )
+
+    with pytest.raises(UnscorableIntent, match="directional_mispricing"):
+        score(intent, ctx)
+
+
+def test_no_bias_exploit_intent_reaching_score_is_refused_not_ranked():
+    """The same failure, for the other directional strategy.
+
+    HAND-COMPUTED (GUARDRAILS.md §5). `make_snapshot(yes=0.60, no=0.36)`
+    deliberately breaks the helper's arbitrage-neutral default
+    (`no = 1 - yes`) -- YES + NO = 0.96, a genuine sum discount, which is
+    exactly the "YES bias" shape `NoBiasExploitStrategy` looks for:
+
+        sum_discount        = 1.0 - (0.60 + 0.36) = 0.04
+        spread_asymmetry    = 0.0   (both legs get the same 0.02 spread)
+        yes_attractiveness  = 0.3   (0.60 is in the "peak retail" [0.60, 0.80] band)
+        category_multiplier = 1.0   (make_snapshot's default category, "test",
+                                     is not in high_bias_categories)
+        bias_score = (0.04 * 2.0 + 0.0 * 0.5 + 0.3) * 1.0 = 0.38
+
+        min_bias_score = 0.04 + min_no_discount (0.02) = 0.06 -> has_bias (0.38 >= 0.06)
+
+        fair_no_price_uncapped = no_price + bias_score * 0.5 = 0.36 + 0.19 = 0.55
+        cap                    = 1 - yes_price + 0.02 = 0.42
+        fair_no_price          = min(0.55, 0.42) = 0.42   (cap binds)
+
+        edge = fair_no_price - no_price = 0.42 - 0.36 = 0.06
+
+    0.06 >= min_edge (0.03), so the strategy emits a real `Signal`, not a
+    contrived one.
+
+    Same isolation as the favorite_compounder test above: the market is
+    open, well-documented, and far from close, so the refusal below is
+    from `_published_edge`'s basis check, not an unrelated path.
+    """
+    now = utcnow()
+    snapshot = make_snapshot(
+        market_id="M1", ts=now, yes=0.60, no=0.36, end_date=now + timedelta(hours=100),
+    )
+    strategy = NoBiasExploitStrategy()
+    signal = strategy.on_market_data(snapshot)
+
+    assert signal is not None
+    assert signal.metadata["edge"] == pytest.approx(0.06)
+    assert signal.metadata[EDGE_BASIS_KEY] == EDGE_BASIS_DIRECTIONAL
+
+    intent = signal.to_intent(venue=PM, expected_resolution_ts=snapshot.end_date)
+    assert intent.metadata[EDGE_BASIS_KEY] == EDGE_BASIS_DIRECTIONAL
+    assert intent.metadata["edge"] == pytest.approx(0.06)
+
+    market = _open_market(PM, "M1")
+    ctx = ScoreContext(
+        now=now,
+        books={
+            (PM, "M1", "NO"): make_book(
+                bids=[(0.34, 100.0)], asks=[(0.36, 100.0)],
+                venue=PM, market_id="M1", outcome="NO",
+            ),
+        },
+        markets={(PM, "M1"): market},
+        settings=settings,
+    )
+
+    with pytest.raises(UnscorableIntent, match="directional_mispricing"):
+        score(intent, ctx)
+
+
+def test_unrecognized_edge_basis_is_refused_generically():
+    """The guard is an ALLOWLIST, not a check for one hardcoded string.
+
+    A `edge_basis` this module has never heard of -- not
+    `EDGE_BASIS_DIRECTIONAL` specifically, just some other label a future
+    strategy might invent -- is refused the same way: a strategy fails
+    loudly by DEFAULT the moment it declares a basis nobody taught this
+    module, rather than sliding through because nobody added its literal
+    string to a blocklist.
+    """
+    now, intent = _single_leg_intent(hours=48.0)
+    intent.metadata[EDGE_BASIS_KEY] = "some_future_basis_nobody_taught_this_module"
+    market = _open_market()
+    book = make_book(bids=[(0.48, 100.0)], asks=[(0.50, 100.0)], venue=PM, market_id="M1", outcome="YES")
+    ctx = ScoreContext(now=now, books={(PM, "M1", "YES"): book}, markets={(PM, "M1"): market}, settings=settings)
+
+    with pytest.raises(UnscorableIntent):
+        score(intent, ctx)
+
+
+def test_absent_edge_basis_still_scores_exactly_as_before():
+    """T34 adds a refusal; it does not add a requirement.
+
+    A strategy that predates the `EDGE_BASIS_KEY` label (or, like the
+    four legitimate arbitrage strategies' `EDGE_BASIS_OBSERVED` case,
+    declares the default explicitly) is scored exactly as before --
+    same intent/context `test_more_hours_to_resolution_yields_lower_
+    annualized_return` already exercises, asserted again here so the
+    regression guarantee sits next to the two refusal tests it
+    complements: an over-broad guard that refused THIS intent would be
+    worse than the latent bug it is meant to close.
+    """
+    now, intent = _single_leg_intent(hours=48.0)
+    assert EDGE_BASIS_KEY not in intent.metadata
+    market = _open_market()
+    book = make_book(bids=[(0.48, 100.0)], asks=[(0.50, 100.0)], venue=PM, market_id="M1", outcome="YES")
+    ctx = ScoreContext(now=now, books={(PM, "M1", "YES"): book}, markets={(PM, "M1"): market}, settings=settings)
+
+    result = score(intent, ctx)
+
+    # capital_lockup_usd = 100 * 0.50 = 50.0; net_edge = 0.03 (no basis
+    # declared -> read as the plain per-unit pre-risk edge, unchanged).
+    assert result.net_edge == pytest.approx(0.03)
+    assert result.capital_lockup_usd == pytest.approx(50.0)
+    assert result.annualized_return == pytest.approx(0.06 / 48.0 * 8760.0)
     assert result.edge_basis == EDGE_BASIS_OBSERVED

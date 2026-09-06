@@ -562,3 +562,76 @@ async def test_the_latest_scan_filter_is_per_pass_not_global(
     body = response.json()
     assert {o["id"] for o in body["opportunities"]} == {"arb-new", "near-new"}
     assert body["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# T33 -- `edge_basis` as a first-class column, not a metadata blob entry
+# ---------------------------------------------------------------------------
+
+
+async def test_a_scanned_opportunity_carries_edge_basis_as_a_typed_field(
+    client: AsyncClient,
+) -> None:
+    """`edge_basis` is a column of the payload, beside `composite`.
+
+    It is the honesty label on the ranking: `"observed_costs"` means
+    every term of `net_edge` is an observed price or a published fee/gas
+    rate, `"identity_estimated"` means it also carries a haircut driven
+    by the matcher's SIMILARITY score, which is not a calibrated
+    probability. A consumer sorting by `composite` has to be able to see
+    which rows rest on an estimate WITHOUT digging through the generic
+    `metadata` dict, which is where it used to live only.
+
+    The planted gap is a same-venue complement on ONE market, so its
+    edge is pure arithmetic over two observed asks and Polymarket's
+    published fee — `"observed_costs"`, with no identity estimate
+    anywhere in it.
+    """
+    scan = await client.post(
+        "/api/v1/arbitrage/scan",
+        params={"strategies": ["binary_complement_arbitrage"]},
+    )
+    assert scan.status_code == 200
+    scanned = scan.json()["opportunities"][0]
+    assert scanned["edge_basis"] == "observed_costs"
+
+    listed = await client.get("/api/v1/arbitrage/opportunities")
+    persisted = listed.json()["opportunities"][0]
+
+    # Both builders -- the fresh `ScoredIntent` one `POST /scan` uses and
+    # the persisted-row one `GET /opportunities` uses -- must agree.
+    assert persisted["edge_basis"] == "observed_costs"
+    assert persisted["id"] == scanned["id"]
+
+
+async def test_a_row_with_no_persisted_basis_reports_none_rather_than_observed(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An UNLABELED row must not be dressed up as an arithmetic one.
+
+    `_scored_row`'s `score` dict is the pre-T31 shape: it carries no
+    `edge_basis` at all, exactly like a row persisted before the field
+    existed. Defaulting such a row to `"observed_costs"` would make it
+    indistinguishable from a row whose edge genuinely contains no
+    estimated parameter — the same "a default that looks like data"
+    failure GUARDRAILS.md §1.7 exists to prevent. `None` says nothing,
+    which is the truth about it.
+    """
+    async with session_factory() as session:
+        session.add(
+            _scored_row(
+                "unlabeled",
+                strategy="binary_complement_arbitrage",
+                created_at=utcnow(),
+                extra_data={"scan_id": "S9", "scan_pass": "arbitrage"},
+            )
+        )
+        await session.commit()
+
+    response = await client.get("/api/v1/arbitrage/opportunities")
+
+    body = response.json()
+    assert [o["id"] for o in body["opportunities"]] == ["unlabeled"]
+    assert "edge_basis" in body["opportunities"][0]
+    assert body["opportunities"][0]["edge_basis"] is None

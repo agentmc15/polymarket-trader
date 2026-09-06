@@ -41,6 +41,64 @@ OWN payload). Both real venues' raw payloads carry a `"volume"` key
 markets by 24h volume" (`settings.scan_top_n`, default 200 per venue)
 rather than inventing a new normalized field for this one task.
 
+BOOK FETCH IS CONCURRENT, BOUNDED, AND PER-CALL ISOLATED (T35). Naively,
+`scan_top_n` (200) x 2 outcomes x 2 venues is up to 800 `get_book`
+calls a pass, and awaiting them one at a time is two problems, not one.
+The obvious one is rate-limit risk against request budgets now shared by
+THREE beats (`scan_opportunities`, `scan_near_resolution`,
+`propose_event_links`). The one that actually bites is SNAPSHOT SKEW: a
+cross-venue arbitrage signal is a claim that two prices are inconsistent
+AT THE SAME MOMENT, and if walking 800 books serially takes minutes, the
+book fed to the strategy for venue A's leg can be three minutes stale
+relative to venue B's — at which point an "edge" can be entirely an
+artifact of the clock, not a real mispricing. `scan()` therefore fetches
+every `(venue, market, outcome)` book THIS PASS NEEDS, from EVERY venue
+TOGETHER, under ONE `asyncio.Semaphore` sized `settings.
+scan_book_fetch_concurrency` (a bound, not a literal — see that field's
+comment) — one shared semaphore across venues, not one per venue,
+because a per-venue bound would still let one venue's 200 books finish
+long before the other venue's have even started, which does nothing for
+skew (see PLAN's own concern: a cross-venue pair is exactly two
+DIFFERENT venues' books). A SHARED semaphore alone is not sufficient,
+either: `asyncio.Semaphore` queues blocked waiters FIFO in the order
+they first tried to acquire, i.e. the order `asyncio.gather`'s
+coroutines were listed in — so a naive venue-by-venue spec list (every
+one of venue A's specs before venue B's first) would still let venue A
+monopolize the front of that queue and push venue B's books into the
+back half of the pass, reproducing the same sequential-by-venue skew
+one layer down. `_interleave_fetch_specs` round-robins across venues
+for exactly this reason: every batch the semaphore admits contains a
+mix of venues from the very first one, so both venues' books arrive
+throughout the WHOLE fetch window instead of in two back-to-back
+blocks. `_fetch_book` is the unit of work `asyncio.
+gather` runs 800(-ish) copies of; it catches `VenueError` INSIDE itself
+and returns `None` rather than raising, which is the part that matters —
+`asyncio.gather`'s default `return_exceptions=False` cancels every OTHER
+in-flight fetch the instant any one coroutine raises, so catching
+outside the gather (or not at all) would turn "Kalshi's book 47 is a
+404" into "every book this pass was fetching, from BOTH venues, is lost"
+— a strictly worse failure than the serial code this replaces, where one
+bad book only cost that one book. Catching inside each unit of work is
+what makes the serial code's per-book isolation (unchanged: still
+exactly one `except VenueError`, still logged at `debug`, still skipped
+without effect on any other book) survive the move to concurrency, and
+it is also what gives a wholly-unreachable venue (not just one bad
+market) the same treatment for free — its books all resolve to `None`
+while the other venue's arrive on schedule, with no separate branch
+needed. `fetch_elapsed_s` (logged as `scan_book_fetch_complete`) is the
+wall-clock length of that ENTIRE concurrent phase — the cheapest number
+that answers "were this pass's books close enough together in time for
+its own signals to mean anything," without adding a persisted
+per-book-pair skew table (a real measurement, but a schema/API change
+outside this task's file set, and overkill for what is fundamentally an
+operator health signal, not a scored input). This is a fetch-STRATEGY
+change only: the two-phase split (fetch every book first, THEN build
+every `MarketSnapshot`) preserves the exact venue/market iteration order
+`scan()` always built `snapshots` in, so which opportunities a given
+fixture yields is unchanged — only WHEN, and in what order, the network
+calls that fill `books_by_key` complete is different, and nothing here
+reads that order.
+
 LINK STATUS RIDES THROUGH TO THE SCORE. `app.strategies
 .cross_venue_arbitrage.LinkBook` accepts ONLY `status == "approved"`
 links (PLAN.md D9) — `_build_strategies` below filters `links` to
@@ -208,11 +266,14 @@ pass wrote it, and `GET /arbitrage/opportunities` keeps the newest
 `scan_id` PER PASS. See `SCAN_PASS_KEY` for why a single global "latest
 scan" would have made the two surfaces mutually exclusive.
 """
+import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
+from itertools import zip_longest
 from typing import Any
 
 from sqlalchemy import select
@@ -458,6 +519,112 @@ def _stamp_link_status(intent: Intent, links_by_id: Mapping[int, EventLink]) -> 
         intent.metadata["link_status"] = link.status
 
 
+def _interleave_fetch_specs(
+    top_markets_by_venue: Mapping[VenueId, Sequence[VenueMarket]],
+) -> list[tuple[VenueId, str, str]]:
+    """Round-robin every venue's `(market, outcome)` fetch targets together.
+
+    WHY ORDER MATTERS EVEN THOUGH EVERY SPEC GOES THROUGH THE SAME SHARED
+    SEMAPHORE. `asyncio.Semaphore` queues blocked waiters FIFO, in the
+    order they first tried to acquire — which, for a single `asyncio.
+    gather()` call, is the order its coroutines appear in. Grouping one
+    venue's ENTIRE fetch list before another's (as a naive `for venue:
+    for market: for outcome` build would) means every one of venue A's
+    specs reaches the front of that queue before venue B's FIRST spec
+    does; with N specs total and a bound of B, venue B's earliest fetch
+    then cannot even START until roughly `len(venue A's specs) / B`
+    batches have already drained — a global semaphore reproduces
+    "fetch venue A fully, then venue B" in miniature, right down to the
+    two venues' books landing in two mostly-disjoint time windows. That
+    is exactly the cross-venue snapshot skew this task exists to close,
+    just measured in fetch batches instead of minutes. Round-robining
+    the specs (venue1[0], venue2[0], venue1[1], venue2[1], ...) instead
+    means every batch of `B` admitted specs contains a mix of venues
+    from the very first one, so both venues' books arrive throughout the
+    WHOLE fetch window rather than in sequential blocks.
+
+    Args:
+        top_markets_by_venue: Each venue's already-ranked, already-capped
+            (`scan_top_n`) market list, in the order `scan()` read them.
+
+    Returns:
+        list[tuple[VenueId, str, str]]: Every `(venue, market_id,
+            outcome)` this pass needs a book for, ordered round-robin
+            across venues (then in-order within a venue). The exact
+            fetch order the caller hands to `asyncio.gather` — it has no
+            bearing on `books_by_key`'s contents (a dict, unordered) or
+            on `snapshots`' order (built separately, from
+            `top_markets_by_venue` directly, in Phase 3).
+    """
+    per_venue_specs: list[list[tuple[VenueId, str, str]]] = [
+        [
+            (venue, market.market_id, outcome)
+            for market in markets
+            for outcome in market.outcomes
+        ]
+        for venue, markets in top_markets_by_venue.items()
+    ]
+    interleaved: list[tuple[VenueId, str, str]] = []
+    for round_specs in zip_longest(*per_venue_specs, fillvalue=None):
+        for spec in round_specs:
+            if spec is not None:
+                interleaved.append(spec)
+    return interleaved
+
+
+async def _fetch_book(
+    adapter: MarketDataAdapter,
+    venue: VenueId,
+    market_id: str,
+    outcome: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[VenueId, str, str, OrderBook] | None:
+    """Fetch one `(venue, market, outcome)` book under a shared bound.
+
+    See the module docstring's "BOOK FETCH IS CONCURRENT..." section.
+    Catching `VenueError` HERE, inside the unit of work `asyncio.gather`
+    runs hundreds of copies of, rather than around the `gather` call
+    itself, is what keeps one bad book from taking the whole pass down:
+    `gather`'s default `return_exceptions=False` cancels every OTHER
+    still-running fetch (any venue) the instant any single coroutine
+    raises, so an uncaught exception here would turn one 404 into every
+    book this pass was fetching, from every venue, being lost.
+
+    Args:
+        adapter: The book's own venue's read-only adapter.
+        venue: The venue id, carried through so the caller can key the
+            result without re-deriving it from `adapter`.
+        market_id: The market to fetch a book for.
+        outcome: The outcome to fetch a book for.
+        semaphore: Shared across the WHOLE pass (every venue's fetches
+            together, not one semaphore per venue) so the concurrency
+            bound actually limits total in-flight requests rather than
+            letting N venues each run `scan_book_fetch_concurrency`
+            calls at once.
+
+    Returns:
+        tuple[VenueId, str, str, OrderBook] | None: `(venue, market_id,
+            outcome, book)` on success; `None` if the venue raised
+            `VenueError` (rate-limited, 404, ...) for this one book —
+            logged at `debug`, exactly as the serial code always did.
+    """
+    async with semaphore:
+        try:
+            book = await adapter.get_book(market_id, outcome)
+        except VenueError:
+            logger.debug(
+                "scanner",
+                extra={
+                    "event": "get_book_failed",
+                    "venue": venue,
+                    "market_id": market_id,
+                    "outcome": outcome,
+                },
+            )
+            return None
+    return venue, market_id, outcome, book
+
+
 def _leg_dict(leg: Leg) -> dict[str, Any]:
     """Return one leg as a JSON-serializable dict, field by field."""
     return {
@@ -542,20 +709,28 @@ async def scan(
 ) -> list[ScoredIntent]:
     """Run one discovery pass over `adapters`: read, score, persist. Never routes.
 
-    For each venue in `adapters`: reads every `status="open"` market,
-    keeps the top `settings.scan_top_n` by `_volume`, fetches a book per
-    (market, outcome), and builds a `MarketSnapshot`. Every requested
-    strategy then runs `on_market_data` over every snapshot; each
-    resulting `Signal`/`Intent` is normalized to an `Intent`, scored
+    For each venue in `adapters`: reads every `status="open"` market and
+    keeps the top `settings.scan_top_n` by `_volume`. Every venue's
+    remaining `(market, outcome)` books are then fetched TOGETHER,
+    concurrently, bounded by one shared `asyncio.Semaphore` sized
+    `settings.scan_book_fetch_concurrency` (T35 — see the module
+    docstring's "BOOK FETCH IS CONCURRENT..." section for why this is a
+    correctness fix, not only a performance one: a cross-venue signal
+    compares two books that must actually be close together in time).
+    Each `MarketSnapshot` is then built from the completed fetch. Every
+    requested strategy then runs `on_market_data` over every snapshot;
+    each resulting `Signal`/`Intent` is normalized to an `Intent`, scored
     (`app.services.scoring.score`), and persisted as a `pending`
     `IntentRecord` — UNLESS scoring raises `UnscorableIntent` (a resolved
     market, a missing `expected_resolution_ts`), in which case that one
     intent is skipped and logged, not the whole pass.
 
-    A failure reading one venue, or one strategy raising on one snapshot,
-    is logged and skipped rather than aborting the pass — a broken
-    Kalshi feed must not also blank out Polymarket's opportunities, and a
-    bug in one strategy must not silence every other one.
+    A failure reading one venue, one book, or one strategy raising on one
+    snapshot, is logged and skipped rather than aborting the pass — a
+    broken Kalshi feed (whether it cannot be listed at all, or just can't
+    answer for one book) must not also blank out Polymarket's
+    opportunities, and a bug in one strategy must not silence every
+    other one.
 
     Args:
         strategy_names: `app.strategies.STRATEGIES` keys to run.
@@ -582,9 +757,12 @@ async def scan(
     strategies = _build_strategies(strategy_names, links)
 
     markets_by_key: dict[tuple[str, str], VenueMarket] = {}
-    books_by_key: dict[tuple[str, str, str], OrderBook] = {}
-    snapshots: list[MarketSnapshot] = []
+    top_markets_by_venue: dict[VenueId, list[VenueMarket]] = {}
 
+    # Phase 1: list markets per venue, unchanged from before this task —
+    # two `list_markets` calls (one per venue today) are not the
+    # rate-limit/skew problem T35 exists for; the ~800 `get_book` calls
+    # below are. A venue that cannot be listed is skipped, not fatal.
     for venue, adapter in adapters.items():
         try:
             markets = await adapter.list_markets(status="open")
@@ -596,26 +774,69 @@ async def scan(
         top_markets = sorted(markets, key=_volume, reverse=True)[
             : settings_obj.scan_top_n
         ]
+        top_markets_by_venue[venue] = top_markets
         for market in top_markets:
             markets_by_key[(venue, market.market_id)] = market
-            for outcome in market.outcomes:
-                try:
-                    book = await adapter.get_book(market.market_id, outcome)
-                except VenueError:
-                    logger.debug(
-                        "scanner",
-                        extra={
-                            "event": "get_book_failed",
-                            "venue": venue,
-                            "market_id": market.market_id,
-                            "outcome": outcome,
-                        },
-                    )
-                    continue
-                books_by_key[
-                    (venue, market.market_id, normalize_outcome(outcome))
-                ] = book
-            snapshots.append(_snapshot_from_market(market, books_by_key, now))
+
+    # Phase 2: fetch EVERY book this pass needs, from EVERY venue,
+    # TOGETHER, under one shared `asyncio.Semaphore` — see the module
+    # docstring's "BOOK FETCH IS CONCURRENT..." section for why a single
+    # global bound (not one per venue, not unbounded) is what addresses
+    # both the rate-limit risk and the cross-venue snapshot-skew risk at
+    # once, and why `_fetch_book` catches `VenueError` itself rather than
+    # letting `asyncio.gather` see it.
+    fetch_specs: list[tuple[VenueId, str, str]] = _interleave_fetch_specs(
+        top_markets_by_venue
+    )
+    semaphore = asyncio.Semaphore(settings_obj.scan_book_fetch_concurrency)
+    fetch_started = time.monotonic()
+    fetch_results = await asyncio.gather(
+        *(
+            _fetch_book(adapters[venue], venue, market_id, outcome, semaphore)
+            for venue, market_id, outcome in fetch_specs
+        )
+    )
+    fetch_elapsed_s = time.monotonic() - fetch_started
+
+    books_by_key: dict[tuple[str, str, str], OrderBook] = {}
+    for fetched in fetch_results:
+        if fetched is None:
+            continue
+        fetched_venue, fetched_market_id, fetched_outcome, book = fetched
+        books_by_key[
+            (fetched_venue, fetched_market_id, normalize_outcome(fetched_outcome))
+        ] = book
+
+    # The cheapest operator-facing signal for "were this pass's books
+    # close enough together in time for a cross-venue edge to mean
+    # anything": the wall-clock length of the WHOLE concurrent fetch
+    # phase above. Not a per-book-pair skew table (a real measurement,
+    # but a schema/API change outside this task's file set) — this is a
+    # health metric for the pass, not a scored input.
+    logger.info(
+        "scanner",
+        extra={
+            "event": "scan_book_fetch_complete",
+            "books_requested": len(fetch_specs),
+            "books_fetched": sum(1 for fetched in fetch_results if fetched is not None),
+            "concurrency_bound": settings_obj.scan_book_fetch_concurrency,
+            "fetch_elapsed_s": round(fetch_elapsed_s, 3),
+        },
+    )
+
+    # Phase 3: build every `MarketSnapshot` now that every book this pass
+    # will ever fetch has already landed in `books_by_key`. Iterates
+    # venues/markets in the EXACT same order the old single-pass loop
+    # did (`top_markets_by_venue` was populated in that same order in
+    # Phase 1), so `snapshots`' order — and therefore which opportunities
+    # a given fixture yields — is unchanged; only WHEN and in what order
+    # the network calls that filled `books_by_key` completed is
+    # different, and nothing downstream reads that.
+    snapshots: list[MarketSnapshot] = [
+        _snapshot_from_market(market, books_by_key, now)
+        for top_markets in top_markets_by_venue.values()
+        for market in top_markets
+    ]
 
     # `cross_venue_arbitrage` needs BOTH legs' books to price either
     # direction, but a `MarketSnapshot` carries only one outcome's book —

@@ -1,4 +1,5 @@
-"""Opportunity scoring (PLAN.md D10, T19; rebased on one edge basis in T31).
+"""Opportunity scoring (PLAN.md D10, T19; rebased on one edge basis in T31;
+edge-basis enforcement in T34).
 
 `score(intent, ctx)` is the ONE place every strategy's output is reduced
 to a single, comparable `composite` ranking number, regardless of which
@@ -38,6 +39,25 @@ INCOMPARABLE" for the honest limits of the claim):
    having none, which is both the common case and the safe reading:
    nothing is silently double-discounted, and a strategy that DOES carry
    the risk has to say so in the payload to have it priced.
+
+   T34 CLOSED THE MIRROR-IMAGE GAP: "publishes an unhaircut edge" was
+   never the only way a fifth strategy could get this wrong.
+   `favorite_compounder` and `no_bias_exploit` (neither in
+   `STRATEGY_CATEGORIES["arbitrage"]` today, so this was latent, not
+   live) publish a DIRECTIONAL mispricing estimate — a bet that a price
+   is wrong and will move — under the exact same `"edge"` key
+   `SCORING_EDGE_KEY` reads, because that key predates this contract.
+   Nothing about the metadata SHAPE distinguishes "pre-risk arbitrage
+   edge" from "directional probability gap"; both are a bare float under
+   `"edge"`. Adding either strategy to the arbitrage category is a
+   one-line, innocuous-looking change, and the day it happens this
+   module would annualize and rank their directional number as if it
+   were riskless arbitrage, with no error and nothing visibly wrong —
+   the exact failure shape this kit has hit before (a $0 `net_edge` on a
+   real 7.5% arb; a silently-discarded `slippage_bps`). `_published_edge`
+   refuses instead: a strategy that knows its `edge` is not this
+   contract's kind of number says so via `EDGE_BASIS_DIRECTIONAL`, and
+   `score()` raises `UnscorableIntent` rather than reading it anyway.
 
 2. IDENTITY RISK IS PRICED EXACTLY ONCE, HERE. `_risk_adjusted_edge`
    applies `edge * p - (1 - p) * worst_case_loss` — the same formula
@@ -262,6 +282,21 @@ _PRICE_EPSILON = 1e-12
 #: value exactly (duplicated for the same reason as the epsilon above).
 _CROSSED_QUOTES_KEY = "crossed_quotes"
 
+#: `EDGE_BASIS_KEY` values `_published_edge` will actually price (T34,
+#: NOTES.md). An intent that declares NO basis at all is still scored —
+#: absence means the strategy predates this label and its `edge` is the
+#: contract's plain per-unit dollar figure, exactly as it always was
+#: (every pre-T34 test and strategy relies on this default). An intent
+#: that DOES declare a basis outside this set — `EDGE_BASIS_DIRECTIONAL`,
+#: or any future value this module has never heard of — is refused
+#: outright rather than scored: the whole point of the label is that a
+#: strategy can say "whatever I published under `SCORING_EDGE_KEY` is
+#: NOT that number" and have scoring believe it, so a new non-arbitrage
+#: strategy landing in `STRATEGY_CATEGORIES["arbitrage"]` by a one-line
+#: mistake fails loudly instead of being annualized and ranked as if its
+#: directional bet were a riskless edge.
+_SCORABLE_EDGE_BASES = frozenset({EDGE_BASIS_OBSERVED, EDGE_BASIS_IDENTITY_ESTIMATED})
+
 
 class UnscorableIntent(ValueError):
     """`score()` cannot produce a meaningful `OpportunityScore` for this intent.
@@ -427,9 +462,11 @@ def score(
             if any leg's `(venue, market_id)` is not in `ctx.markets`, if
             any leg's market is already `"resolved"`, if (unless
             `allow_past_close`) any leg's market is past its
-            `close_time`, or if any scoring-contract metadata value the
-            intent DID publish is unreadable as a number or out of range
-            (see `_published_edge`/`_risk_adjusted_edge`).
+            `close_time`, if any scoring-contract metadata value the
+            intent DID publish is unreadable as a number or out of range,
+            or if the intent declares an `EDGE_BASIS_KEY` this module
+            does not treat as a scorable, fee-netted edge (T34; see
+            `_published_edge`/`_risk_adjusted_edge`).
     """
     leg_markets = _leg_markets(intent, ctx, allow_past_close=allow_past_close)
     hours_to_resolution = _hours_to_resolution(intent, ctx.now)
@@ -584,6 +621,17 @@ def _published_edge(intent: Intent) -> float:
     lives in. An intent publishing neither key (a directional single-leg
     intent) has no measurable riskless edge for this field.
 
+    T34 (NOTES.md): before either key is read, this checks whether the
+    intent DECLARED an `EDGE_BASIS_KEY` outside `_SCORABLE_EDGE_BASES`.
+    `favorite_compounder`/`no_bias_exploit` publish a directional
+    mispricing estimate under the SAME `"edge"` spelling `SCORING_EDGE_KEY`
+    uses, for reasons that predate this contract — reading their number
+    as a fee-netted settlement edge would annualize and rank a
+    directional bet as if it were riskless arbitrage, silently, the
+    moment either strategy is ever scored. A strategy declaring no basis
+    at all is unaffected: absence is the pre-T34 default, and every
+    strategy that predates this label is still read exactly as before.
+
     Args:
         intent: The intent being scored.
 
@@ -591,8 +639,21 @@ def _published_edge(intent: Intent) -> float:
         float: The published pre-risk edge, or `0.0`.
 
     Raises:
-        UnscorableIntent: If a published edge is not a number.
+        UnscorableIntent: If a published edge is not a number, or if
+            `intent.metadata[EDGE_BASIS_KEY]` is declared and is not one
+            of `_SCORABLE_EDGE_BASES` — i.e. the strategy itself says its
+            edge is not this contract's kind of number.
     """
+    declared_basis = intent.metadata.get(EDGE_BASIS_KEY)
+    if declared_basis is not None and declared_basis not in _SCORABLE_EDGE_BASES:
+        raise UnscorableIntent(
+            f"intent.metadata[{EDGE_BASIS_KEY!r}] is {declared_basis!r}, which is "
+            f"not one of {sorted(_SCORABLE_EDGE_BASES)!r}; this intent's "
+            f"{SCORING_EDGE_KEY!r}/{SCORING_EDGE_LEGACY_KEY!r} (if any) is not the "
+            "fee-netted, settlement-realized, per-contract USD figure the "
+            "scoring contract requires (app.strategies.base), and score() will "
+            "not read it as one"
+        )
     if SCORING_EDGE_KEY in intent.metadata:
         return _metadata_float(intent, SCORING_EDGE_KEY)
     if SCORING_EDGE_LEGACY_KEY in intent.metadata:

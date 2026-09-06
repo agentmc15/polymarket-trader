@@ -244,3 +244,33 @@ async def test_cancel_an_unknown_order_returns_404(client: AsyncClient) -> None:
     response = await client.delete("/api/v1/trading/orders/999999")
 
     assert response.status_code == 404
+
+
+async def test_an_order_body_with_an_unknown_venue_key_is_refused_not_routed(
+    client: AsyncClient,
+) -> None:
+    """T33: a misspelled body key is a 422 naming it, never a silent default.
+
+    `venue` is the one `OrderRequest` field with a default
+    (`"polymarket"`), which makes it the one place a swallowed key on
+    this route costs real money: a client posting `"exchange": "kalshi"`
+    (or `"venu"`) used to be accepted, the key discarded, and the order
+    ROUTED TO POLYMARKET — the wrong venue, with no error anywhere.
+
+    The `GET /orders` assertion is the half that matters: a 422 alone
+    would be satisfied by any validation failure, but nothing must have
+    reached `OrderRouter` at all.
+    """
+    response = await client.post(
+        "/api/v1/trading/orders", json=_order_payload(exchange="kalshi")
+    )
+
+    assert response.status_code == 422, response.text
+    assert [
+        error["loc"][-1]
+        for error in response.json()["detail"]
+        if error["type"] == "extra_forbidden"
+    ] == ["exchange"]
+
+    listed = await client.get("/api/v1/trading/orders")
+    assert listed.json()["orders"] == []
