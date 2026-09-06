@@ -9,7 +9,15 @@ def reset_daily_stats() -> dict:
     Returns:
         dict: Reset results.
     """
-    # TODO: Implement daily stats reset
+    # TODO: Implement daily stats reset. `Bot.reset_daily_stats()`
+    # (`app/bots/base.py`) already exists but resets in-memory state on
+    # a `BotManager` instance that lives in the API process — a Celery
+    # worker process has no access to it, so wiring this task straight
+    # to that method would not even be correct once written; the state
+    # needs a DB-backed home first. T41: deliberately NOT on the beat
+    # schedule (see the comment above `celery_app.conf.beat_schedule` in
+    # `app/tasks/__init__.py`) while this stays a stub that
+    # unconditionally reports "success".
     return {"status": "success", "bots_reset": 0}
 
 

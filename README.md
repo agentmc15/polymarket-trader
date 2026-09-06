@@ -88,7 +88,7 @@ Python 3.12. No virtualenv is assumed.
 cd backend && python3 -m pytest -q
 ```
 
-**738 tests**, SQLite in-memory via `aiosqlite`, **no network access** — every venue interaction in
+**826 tests**, SQLite in-memory via `aiosqlite`, **no network access** — every venue interaction in
 the suite goes through recorded fixtures or `httpx.MockTransport`.
 
 ### Run a capital sweep with no database
@@ -307,14 +307,9 @@ Stated plainly, because a limitation you cannot see is worse than one you can.
    here means "every complement intent is half-recorded by construction."
 3. **`PriceHistory` has no outcome column**, so the DB-backed replayer can only attach a `"YES"`
    book, and every recorded Kalshi book is currently dead data for DB-backed backtests.
-4. **Cross-venue arbitrage produces nothing out of the box.** `event_links` starts empty and
-   `propose_links` is reachable only via `POST /links/propose` — there is no scheduled job and no UI.
-   Approval is correctly human-gated; there is simply nothing to approve until you propose links.
-5. **Strategies do not price fees on a uniform basis.** Realized P&L is unaffected (the fill engine
+4. **Strategies do not price fees on a uniform basis.** Realized P&L is unaffected (the fill engine
    charges the true per-level fee), but the *emission gates* differ, so which opportunities exist at
    all is not calibrated identically across strategies.
-6. **Frontend/backend contract drift predating this work** means the Results tab may not activate
-   after a run (`POST /backtests` returns `id`; the client reads `backtest_id`).
 
 See `HANDOFF.md` for the current remediation queue.
 

@@ -40,19 +40,47 @@ celery_app.conf.update(
 )
 
 # Beat schedule for periodic tasks
+#
+# T41 (deployment coherence audit): `app.tasks.market_sync.sync_markets`,
+# `.sync_prices` and `app.tasks.bot_execution.reset_daily_stats` used to
+# be registered here as "sync-markets-every-5-minutes",
+# "sync-prices-every-minute" and "reset-daily-stats-at-midnight". All
+# three are `# TODO` stubs that unconditionally return
+# `{"status": "success", ...: 0}` — so they fired on schedule, did
+# nothing, and reported health while doing it. A monitoring dashboard
+# reading these beats sees three green heartbeats and an operator
+# concludes market sync is running, which is false: the real market
+# sync path is `app.services.data_collector.DataCollector`, driven
+# manually via `app.scripts.sync_markets` / `app.scripts.collect_prices`,
+# entirely outside Celery.
+#
+# Deliberately UNREGISTERED rather than converted to "honest failure"
+# beats: every entry below carries a comment justifying why it is safe
+# and useful to fire on a clock, matching this file's own convention —
+# a stub with no such justification is the anomaly, not a candidate for
+# a manufactured non-success status. `sync_orderbooks`,
+# `check_stop_loss` and `check_take_profit` (also stubs, in
+# market_sync.py / bot_execution.py) were never scheduled either; this
+# just makes the other three consistent with that existing, correct
+# treatment. A beat that fires every 60s and always reports failure
+# would also page/alert on a "regression" that never happened, which is
+# its own kind of misleading. Absence from this dict is the honest
+# signal: nothing here claims to run market sync, so nobody checking
+# THIS FILE (not the task bodies) concludes that it does. Re-add the
+# entry here, with the same kind of justifying comment as its
+# neighbors, once the callable it points to does real work.
+#
+#   "sync-markets-every-5-minutes": {
+#       "task": "app.tasks.market_sync.sync_markets", "schedule": 300.0,
+#   },
+#   "sync-prices-every-minute": {
+#       "task": "app.tasks.market_sync.sync_prices", "schedule": 60.0,
+#   },
+#   "reset-daily-stats-at-midnight": {
+#       "task": "app.tasks.bot_execution.reset_daily_stats",
+#       "schedule": 86400.0,
+#   },
 celery_app.conf.beat_schedule = {
-    "sync-markets-every-5-minutes": {
-        "task": "app.tasks.market_sync.sync_markets",
-        "schedule": 300.0,  # 5 minutes
-    },
-    "sync-prices-every-minute": {
-        "task": "app.tasks.market_sync.sync_prices",
-        "schedule": 60.0,  # 1 minute
-    },
-    "reset-daily-stats-at-midnight": {
-        "task": "app.tasks.bot_execution.reset_daily_stats",
-        "schedule": 86400.0,  # 24 hours
-    },
     # T14: an `Order` row is committed PENDING before the venue is
     # called (crash-safety), so something has to come back and resolve
     # it. 60s is short enough that a lost order is noticed while it

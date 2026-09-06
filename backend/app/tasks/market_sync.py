@@ -9,7 +9,14 @@ def sync_markets() -> dict:
     Returns:
         dict: Sync results.
     """
-    # TODO: Implement market sync
+    # TODO: Implement market sync. Real market sync already exists —
+    # `app.services.data_collector.DataCollector` /
+    # `app.scripts.sync_markets` — it is just not driven from here.
+    # T41: deliberately NOT on the beat schedule (see the comment above
+    # `celery_app.conf.beat_schedule` in `app/tasks/__init__.py`) while
+    # this stays a stub that unconditionally reports "success"; wire it
+    # up there, not by changing this return value in isolation, when it
+    # does real work.
     return {"status": "success", "markets_synced": 0}
 
 
@@ -20,7 +27,12 @@ def sync_prices() -> dict:
     Returns:
         dict: Sync results.
     """
-    # TODO: Implement price sync
+    # TODO: Implement price sync. Real price collection already exists —
+    # `app.services.data_collector.DataCollector` /
+    # `app.scripts.collect_prices` — it is just not driven from here.
+    # T41: deliberately NOT on the beat schedule (see the comment above
+    # `celery_app.conf.beat_schedule` in `app/tasks/__init__.py`) while
+    # this stays a stub that unconditionally reports "success".
     return {"status": "success", "prices_synced": 0}
 
 
