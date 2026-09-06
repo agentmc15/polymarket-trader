@@ -66,38 +66,70 @@ coroutines were listed in — so a naive venue-by-venue spec list (every
 one of venue A's specs before venue B's first) would still let venue A
 monopolize the front of that queue and push venue B's books into the
 back half of the pass, reproducing the same sequential-by-venue skew
-one layer down. `_interleave_fetch_specs` round-robins across venues
-for exactly this reason: every batch the semaphore admits contains a
-mix of venues from the very first one, so both venues' books arrive
-throughout the WHOLE fetch window instead of in two back-to-back
-blocks. `_fetch_book` is the unit of work `asyncio.
-gather` runs 800(-ish) copies of; it catches `VenueError` INSIDE itself
-and returns `None` rather than raising, which is the part that matters —
-`asyncio.gather`'s default `return_exceptions=False` cancels every OTHER
-in-flight fetch the instant any one coroutine raises, so catching
-outside the gather (or not at all) would turn "Kalshi's book 47 is a
-404" into "every book this pass was fetching, from BOTH venues, is lost"
-— a strictly worse failure than the serial code this replaces, where one
-bad book only cost that one book. Catching inside each unit of work is
-what makes the serial code's per-book isolation (unchanged: still
-exactly one `except VenueError`, still logged at `debug`, still skipped
-without effect on any other book) survive the move to concurrency, and
-it is also what gives a wholly-unreachable venue (not just one bad
-market) the same treatment for free — its books all resolve to `None`
-while the other venue's arrive on schedule, with no separate branch
-needed. `fetch_elapsed_s` (logged as `scan_book_fetch_complete`) is the
-wall-clock length of that ENTIRE concurrent phase — the cheapest number
-that answers "were this pass's books close enough together in time for
-its own signals to mean anything," without adding a persisted
-per-book-pair skew table (a real measurement, but a schema/API change
-outside this task's file set, and overkill for what is fundamentally an
-operator health signal, not a scored input). This is a fetch-STRATEGY
-change only: the two-phase split (fetch every book first, THEN build
-every `MarketSnapshot`) preserves the exact venue/market iteration order
-`scan()` always built `snapshots` in, so which opportunities a given
-fixture yields is unchanged — only WHEN, and in what order, the network
-calls that fill `books_by_key` complete is different, and nothing here
-reads that order.
+one layer down. `_interleave_fetch_specs` round-robins across venues for
+exactly this reason: every batch the semaphore admits contains a mix of
+venues from the very first one, so neither venue's whole block can
+precede the other's.
+
+WHAT THE INTERLEAVE DOES NOT DO, AND WHAT ACTUALLY BOUNDS SKEW (T38 F5).
+This paragraph used to claim the round-robin means "both venues' books
+arrive throughout the WHOLE fetch window instead of in two back-to-back
+blocks". Measured, that is overstated, and for uneven venues it is
+false: on the metric that matters (the gap between the two legs of ONE
+link, as a percentage of the fetch window, over links pairing ARBITRARY
+markets across the two venues — which is what the matcher produces) the
+interleave takes the MEAN from 51.2% to 34.1% for 200-vs-200 markets and
+from 52.5% to only 47.8% for 200-vs-20, and the WORST case is 100% of
+the window under both orders. When one venue carries far fewer markets,
+`zip_longest` exhausts
+it early and its books really do land as a block in the first fifth of
+the window. THE MECHANISM THAT MAKES A CROSS-VENUE SIGNAL DEFENSIBLE IS
+THE WINDOW LENGTH, not the ordering: ~800 serial round trips became ~40
+bounded waves, so "98% of the window" went from minutes to
+milliseconds. `scan()` therefore MEASURES the worst and mean per-link
+pair skew it actually achieved (`_link_pair_skew`, logged on
+`scan_book_fetch_complete` beside `fetch_elapsed_s`) rather than
+asserting a bound the ordering cannot provide. Genuinely BOUNDING the
+worst case needs a different mechanism — a link's two legs admitted as
+one adjacent unit, or a re-fetch when a partner lands too late — which
+is a scheduling change, not an ordering one, and is deliberately left
+for a follow-up.
+
+ONE BAD BOOK COSTS ONE BOOK — WHICH TOOK T38 TO ACTUALLY BE TRUE.
+`_fetch_book` is the unit of work `asyncio.gather` runs 800(-ish) copies
+of, and it handles the failure INSIDE itself rather than letting the
+`gather` see it. That much was always the design; what was wrong was the
+SET it handled. It caught `VenueError` only — and the adapters
+deliberately do NOT flatten the common failures into `VenueError`
+(`app.venues.kalshi.adapter.raise_for_venue_error` maps 429 and 401/403
+and lets every other status fall through to `raise_for_status()`, saying
+so in its own docstring; Polymarket's `get_book` calls a bare
+`raise_for_status()`). A 404 on a delisted ticker, a 500, or a read
+timeout therefore arrived as `httpx.HTTPError`, escaped `_fetch_book`,
+and propagated out of a `gather` running under the default
+`return_exceptions=False` — which does not even cancel the siblings, it
+just abandons them mid-flight and raises. Measured on 200+200 markets at
+bound 20 with ONE book failing: an `httpx.HTTPStatusError` or an
+`httpx.ReadTimeout` made `scan()` RAISE with 39 of 800 books surviving,
+while the `VenueError` it did catch cost exactly one book. On a
+120-second beat that is an indefinite outage — every pass produces zero
+opportunities and never reaches `session.commit()`, with no signal but
+opportunities drying up. `VENUE_READ_FAULTS` (below) is now the
+explicit, documented set that is skipped and COUNTED, `gather` runs with
+`return_exceptions=True` so nothing is left orphaned, and anything
+outside that set — a programming error in a parsing path — is re-raised
+after every sibling has settled, loudly, rather than being disguised as
+a flaky venue. A failed book is reported on the same
+`scan_book_fetch_complete` line (`books_failed`, broken down by venue
+and by error type, logged at WARNING when non-zero) because a pass that
+quietly returns 39 of 800 books is its own failure mode.
+
+This remains a fetch-STRATEGY change only: the two-phase split (fetch
+every book first, THEN build every `MarketSnapshot`) preserves the exact
+venue/market iteration order `scan()` always built `snapshots` in, so
+which opportunities a given fixture yields is unchanged — only WHEN, and
+in what order, the network calls that fill `books_by_key` complete is
+different, and nothing here reads that order.
 
 LINK STATUS RIDES THROUGH TO THE SCORE. `app.strategies
 .cross_venue_arbitrage.LinkBook` accepts ONLY `status == "approved"`
@@ -270,12 +302,14 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from itertools import zip_longest
 from typing import Any
 
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -344,6 +378,49 @@ NEAR_RESOLUTION_STRATEGY: str = SettlementEdgeStrategy.name
 SCAN_PASS_KEY = "scan_pass"
 ARBITRAGE_SCAN_PASS = "arbitrage"
 NEAR_RESOLUTION_SCAN_PASS = "near_resolution"
+
+#: WHAT "THE VENUE COULD NOT ANSWER FOR THIS ONE BOOK" MEANS, EXACTLY
+#: (T38 F2). Every read this module performs against a venue is skipped
+#: and counted -- never fatal to the pass -- for exactly these types, and
+#: for nothing else.
+#:
+#: `VenueError` alone (what this module caught before T38) was not the
+#: set it claimed to be, because the adapters DELIBERATELY do not flatten
+#: the common failures into it. `app.venues.kalshi.adapter
+#: .raise_for_venue_error` maps only 429 -> `VenueRateLimited` and
+#: 401/403 -> `VenueAuthError` and says so in its own docstring; every
+#: other status falls through to `httpx.Response.raise_for_status()`.
+#: `app.venues.polymarket.adapter.PolymarketAdapter.get_book` calls a
+#: bare `raise_for_status()`. So the single commonest venue failures --
+#: a 404 on a delisted or reissued ticker, a 500, a read timeout, a
+#: dropped connection -- all arrive here as `httpx.HTTPError`, NOT as
+#: `VenueError`, and were therefore fatal to the whole pass rather than
+#: to the one book. `httpx.HTTPError` is the exact umbrella for that:
+#: `HTTPStatusError` (any error status) plus every `RequestError`
+#: (`ConnectError`, `ReadTimeout`, `RemoteProtocolError`, ...). It does
+#: NOT cover `httpx.InvalidURL`/`httpx.CookieConflict`, which derive
+#: from `Exception` directly and are caller bugs, not venue faults.
+#:
+#: WHAT IS DELIBERATELY NOT IN HERE, and why this is not `except
+#: Exception`. A bare `Exception` per book would also swallow a
+#: PROGRAMMING error -- an `AttributeError` or a `KeyError` in a parsing
+#: path -- and report it as "the venue was flaky". Every book would take
+#: the same branch, so the pass would return a handful of books, log
+#: some debug lines, commit nothing interesting, and look like a quiet
+#: venue outage rather than the code defect it is. Those still abort the
+#: pass, loudly, with a traceback. `asyncio.CancelledError` is likewise
+#: absent: it derives from `BaseException`, so no `except Exception`
+#: clause here can catch it and shutdown/cancellation semantics are
+#: unaffected -- stated because it is a property worth not losing by
+#: accident, not because a clause enforces it.
+#:
+#: A venue payload that is not JSON at all is the venue's fault, not
+#: ours, and belongs in this class -- but `json.JSONDecodeError` is a
+#: `ValueError` and would drag every genuine `ValueError` in with it, so
+#: it is flattened to `VenuePayloadError` AT THE ADAPTER BOUNDARY
+#: instead (`app.venues.polymarket.adapter`, T38; Kalshi's `json_object`
+#: already did this) rather than being widened into this tuple.
+VENUE_READ_FAULTS: tuple[type[Exception], ...] = (VenueError, httpx.HTTPError)
 
 
 @dataclass(frozen=True)
@@ -535,13 +612,52 @@ def _interleave_fetch_specs(
     then cannot even START until roughly `len(venue A's specs) / B`
     batches have already drained — a global semaphore reproduces
     "fetch venue A fully, then venue B" in miniature, right down to the
-    two venues' books landing in two mostly-disjoint time windows. That
-    is exactly the cross-venue snapshot skew this task exists to close,
-    just measured in fetch batches instead of minutes. Round-robining
-    the specs (venue1[0], venue2[0], venue1[1], venue2[1], ...) instead
-    means every batch of `B` admitted specs contains a mix of venues
-    from the very first one, so both venues' books arrive throughout the
-    WHOLE fetch window rather than in sequential blocks.
+    two venues' books landing in two mostly-disjoint time windows.
+    Round-robining the specs (venue1[0], venue2[0], venue1[1],
+    venue2[1], ...) removes that particular pathology: every batch of
+    `B` admitted specs contains a mix of venues from the very first one,
+    so neither venue's whole block can precede the other's.
+
+    WHAT THIS DOES **NOT** BUY, MEASURED (T38 F5). An earlier version of
+    this docstring claimed the interleave means "both venues' books
+    arrive throughout the WHOLE fetch window rather than in sequential
+    blocks". That is overstated, and in one common shape it is simply
+    false. What was actually measured, in admission order, on the metric
+    that matters (the gap between the two legs of ONE link, as a
+    percentage of the fetch window):
+
+        200 vs 200 markets:  interleaved mean 34.1%, venue-grouped 51.2%
+        200 vs  20 markets:  interleaved mean 47.8%, venue-grouped 52.5%
+
+    and the WORST case is 100% of the window under BOTH orders. THE
+    PAIRING MODEL IS LOAD-BEARING and is the reason those numbers are
+    not flattering: a link pairs ARBITRARY markets across the two venues
+    (Polymarket's #7 with Kalshi's #143 — that is what the matcher
+    produces), not same-index ones. Simulated with index-ALIGNED pairs
+    the interleave scores a perfect 0% skew, which is why an
+    order-only argument looks so much stronger than it is. So the
+    interleave buys roughly 17 points of MEAN pair skew when the two
+    venues carry a similar number of markets, roughly 5 points when they
+    do not, and it never bounds the worst case at all. When one venue is
+    much smaller, `zip_longest` exhausts it early and its books really
+    do land as a block in the first fifth of the window — exactly the
+    shape the old claim denied.
+
+    The interleave is still worth keeping (it is free, it strictly
+    improves the mean, and it removes the degenerate venue-grouped
+    ordering), but it is NOT the mechanism that makes a cross-venue
+    signal defensible. THE WINDOW LENGTH IS. Going from ~800 serial
+    round trips to ~40 bounded waves is what took the skew from minutes
+    to milliseconds; a pair skew of "98% of the window" is harmless at a
+    300ms window and fatal at a 3-minute one. `scan()` therefore
+    MEASURES the worst and mean per-link pair skew it actually achieved
+    (`_link_pair_skew`, logged on `scan_book_fetch_complete`) rather
+    than asserting a bound this function cannot provide. Genuinely
+    BOUNDING it would need a different mechanism — fetching each link's
+    two legs as an adjacent pair under their own admission slot, or
+    re-fetching a leg whose partner landed too late — which is a
+    scheduling change, not an ordering one, and is deliberately left for
+    a follow-up rather than half-built here.
 
     Args:
         top_markets_by_venue: Each venue's already-ranked, already-capped
@@ -572,23 +688,63 @@ def _interleave_fetch_specs(
     return interleaved
 
 
+@dataclass(frozen=True)
+class _BookFetch:
+    """The outcome of ONE `_fetch_book` call — succeeded or failed, always counted.
+
+    `_fetch_book` used to answer `None` for "this book failed", which
+    made a failure indistinguishable from a book nobody asked for once
+    the results were folded into `books_by_key`. A pass that quietly
+    returned 39 of 800 books read exactly like a pass that returned 800.
+    This type keeps the failure in the result set so it can be counted,
+    attributed to a venue, and grouped by what actually went wrong.
+
+    Attributes:
+        venue: The venue this book was requested from.
+        market_id: The market it was requested for.
+        outcome: The outcome it was requested for.
+        book: The fetched book, or `None` if the fetch failed.
+        error: `None` on success; otherwise the exception CLASS NAME
+            (`"HTTPStatusError"`, `"ReadTimeout"`, `"VenueRateLimited"`,
+            ...) — a name, never the message, so a venue's own error
+            text (untrusted data, GUARDRAILS.md §6) never becomes a log
+            field that looks structured.
+        completed_at: `time.monotonic()` at the moment this book landed,
+            or the moment the fetch failed. Feeds `_link_pair_skew` —
+            the measured answer to "how far apart in time were the two
+            books this cross-venue signal compares".
+    """
+
+    venue: VenueId
+    market_id: str
+    outcome: str
+    book: OrderBook | None
+    error: str | None
+    completed_at: float
+
+
 async def _fetch_book(
     adapter: MarketDataAdapter,
     venue: VenueId,
     market_id: str,
     outcome: str,
     semaphore: asyncio.Semaphore,
-) -> tuple[VenueId, str, str, OrderBook] | None:
+) -> _BookFetch:
     """Fetch one `(venue, market, outcome)` book under a shared bound.
 
-    See the module docstring's "BOOK FETCH IS CONCURRENT..." section.
-    Catching `VenueError` HERE, inside the unit of work `asyncio.gather`
-    runs hundreds of copies of, rather than around the `gather` call
-    itself, is what keeps one bad book from taking the whole pass down:
-    `gather`'s default `return_exceptions=False` cancels every OTHER
-    still-running fetch (any venue) the instant any single coroutine
-    raises, so an uncaught exception here would turn one 404 into every
-    book this pass was fetching, from every venue, being lost.
+    See the module docstring's "BOOK FETCH IS CONCURRENT..." section, and
+    `VENUE_READ_FAULTS` for exactly which exceptions are treated as "the
+    venue could not answer for this one book" and which still abort the
+    pass. Catching them HERE, inside the unit of work `asyncio.gather`
+    runs hundreds of copies of, rather than around the `gather` call, is
+    what keeps one bad book from costing every other book in flight.
+
+    A failure is RECORDED, not discarded: the returned `_BookFetch`
+    carries `book=None` and the exception's class name, so `scan()` can
+    count it, attribute it to its venue, and log an aggregate. The
+    per-book line stays at `debug` on purpose — an unreachable venue
+    produces one of these per book, and 800 warnings is not a signal.
+    The one-per-pass aggregate `scan()` emits is.
 
     Args:
         adapter: The book's own venue's read-only adapter.
@@ -603,15 +759,18 @@ async def _fetch_book(
             calls at once.
 
     Returns:
-        tuple[VenueId, str, str, OrderBook] | None: `(venue, market_id,
-            outcome, book)` on success; `None` if the venue raised
-            `VenueError` (rate-limited, 404, ...) for this one book —
-            logged at `debug`, exactly as the serial code always did.
+        _BookFetch: `book` set on success; `book=None` and `error` set to
+            the exception's class name for any `VENUE_READ_FAULTS` type.
+
+    Raises:
+        Exception: Anything NOT in `VENUE_READ_FAULTS` propagates
+            unchanged — a programming error in a parsing path is a bug
+            to surface, not a venue to skip.
     """
     async with semaphore:
         try:
             book = await adapter.get_book(market_id, outcome)
-        except VenueError:
+        except VENUE_READ_FAULTS as exc:
             logger.debug(
                 "scanner",
                 extra={
@@ -619,10 +778,73 @@ async def _fetch_book(
                     "venue": venue,
                     "market_id": market_id,
                     "outcome": outcome,
+                    "error": type(exc).__name__,
                 },
             )
-            return None
-    return venue, market_id, outcome, book
+            return _BookFetch(
+                venue=venue,
+                market_id=market_id,
+                outcome=outcome,
+                book=None,
+                error=type(exc).__name__,
+                completed_at=time.monotonic(),
+            )
+    return _BookFetch(
+        venue=venue,
+        market_id=market_id,
+        outcome=outcome,
+        book=book,
+        error=None,
+        completed_at=time.monotonic(),
+    )
+
+
+def _link_pair_skew(
+    links: Sequence[EventLink], completed_at: Mapping[tuple[str, str], float]
+) -> tuple[float, float, int]:
+    """Measure how far apart in time each approved link's two legs were read.
+
+    THE METRIC THE CONCURRENCY WORK IS ACTUALLY FOR (T38 F5). A
+    cross-venue signal is a claim that two prices are inconsistent AT
+    THE SAME MOMENT. The honest health number for that claim is not the
+    fetch window's length and not "were the venues interleaved" — it is,
+    for each link this pass could have priced, the gap between when its
+    two legs' books landed. `_interleave_fetch_specs` improves the MEAN
+    of this and does not bound its maximum (see that function's measured
+    numbers), so this reports the real, achieved value instead of
+    asserting one.
+
+    A link whose legs' books did not both land (either leg failed, or
+    the market was not in this pass's top-N) contributes nothing and is
+    not counted — an unmeasurable pair must not be averaged in as a
+    zero.
+
+    Args:
+        links: Every `EventLink` this pass read, any status; only
+            `"approved"` ones are measured, because only those can
+            produce a cross-venue intent (PLAN.md D9).
+        completed_at: `(venue, market_id) -> latest` `time.monotonic()`
+            at which any of that market's books landed. The LATEST, not
+            the first: a leg is only as fresh as the last book needed to
+            price it.
+
+    Returns:
+        tuple[float, float, int]: `(max_skew_s, mean_skew_s,
+            measured_links)`. `(0.0, 0.0, 0)` when no approved link had
+            both legs land.
+    """
+    skews: list[float] = []
+    for link in links:
+        if link.status != "approved":
+            continue
+        a = completed_at.get((link.venue_a, link.market_a))
+        b = completed_at.get((link.venue_b, link.market_b))
+        if a is None or b is None:
+            continue
+        skews.append(abs(a - b))
+    if not skews:
+        return 0.0, 0.0, 0
+    return max(skews), sum(skews) / len(skews), len(skews)
 
 
 def _leg_dict(leg: Leg) -> dict[str, Any]:
@@ -725,12 +947,22 @@ async def scan(
     market, a missing `expected_resolution_ts`), in which case that one
     intent is skipped and logged, not the whole pass.
 
-    A failure reading one venue, one book, or one strategy raising on one
-    snapshot, is logged and skipped rather than aborting the pass — a
-    broken Kalshi feed (whether it cannot be listed at all, or just can't
-    answer for one book) must not also blank out Polymarket's
-    opportunities, and a bug in one strategy must not silence every
-    other one.
+    A VENUE failing to answer — a venue that cannot be listed at all, or
+    one book answering 404/500/timeout/connection-reset — is counted,
+    logged and skipped rather than aborting the pass: a broken Kalshi
+    feed must not also blank out Polymarket's opportunities. The exact
+    set of exceptions that means is `VENUE_READ_FAULTS`, and it is
+    deliberately NOT "any exception". A programming error (an
+    `AttributeError` in a parsing path, say) still aborts this pass with
+    a traceback, because it would take the same branch for EVERY book
+    and a pass that returned 39 of 800 books while logging `debug` lines
+    would read as a quiet venue rather than the defect it is. Every book
+    that did fail is reported on the `scan_book_fetch_complete` log line
+    (`books_failed`, `book_failures_by_venue`, `book_failures_by_error`;
+    WARNING when non-zero). A bug in one STRATEGY, separately, must not
+    silence every other one — that catch is broad on purpose, since a
+    strategy is a pure function over one snapshot and cannot corrupt
+    another one's inputs.
 
     Args:
         strategy_names: `app.strategies.STRATEGIES` keys to run.
@@ -766,9 +998,14 @@ async def scan(
     for venue, adapter in adapters.items():
         try:
             markets = await adapter.list_markets(status="open")
-        except VenueError:
+        except VENUE_READ_FAULTS as exc:
             logger.warning(
-                "scanner", extra={"event": "list_markets_failed", "venue": venue}
+                "scanner",
+                extra={
+                    "event": "list_markets_failed",
+                    "venue": venue,
+                    "error": type(exc).__name__,
+                },
             )
             continue
         top_markets = sorted(markets, key=_volume, reverse=True)[
@@ -783,44 +1020,99 @@ async def scan(
     # docstring's "BOOK FETCH IS CONCURRENT..." section for why a single
     # global bound (not one per venue, not unbounded) is what addresses
     # both the rate-limit risk and the cross-venue snapshot-skew risk at
-    # once, and why `_fetch_book` catches `VenueError` itself rather than
-    # letting `asyncio.gather` see it.
+    # once, and why `_fetch_book` handles `VENUE_READ_FAULTS` itself
+    # rather than letting `asyncio.gather` see them.
     fetch_specs: list[tuple[VenueId, str, str]] = _interleave_fetch_specs(
         top_markets_by_venue
     )
     semaphore = asyncio.Semaphore(settings_obj.scan_book_fetch_concurrency)
     fetch_started = time.monotonic()
-    fetch_results = await asyncio.gather(
+    # `return_exceptions=True` (T38 F2), NOT the default. With the
+    # default, the first coroutine to raise propagates IMMEDIATELY while
+    # its ~800 siblings keep running detached — `asyncio.gather` does not
+    # cancel them — so `scan()` would abort with hundreds of orphaned
+    # tasks still holding the semaphore and issuing HTTP requests into a
+    # loop that is about to be torn down. Collecting instead means every
+    # sibling has settled before this line returns; a genuine
+    # programming error (anything outside `VENUE_READ_FAULTS`, which
+    # `_fetch_book` handles itself) is then re-raised below, loudly and
+    # cleanly, with nothing left running behind it.
+    settled: list[_BookFetch | BaseException] = await asyncio.gather(
         *(
             _fetch_book(adapters[venue], venue, market_id, outcome, semaphore)
             for venue, market_id, outcome in fetch_specs
-        )
+        ),
+        return_exceptions=True,
     )
     fetch_elapsed_s = time.monotonic() - fetch_started
 
-    books_by_key: dict[tuple[str, str, str], OrderBook] = {}
-    for fetched in fetch_results:
-        if fetched is None:
-            continue
-        fetched_venue, fetched_market_id, fetched_outcome, book = fetched
-        books_by_key[
-            (fetched_venue, fetched_market_id, normalize_outcome(fetched_outcome))
-        ] = book
+    fetch_results: list[_BookFetch] = []
+    for settled_item in settled:
+        if isinstance(settled_item, BaseException):
+            # Not a venue fault (`_fetch_book` would have recorded one)
+            # — a bug, or a cancellation. Either way it is not "this
+            # book was flaky", and pretending otherwise would hide a
+            # real defect behind a slow leak of missing books.
+            raise settled_item
+        fetch_results.append(settled_item)
 
-    # The cheapest operator-facing signal for "were this pass's books
-    # close enough together in time for a cross-venue edge to mean
-    # anything": the wall-clock length of the WHOLE concurrent fetch
-    # phase above. Not a per-book-pair skew table (a real measurement,
-    # but a schema/API change outside this task's file set) — this is a
-    # health metric for the pass, not a scored input.
-    logger.info(
+    books_by_key: dict[tuple[str, str, str], OrderBook] = {}
+    # `(venue, market_id) -> latest` monotonic completion, for
+    # `_link_pair_skew`. Latest, because a leg is only as fresh as the
+    # last book needed to price it.
+    completed_at: dict[tuple[str, str], float] = {}
+    failures_by_venue: Counter[str] = Counter()
+    failures_by_error: Counter[str] = Counter()
+    for fetched in fetch_results:
+        if fetched.book is None:
+            failures_by_venue[fetched.venue] += 1
+            failures_by_error[fetched.error or "unknown"] += 1
+            continue
+        books_by_key[
+            (fetched.venue, fetched.market_id, normalize_outcome(fetched.outcome))
+        ] = fetched.book
+        key = (fetched.venue, fetched.market_id)
+        completed_at[key] = max(completed_at.get(key, 0.0), fetched.completed_at)
+
+    # Two operator-facing signals, not one.
+    #
+    # `fetch_elapsed_s` is the wall-clock length of the WHOLE concurrent
+    # fetch phase — the number that actually governs whether a
+    # cross-venue edge can be real (see `_interleave_fetch_specs`: the
+    # window shrinking from minutes to milliseconds is the mechanism
+    # that reduces skew; the interleave only improves its mean).
+    #
+    # `max_link_pair_skew_s` is the measured version of the claim this
+    # module used to assert: for each APPROVED link whose two legs both
+    # landed, the gap between when they landed. It is reported rather
+    # than bounded because ordering alone cannot bound it (T38 F5).
+    #
+    # `books_failed` and its two breakdowns exist because a pass that
+    # quietly returns 39 of 800 books is its own failure mode. This line
+    # is the ONE place a failed book is visible at production log level
+    # — the per-book line in `_fetch_book` is `debug`, since a dead
+    # venue would otherwise emit 800 warnings.
+    max_skew_s, mean_skew_s, measured_links = _link_pair_skew(links, completed_at)
+    # Counted off the RESULTS, not off `len(books_by_key)`: two specs can
+    # normalize to the same book key, and a count that could silently
+    # disagree with `books_requested` is the reporting bug this block
+    # exists to prevent.
+    books_failed = failures_by_venue.total()
+    logger.log(
+        logging.WARNING if books_failed else logging.INFO,
         "scanner",
         extra={
             "event": "scan_book_fetch_complete",
             "books_requested": len(fetch_specs),
-            "books_fetched": sum(1 for fetched in fetch_results if fetched is not None),
+            "books_fetched": len(fetch_results) - books_failed,
+            "books_failed": books_failed,
+            "book_failures_by_venue": dict(failures_by_venue),
+            "book_failures_by_error": dict(failures_by_error),
             "concurrency_bound": settings_obj.scan_book_fetch_concurrency,
             "fetch_elapsed_s": round(fetch_elapsed_s, 3),
+            "max_link_pair_skew_s": round(max_skew_s, 3),
+            "mean_link_pair_skew_s": round(mean_skew_s, 3),
+            "links_skew_measured": measured_links,
         },
     )
 
@@ -1150,6 +1442,10 @@ async def near_resolution_pass(
     scan_id = str(uuid.uuid4())
     strategy = SettlementEdgeStrategy(dict(strategy_config) if strategy_config else None)
 
+    #: Counted, not just skipped (T38 F2) — the per-book log line below
+    #: is `debug`, so without this a pass that read a fraction of the
+    #: books it needed would be indistinguishable from a quiet market.
+    near_resolution_books_failed = 0
     scored: list[ScoredIntent] = []
     for venue, adapter in adapters.items():
         try:
@@ -1157,10 +1453,14 @@ async def near_resolution_pass(
             # "Market SELECTION" paragraph for why `scan()`'s filter
             # would silently drop a Kalshi market this pass needs.
             markets = await adapter.list_markets(status=None)
-        except VenueError:
+        except VENUE_READ_FAULTS as exc:
             logger.warning(
                 "scanner",
-                extra={"event": "near_resolution_list_markets_failed", "venue": venue},
+                extra={
+                    "event": "near_resolution_list_markets_failed",
+                    "venue": venue,
+                    "error": type(exc).__name__,
+                },
             )
             continue
 
@@ -1175,7 +1475,14 @@ async def near_resolution_pass(
             for outcome in market.outcomes:
                 try:
                     book = await adapter.get_book(market.market_id, outcome)
-                except VenueError:
+                # `VENUE_READ_FAULTS`, not `VenueError` (T38 F2). This
+                # loop is serial, so there is no `gather` to cancel —
+                # but the outage is identical in kind: one 404 on one
+                # book propagated out of `near_resolution_pass`
+                # entirely, losing every market it had not reached yet
+                # AND the `session.commit()` at the end of the pass.
+                except VENUE_READ_FAULTS as exc:
+                    near_resolution_books_failed += 1
                     logger.debug(
                         "scanner",
                         extra={
@@ -1183,6 +1490,7 @@ async def near_resolution_pass(
                             "venue": venue,
                             "market_id": market.market_id,
                             "outcome": outcome,
+                            "error": type(exc).__name__,
                         },
                     )
                     continue
@@ -1273,6 +1581,14 @@ async def near_resolution_pass(
                 )
             )
 
+    if near_resolution_books_failed:
+        logger.warning(
+            "scanner",
+            extra={
+                "event": "near_resolution_books_failed",
+                "books_failed": near_resolution_books_failed,
+            },
+        )
     await session.commit()
     scored.sort(key=lambda scored_intent: scored_intent.score.composite, reverse=True)
     return scored

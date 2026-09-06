@@ -317,6 +317,57 @@ async def test_get_book_missing_bids_raises_venue_payload_error() -> None:
         await adapter.get_book(MARKET_A001, "Yes")
 
 
+@pytest.mark.asyncio
+async def test_get_book_non_json_body_raises_venue_payload_error() -> None:
+    """A 200 whose body is not JSON at all is the VENUE's fault (T38 F2).
+
+    A CDN error page or a truncated response makes `response.json()`
+    raise `json.JSONDecodeError` -- a `ValueError`. Left unflattened,
+    no caller could skip it without also catching every genuine
+    `ValueError` a programming error would raise, so
+    `app.services.scanner`'s per-book skip class could not include it
+    and ONE such body would abort a whole 800-book scan pass. Flattened
+    at the adapter boundary it is an ordinary `VenueError`, exactly as
+    Kalshi's `json_object` helper has always done for the same case.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = request.url
+        if url.host == "gamma-api.polymarket.com":
+            if url.path == "/markets":
+                condition_ids = url.params.get("condition_ids")
+                if condition_ids:
+                    return httpx.Response(
+                        200,
+                        json=[
+                            m
+                            for m in GAMMA_MARKETS
+                            if m.get("conditionId") == condition_ids
+                        ],
+                    )
+                return httpx.Response(200, json=GAMMA_MARKETS)
+            if url.path == "/events":
+                return httpx.Response(200, json=[])
+        if url.host == "clob.polymarket.com":
+            if url.path == "/book":
+                # A 200 carrying an HTML error page, as a CDN or a
+                # misrouted request produces.
+                return httpx.Response(
+                    200,
+                    text="<html><body>502 Bad Gateway</body></html>",
+                    headers={"content-type": "text/html"},
+                )
+            if url.path.startswith("/markets"):
+                return httpx.Response(200, json=CLOB_MARKET)
+        return httpx.Response(404, json={"error": "unhandled"})
+
+    adapter = PolymarketAdapter(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(VenuePayloadError):
+        await adapter.get_book(MARKET_A001, "Yes")
+    await adapter.aclose()
+
+
 # ---------------------------------------------------------------------------
 # 5. Live-trading fence
 # ---------------------------------------------------------------------------

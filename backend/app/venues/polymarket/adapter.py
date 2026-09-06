@@ -48,6 +48,24 @@ list is NOT implemented in this kit (single page only) — acceptable at
 fixture/kit scale; flagged for whoever wires this against a large, real
 market catalog.
 
+`get_book` IS FOUR HTTP REQUESTS, NOT ONE — WHICH IS WHY THE MARKET
+LOOKUP IS MEMOIZED (T38 F6). The CLOB book endpoint is keyed by
+`token_id`, so `get_book` must first resolve `(market_id, outcome) ->
+token_id` through `get_market()`, and `get_market()` is itself three
+requests: `GET gamma/markets?condition_ids=...`, `GET gamma/events` (the
+FULL events listing, for `event_id`), and `GET clob/markets/{condition_
+id}`. Measured with a counting `httpx.MockTransport`: one `get_book`
+issued four requests, four `get_book` calls issued sixteen. At
+`scan_top_n=200` that is ~1600 Polymarket requests a scan pass for 400
+books, 400 of them full events listings — where Kalshi's `get_book` is
+exactly one request, which is also why Polymarket's leg of a pass ran
+several times longer than Kalshi's. `_AsyncTtlMemo` (below) memoizes the
+events listing under one key and the per-market metadata under
+`market_id`, single-flight so a market's two concurrent outcome fetches
+share one lookup, for `settings.polymarket_market_cache_ttl_s`. The BOOK
+is never memoized. `get_market()` itself is deliberately left unmemoized
+— it is a public read whose callers are entitled to a fresh answer.
+
 The CLOB book endpoint's OWN `tick_size`/`min_order_size` (which may
 legitimately differ slightly from the market payload's, or simply
 duplicate it) are recorded on `OrderBook.metadata`, NOT on `OrderBook`
@@ -75,9 +93,10 @@ live response before trusting them for sizing.
 """
 import asyncio
 import json
+import time
 from collections.abc import Callable, Coroutine, Mapping
 from datetime import UTC, datetime
-from typing import Any, Literal, cast
+from typing import Any, Generic, Literal, TypeVar, cast
 
 import httpx
 from py_clob_client.clob_types import (
@@ -113,6 +132,171 @@ _ORDER_ACK_STATUSES: frozenset[str] = frozenset(
     {"open", "filled", "partially_filled", "cancelled", "rejected"}
 )
 
+_T = TypeVar("_T")
+
+#: Hard cap on how many entries an `_AsyncTtlMemo` retains. It matters
+#: because in `"paper"` mode `app.venues.registry.get_read_adapter`
+#: returns the PROCESS-WIDE `PaperVenueAdapter` singleton, which wraps
+#: one long-lived `PolymarketAdapter` — so a memo on that instance is
+#: process-lifetime, not pass-lifetime, and an unbounded one would grow
+#: a `market_id`-keyed entry for every market the process ever saw.
+_MEMO_MAX_ENTRIES = 4096
+
+
+class _AsyncTtlMemo(Generic[_T]):
+    """A short-lived, single-flight memo for one expensive async lookup.
+
+    WHY THIS EXISTS (T38 F6). `PolymarketAdapter.get_book` resolves an
+    outcome name to its CLOB `token_id` by calling `get_market()` first,
+    and `get_market()` is THREE HTTP requests: `GET gamma/markets?
+    condition_ids=...`, `GET gamma/events` (the FULL events listing, so
+    the market can be tagged with its `event_id`), and `GET clob/markets/
+    {condition_id}`. So one `get_book` is four requests, not one — and a
+    `scan()` pass over `scan_top_n=200` markets x 2 outcomes issues
+    ~1600 Polymarket requests, 400 of them full `/events` listings, for
+    400 books. (Kalshi's `get_book` is exactly one request, which is
+    also why Polymarket's leg of a pass runs several times longer than
+    Kalshi's — the "one venue 4x slower" shape that widens pair skew.)
+
+    `settings.scan_book_fetch_concurrency`'s own comment justifies its
+    bound as a rate-limit budget. That bound still holds as a RATE — the
+    four requests inside one `get_book` are sequential, so at most
+    `scan_book_fetch_concurrency` are ever in flight — but the pass's
+    request VOLUME was 4x what "800 `get_book` calls" implies, and the
+    repeat work was pure waste: the same events listing 400 times, and
+    the same market's metadata once per outcome.
+
+    SINGLE-FLIGHT, NOT JUST A CACHE. A plain value cache barely helps
+    here, because the calls that duplicate each other run CONCURRENTLY:
+    a market's YES and NO specs are adjacent in `scan()`'s interleaved
+    fetch order, so both miss an empty cache and both fetch. The
+    per-key lock below is what turns "up to `bound` duplicate lookups"
+    into exactly one. It is double-checked: a waiter re-reads the cache
+    after acquiring, and if the leader FAILED (nothing cached) it simply
+    does its own fetch rather than inheriting the leader's exception.
+
+    STALENESS IS BOUNDED BY `ttl_s`, DELIBERATELY SHORT. What is
+    memoized is market METADATA (`outcome_ids`, `tick_size`, `status`)
+    and event grouping — data that turns over on a scale of hours. The
+    TTL exists so that a long-lived adapter cannot serve a market's
+    metadata indefinitely, not because the data is volatile. Order books
+    are NEVER memoized: `GET /book` is issued on every single
+    `get_book` call, which is the whole point of the pass.
+
+    Attributes:
+        ttl_s: How long a cached value is served for. `<= 0` disables
+            the memo entirely — every call goes to `factory`.
+    """
+
+    def __init__(self, ttl_s: float) -> None:
+        """Build an empty memo with the given time-to-live in seconds."""
+        self.ttl_s = ttl_s
+        self._values: dict[str, tuple[float, _T]] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
+
+    def _cached(self, key: str) -> tuple[_T] | None:
+        """Return `(value,)` if `key` is cached and unexpired, else `None`.
+
+        A one-tuple rather than the bare value so that a legitimately
+        falsy cached value (an empty mapping — Gamma `/events` returning
+        no groupings is normal) is still a HIT.
+        """
+        entry = self._values.get(key)
+        if entry is None:
+            return None
+        stored_at, value = entry
+        if time.monotonic() - stored_at >= self.ttl_s:
+            return None
+        return (value,)
+
+    def _lock_for(self, key: str) -> asyncio.Lock:
+        """Return this key's lock, rebuilding the table if the loop changed.
+
+        WHY, PRECISELY (verified on CPython 3.12.7, not assumed).
+        `asyncio.Lock` binds itself to a loop only on the CONTENDED
+        path — an uncontended `acquire()` never calls `_get_loop()` at
+        all, so a lock used by one caller at a time really is portable
+        across loops. What raises `RuntimeError: ... is bound to a
+        different event loop` is a lock that was CONTENDED under one
+        loop and is contended again under another.
+
+        That combination is the ordinary case here, not an exotic one.
+        `app.tasks.scanner` runs each beat under its own `asyncio.run`,
+        and in `"paper"` mode the adapter is a process-wide singleton
+        that outlives every one of them. Within a single beat,
+        `scan()`'s interleaved fetch order puts a market's YES and NO
+        books in the same admission wave, so they contend that market's
+        lock every time. And with the default TTL at half
+        `scan_interval_s`, every memo entry has expired by the next
+        beat, so the next beat contends the SAME lock again — the exact
+        two-loops-both-contended shape. A loop change therefore discards
+        the whole lock table. Cached VALUES are plain data and survive
+        it.
+        """
+        loop = asyncio.get_running_loop()
+        if self._lock_loop is not loop:
+            self._lock_loop = loop
+            self._locks = {}
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
+
+    def _store(self, key: str, value: _T) -> None:
+        """Cache `value` under `key`, evicting expired entries when over cap."""
+        self._values[key] = (time.monotonic(), value)
+        if len(self._values) <= _MEMO_MAX_ENTRIES:
+            return
+        now = time.monotonic()
+        self._values = {
+            k: entry
+            for k, entry in self._values.items()
+            if now - entry[0] < self.ttl_s
+        }
+        if len(self._values) > _MEMO_MAX_ENTRIES:
+            self._values.clear()
+        # An unheld lock is safe to drop: the worst case is that a
+        # newcomer builds a fresh one and performs one redundant fetch.
+        self._locks = {
+            lock_key: lock
+            for lock_key, lock in self._locks.items()
+            if lock.locked()
+        }
+
+    async def get(
+        self, key: str, factory: Callable[[], Coroutine[Any, Any, _T]]
+    ) -> _T:
+        """Return the memoized value for `key`, calling `factory` at most once.
+
+        Args:
+            key: Cache key.
+            factory: Zero-argument coroutine function producing the
+                value. Called only on a miss, and only by the single
+                caller that wins this key's lock.
+
+        Returns:
+            _T: The cached or freshly produced value.
+
+        Raises:
+            Exception: Whatever `factory` raises, unchanged and
+                UNCACHED — a failed lookup is retried by the next
+                caller rather than remembered.
+        """
+        if self.ttl_s <= 0.0:
+            return await factory()
+        hit = self._cached(key)
+        if hit is not None:
+            return hit[0]
+        async with self._lock_for(key):
+            hit = self._cached(key)
+            if hit is not None:
+                return hit[0]
+            value = await factory()
+            self._store(key, value)
+            return value
+
 
 class PolymarketAdapter(BaseAdapter):
     """Read-path `VenueAdapter` for Polymarket (PLAN.md D3).
@@ -122,7 +306,12 @@ class PolymarketAdapter(BaseAdapter):
     in the package that do (GUARDRAILS.md §1.1).
     """
 
-    def __init__(self, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        market_cache_ttl_s: float | None = None,
+    ) -> None:
         """Build the two API clients this adapter needs.
 
         Args:
@@ -130,6 +319,11 @@ class PolymarketAdapter(BaseAdapter):
                 `httpx.MockTransport` here (GUARDRAILS.md §1.4: no network
                 access in tests); production code leaves this `None` so
                 `httpx.AsyncClient` uses its real transport.
+            market_cache_ttl_s: Seconds a market-metadata / event-grouping
+                lookup is memoized for (see `_AsyncTtlMemo` for the
+                request-amplification this exists to remove). `None`
+                reads `settings.polymarket_market_cache_ttl_s`; `0.0`
+                disables memoization entirely.
         """
         self.venue: VenueId = "polymarket"
         self._gamma_client = httpx.AsyncClient(
@@ -139,6 +333,23 @@ class PolymarketAdapter(BaseAdapter):
             base_url=settings.clob_api_url, transport=transport, timeout=30.0
         )
         self._clob_wrapper: ClobClientWrapper | None = None
+        ttl_s = (
+            settings.polymarket_market_cache_ttl_s
+            if market_cache_ttl_s is None
+            else market_cache_ttl_s
+        )
+        #: Gamma `/events` is a FULL listing and is identical for every
+        #: caller, so one entry under a constant key serves the whole
+        #: TTL — this is the single biggest saving (400 listings a pass
+        #: became 1).
+        self._events_memo: _AsyncTtlMemo[dict[str, str]] = _AsyncTtlMemo(ttl_s)
+        #: Keyed by `market_id`. Serves `get_book`'s outcome -> token_id
+        #: resolution ONLY, so a market's two outcomes cost one lookup
+        #: between them instead of one each. `get_market()` itself stays
+        #: UNMEMOIZED: it is a public read whose callers (the matcher,
+        #: the links API) are entitled to a fresh answer, and nothing
+        #: about F6 is their fault.
+        self._book_market_memo: _AsyncTtlMemo[VenueMarket] = _AsyncTtlMemo(ttl_s)
 
     async def aclose(self) -> None:
         """Close both underlying `httpx.AsyncClient` instances."""
@@ -312,7 +523,18 @@ class PolymarketAdapter(BaseAdapter):
 
         Standalone (non-grouped) markets simply do not appear as a key —
         callers treat a missing key as "no event grouping", not an error.
+
+        MEMOIZED for `settings.polymarket_market_cache_ttl_s` (T38 F6).
+        `GET /events` returns the whole listing and is identical no
+        matter which market asked for it, but every `get_market()` —
+        and therefore, before this, every single `get_book()` — issued
+        one. A 400-book Polymarket pass fetched the full events listing
+        400 times. See `_AsyncTtlMemo`.
         """
+        return await self._events_memo.get("", self._build_event_id_by_market_id)
+
+    async def _build_event_id_by_market_id(self) -> dict[str, str]:
+        """Fetch Gamma `/events` and fold it into `{market_id: event_id}`."""
         events = await self._fetch_events()
         mapping: dict[str, str] = {}
         for event in events:
@@ -373,9 +595,19 @@ class PolymarketAdapter(BaseAdapter):
     async def get_book(self, market_id: str, outcome: str) -> OrderBook:
         """Fetch the current CLOB order book for one (market, outcome).
 
-        Resolves `outcome` to its CLOB `token_id` via `get_market` first
-        (the book endpoint is keyed by `token_id`, not `market_id` +
-        `outcome` — PLAN.md §3).
+        Resolves `outcome` to its CLOB `token_id` via the market's
+        metadata first (the book endpoint is keyed by `token_id`, not
+        `market_id` + `outcome` — PLAN.md §3).
+
+        THE BOOK ITSELF IS NEVER CACHED — `GET /book` is issued on every
+        call, which is the entire point of a scan pass. What IS memoized
+        (`settings.polymarket_market_cache_ttl_s`) is the market-metadata
+        lookup that resolves the token id, because it costs THREE
+        requests and a market's two outcomes need the identical answer.
+        Before T38 that made one `get_book` four HTTP requests and a
+        400-book pass ~1600 of them; it is now four for the first book
+        of a market and one for every book after it, inside the TTL. See
+        `_AsyncTtlMemo` for the full accounting.
 
         Args:
             market_id: Polymarket condition id.
@@ -387,9 +619,18 @@ class PolymarketAdapter(BaseAdapter):
         Raises:
             VenuePayloadError: If `outcome` is not one of the market's
                 known outcomes, or the book payload is malformed
-                (including a payload missing `bids`/`asks`).
+                (including a body that is not JSON at all, or a payload
+                missing `bids`/`asks`).
+            httpx.HTTPStatusError: If the CLOB answers the book request
+                with an error status. Deliberately NOT flattened into
+                `VenueError` — same rule Kalshi's `raise_for_venue_error`
+                documents — so callers see the status. Every scanner
+                read path treats it as a skippable venue fault
+                (`app.services.scanner.VENUE_READ_FAULTS`).
         """
-        market = await self.get_market(market_id)
+        market = await self._book_market_memo.get(
+            market_id, lambda: self.get_market(market_id)
+        )
         try:
             token_id = market.outcome_ids[outcome]
         except KeyError:
@@ -399,7 +640,18 @@ class PolymarketAdapter(BaseAdapter):
             ) from None
         response = await self._clob_client.get("/book", params={"token_id": token_id})
         response.raise_for_status()
-        payload: object = response.json()
+        # A non-JSON body is the VENUE's fault, not a caller's — but
+        # `response.json()` signals it with `json.JSONDecodeError`, a
+        # `ValueError`, which no caller can catch without also catching
+        # every genuine `ValueError` a programming error would raise.
+        # Flattened here, at the adapter boundary, exactly as Kalshi's
+        # `json_object` helper already does (T38 F2).
+        try:
+            payload: object = response.json()
+        except ValueError as exc:
+            raise VenuePayloadError(
+                f"CLOB /book response was not JSON: {exc}", raw=response.text
+            ) from exc
         if not isinstance(payload, dict):
             raise VenuePayloadError("CLOB /book payload was not an object", raw=payload)
         return _parse_book(payload, market_id=market_id, outcome=outcome)

@@ -157,6 +157,37 @@ class Settings(BaseSettings):
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     chain_id: int = 137  # Polygon mainnet
 
+    # `polymarket_market_cache_ttl_s` bounds how long
+    # `app.venues.polymarket.adapter.PolymarketAdapter` may serve a
+    # memoized MARKET-METADATA / event-grouping lookup (T38 F6). It
+    # exists because `get_book` is FOUR HTTP requests, not one: the CLOB
+    # book endpoint is keyed by `token_id`, so the outcome must first be
+    # resolved through `get_market()`, which is itself `GET
+    # gamma/markets?condition_ids=...` + `GET gamma/events` (the FULL
+    # listing) + `GET clob/markets/{condition_id}`. Measured with a
+    # counting `httpx.MockTransport`: 4 requests for one `get_book`, 16
+    # for four. At `scan_top_n=200` a scan pass therefore issued ~1600
+    # Polymarket requests for 400 books — 400 of them identical events
+    # listings, and one duplicate market lookup per outcome — against a
+    # concurrency bound whose own comment (see
+    # `scan_book_fetch_concurrency`) justifies itself as a request
+    # budget.
+    # 60s rather than "the life of a pass" because the adapter's
+    # lifetime is NOT the pass's: `app.venues.registry.get_read_adapter`
+    # builds a fresh one per call in `"live"` mode, but in `"paper"`
+    # mode it returns the process-wide `PaperVenueAdapter` singleton,
+    # whose inner read adapter lives as long as the process. A TTL is
+    # what makes the same memo safe under both lifetimes. 60s is half
+    # `scan_interval_s` — long enough that one pass shares one lookup,
+    # short enough that a market's status/tick data cannot be served
+    # stale across passes.
+    # Set to 0.0 to disable memoization entirely (every call re-fetches).
+    # ORDER BOOKS ARE NEVER MEMOIZED at any TTL; this covers market
+    # metadata and event grouping only.
+    polymarket_market_cache_ttl_s: float = Field(
+        default=60.0, alias="POLYMARKET_MARKET_CACHE_TTL_S"
+    )
+
     # Kalshi Trade API v2 (app/venues/kalshi/, T12; PLAN.md §3 Venue facts,
     # docs.kalshi.com — pinned by the architect 2026-09-04, GUARDRAILS.md
     # §1.4 forbids re-fetching them).
@@ -427,6 +458,21 @@ class Settings(BaseSettings):
     # enough overlap to turn "minutes" into low single-digit seconds
     # without opening hundreds of sockets at once; lower it further if a
     # venue's actual published limit (once known) demands it.
+    # WHAT THIS BOUNDS, PRECISELY (T38 F6). It bounds in-flight `get_book`
+    # CALLS, and because the several HTTP requests inside one such call
+    # are issued sequentially, it does also bound in-flight HTTP
+    # REQUESTS at the same number — the RATE budget above holds. What it
+    # never bounded is the pass's total request VOLUME. One Polymarket
+    # `get_book` was four requests (the CLOB book endpoint is keyed by
+    # `token_id`, so the outcome is resolved through `get_market()`
+    # first, which is three more), so "800 `get_book` calls" was really
+    # ~2000 requests a pass, not 800 — 1600 Polymarket plus 400 Kalshi,
+    # where a Kalshi `get_book` is exactly one. It also made
+    # Polymarket's leg of a pass several times longer than Kalshi's,
+    # stretching the very fetch window the concurrency work exists to
+    # shrink. `polymarket_market_cache_ttl_s` is the fix; this bound was
+    # measuring what its comment said, but over a call count that was
+    # not the request count.
     scan_book_fetch_concurrency: int = Field(
         default=20, alias="SCAN_BOOK_FETCH_CONCURRENCY"
     )
