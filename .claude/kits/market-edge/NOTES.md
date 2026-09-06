@@ -6594,3 +6594,139 @@ assumed, and that it is four paths rather than a proof.
 
 agent: T45 id=adc72ec7f78e99a3e role=implementer model=sonnet
 outcome: T45 model=sonnet attempts=1 result=pass review=revised run=2026-09-05-3bd5
+
+### T44
+
+**What was measured, before anything was changed.** I drove every payload-parsing method on both
+adapters -- `list_markets`, `get_market`, `get_book`, `get_balance`, `get_positions`,
+`get_open_orders`, `get_fills`, plus the module-level parsers those delegate to -- through ~95
+divergent payloads over `httpx.MockTransport` and a stubbed CLOB client, and recorded what each one
+actually did. No venue was contacted for any of it; the divergences are hand-written mutations of the
+existing fixtures. The three classes are LOUD (a typed error naming the field), QUIET-AND-SAFE (the
+item is skipped and the read continues), and QUIET-AND-WRONG (a plausible-looking number, no signal).
+
+**The quiet-and-wrong findings, and what they now do.**
+
+| divergence | was | is |
+| --- | --- | --- |
+| kalshi: dollar STRING under a bare cents key (`{"yes": [["0.40", 120]]}`, `{"balance": "1234.56"}`, `yes_price`, `fee_paid`, `market_exposure`) | 100x too small, silently: a 40c quote became 0.004, $1234.56 of capital became $12.34 | `VenuePayloadError` naming the field, from the single `_to_dollars` funnel |
+| kalshi: renamed envelope key (`markets`, `orders`, `fills`, `market_positions`) | `body.get(key, [])` -> empty list, indistinguishable from "you hold nothing" | `VenuePayloadError`; an empty list under a PRESENT key still means empty |
+| kalshi + polymarket: every entry in a page fails to parse | empty list, no error -- and `reconcile` acts on a successful empty read as "the venue holds nothing" | `VenuePayloadError`; a single bad row is still skipped and now logged |
+| kalshi: fill `side` in an unknown vocabulary (`"ask"`) | priced from `yes_price` and labelled `outcome="YES"` | `VenuePayloadError` naming `side` (an ABSENT side still defaults to YES) |
+| kalshi + polymarket: a market payload the domain type rejects (negative `minimum_order_size`, `tick_size: 0`) | bare `ValueError` -- not a `VenueError`, so outside `scanner.VENUE_READ_FAULTS`, so it aborts a whole scan pass | `VenuePayloadError` naming venue, market and field |
+| polymarket: `outcomes` key absent | a listed market with `outcomes=()` and `outcome_ids={}` | `VenuePayloadError` |
+| polymarket: `"resolved": "false"` (string) | `bool("false") is True` -> every live market `status="resolved"`, dropped from every open scan | parsed correctly as `False`; an unrecognizable flag raises |
+| polymarket: `"question": null` | `str(None)` -> a market titled `"None"` | `""` |
+| polymarket: book `timestamp` in SECONDS | divided by 1000 again -> a book dated 1970-01-21 | read by magnitude, as `_try_epoch` and Kalshi's parser already do -> the correct time |
+| polymarket: `taker_base_fee`/`fee_rate_bps` as a RATE (`0.02`) where bps were pinned | `/10_000` again -> a 0.000002 fee, every marginal edge profitable | `VenuePayloadError`; `0` (a declared waiver) and any bps >= 1 untouched |
+| polymarket: trades priced in cents (`42`) | `min(max(x,0),1)` CLAMPED it -> a position at `avg_price=1.0` used for sizing | clamp removed (float dust only); out-of-range raises naming the venue and the range |
+| polymarket: trade `side` neither BUY nor SELL | netted as a SELL, cancelling the buy it should have added | skipped, logged, and fatal if every trade failed |
+| polymarket: `get_balance` with no `balance` field | `default=0.0` -- a funded account reported as empty | `VenuePayloadError` (Kalshi has always raised here) |
+| polymarket: order entry with no id | an ack with `order_id=""`, which `reconcile` indexes under `""` | `VenuePayloadError` (Kalshi has always raised here) |
+| polymarket: `size_matched` PRESENT but unreadable | `_try_float(...) or 0.0` -> a part-filled order reported untouched | `VenuePayloadError` naming the field; an ABSENT one still falls back |
+| polymarket: fill with no `fee_rate_bps` | `fee=$0.00`, silently | estimated at the category rate and labelled `metadata["fee_source"]`, exactly as Kalshi's fills already were |
+| polymarket: fill with no parseable timestamp | stamped `utcnow()`, so an old fill passes a `since` filter | dropped, as Kalshi already did |
+
+**Where the risk turned out NOT to be.** Six classes were already loud and are now pinned rather than
+changed: a missing/`null` `endDate` or `close_time`; a book missing `bids`/`asks`; a book level with a
+missing/`null`/non-numeric price or size; a price outside `[0,1]` on either venue's book (which is how
+integer cents under a `*_dollars` key surfaces, and it surfaces immediately); a non-JSON body; and a
+Kalshi book payload carrying neither documented container. Kalshi's book conversion in particular is
+in good shape -- the `[0,1]` validators catch the cents-read-as-dollars direction on every price field
+the moment it is constructed.
+
+**Two divergences are deliberately NOT rejected, and saying so is part of the result.** A dollar value
+as a NUMBER under a Kalshi legacy key (`{"yes": [[0.40, 120]]}`) reads as 0.4 cents -- which is a
+legal price on a market whose tick is a tenth of a cent, so no threshold can separate it from a real
+deep-tail quote. And integer cents under a `*_dollars` key (`{"balance_dollars": 123456}`) reads as
+$123,456.00, 100x too big and the dangerous direction for sizing -- but a six-figure balance is
+equally plausible, so refusing it would mean inventing a bound. That one is logged at WARNING instead,
+naming the field and its Python type, which is the difference between an ambiguity an operator can see
+and one they cannot. Both are pinned by tests so the gap stays visible rather than being assumed
+closed.
+
+**On not overcorrecting.** Roughly a third of the new tests exist to keep tolerance: an unknown extra
+key on a market, a book or a balance payload is accepted on both venues (venues add fields, and an
+adapter that refuses the first harmless addition is its own outage); an empty book side, an empty
+`markets`/`orders`/`fills` list under a present key, and a position that netted flat all still mean
+what they say; a string-encoded number is still a number (`"200"` bps, `"5"` contracts, `"123456"`
+cents); an absent optional field keeps its documented fallback, and only a PRESENT-but-unreadable one
+raises. The unknown-enum cases (a new Kalshi market status, an unrecognized order status on either
+venue) stay tolerant and conservative for the same reason -- but they now log the word they did not
+know, because "defaults to open" plus silence is how an untradable market gets scanned.
+
+Four of these promises went into `tests/venues/test_adapter_contract.py` rather than one venue's file,
+because the failure they prevent is venue-agnostic: out-of-domain market values raise a typed
+`VenueError` and not a bare `ValueError`; a balance payload with no amount is refused; a page of
+orders none of which parse is refused; and an unknown extra key is tolerated. The contract file gained
+a `DivergenceCase` record so each venue supplies those payloads in its own vocabulary (Polymarket's
+minimum order size lives on the CLOB payload, Kalshi's on the market) while the assertion stays shared.
+
+**Red-green.** Reverted both adapters to HEAD in place (my versions held in `$TMPDIR`, restored and
+verified byte-identical after) and re-ran the three venue test files: **39 failed, 117 passed**. All 39
+are the regression tests above, including both parametrizations of the two shared contract cases.
+Restored: **156 passed**. The tests that were green in BOTH states are the tolerance pins listed above
+plus two cases that were already loud at HEAD (`test_a_book_with_no_parseable_timestamp_is_refused`,
+and the Kalshi half of the shared balance case) -- flagged rather than buried, because a test that
+never had a red state proves less. None is vacuous: each fails against a plausible wrong
+implementation, which for the tolerance half means any future pass that hardens these adapters into
+brittleness.
+
+**Verification.** Full suite **927 passed**, zero failures. The brief's 841 was stale by the time I
+started -- the tree was at 861 before my first edit, the extra 20 being the concurrent agent's
+`tests/test_preflight.py` -- and my 58 new tests plus their later additions account for the rest. (One
+intermediate full-suite run showed 8 failures in `tests/test_preflight.py`; they reproduced neither in
+isolation nor on the next full run, and that file is the other agent's, mid-write. Nothing in it
+touches `app/venues/`.) `ruff check` clean on exactly the five files I changed. `mypy` on the same
+five: clean on both adapters, and the 12 findings in the two test files are all pre-existing
+alias-keyword `Settings(...)` calls at lines that exist verbatim at HEAD (kalshi 111/689/971,
+polymarket 403/415/430) -- my added test code contributes none. No directory-wide run of either.
+`git status --porcelain` shows my five files and this NOTES.md; `app/scripts/preflight.py`,
+`tests/test_preflight.py`, `TASKS.md`, `README.md` and `HANDOFF.md` are the concurrent agent's and I
+did not touch them. No venue network anywhere: every probe and every test is `httpx.MockTransport` or
+a stubbed CLOB client, the Polymarket credentialed tests use an all-zeros placeholder key
+(GUARDRAILS.md §1.3) purely to pass the credential gate before the wrapper is replaced outright, and
+`live.py` in both packages is untouched.
+
+### T44 adjudication (orchestrator)
+
+Verified structurally rather than by re-reading 784 lines of diff, and the checks that mattered were
+the ones about *containment*, not about individual fixes.
+
+**Independently red-greened the most severe claim.** `test_a_string_boolean_does_not_mark_a_live_market_resolved`:
+backed the adapter up to the scratchpad, `git checkout HEAD --` it, ran the single test — FAILED —
+restored, confirmed byte-identical with `cmp`, ran again — passed. The mechanism is plain Python:
+HEAD had `bool(gamma_item.get("resolved", False))`, and `bool("false")` is `True`, so a
+string-encoded flag marked every live market `status="resolved"` and dropped it from every
+`status="open"` scan. The failure mode is an empty opportunity list, which is indistinguishable from
+a quiet market — this repo's signature shape.
+
+**Verified the money-critical claim at HEAD by reading it**: `avg_price = min(max(cost_basis /
+net_size, 0.0), 1.0)`. A trades payload priced in cents (`42`) clamps to exactly `1.0` — a
+real-looking $1.00 cost basis on a position used for sizing. The clamp is gone; only IEEE-754 dust is
+absorbed now.
+
+**The containment check, which is what made the raises safe.** T44 converts many silent defaults into
+raises, and a raise is only an improvement if something catches it at the right granularity.
+`VenuePayloadError` subclasses `VenueError`, which is in `scanner.py`'s `VENUE_READ_FAULTS`, so a
+divergent book is logged and skipped per-book rather than aborting the pass — the T38 property still
+holds. In live mode an unreadable `get_balance()` propagates out of `deps.py:83` before the
+`OrderRouter` is constructed, so no order can be placed on unknown capital. The old `default=0.0`
+also blocked trading, but silently; failing closed *and legibly* is the actual gain.
+
+**Guardrails checked, not assumed.** §1.1: `git diff --name-only` matches no `live.py` — only the two
+adapters and three test files. §1.4: the tests log `GET https://gamma-api.polymarket.com/...` lines,
+which look alarming and are not — httpx logs the URL it *would* have requested through an
+`httpx.MockTransport`, and 927 tests in 9.9s is not real network. Full suite **927 passed**.
+
+**The honest framing, which the table above does not carry.** These are not seventeen confirmed live
+defects. GUARDRAILS §1.4 means nobody here has seen a real Polymarket or Kalshi payload, so what was
+fixed is seventeen *divergence classes* that would have been quiet-and-wrong had they occurred — the
+mechanism is verified in every case, the occurrence is not. `resolved: "false"` is a genuine bug if
+and only if Gamma sends string booleans, and that is unknown from inside this fence. The value
+delivered is that the first real payload disagreement now names the venue, the market and the field
+instead of producing a confident wrong number; claiming more than that would repeat the mistake this
+kit keeps recording.
+
+agent: T44 id=aabf1e7cc7ccea913 role=implementer model=opus
+outcome: T44 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5

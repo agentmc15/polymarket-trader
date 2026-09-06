@@ -1570,7 +1570,7 @@ task closes it — GUARDRAILS §1.4 bars the venue network — but both make the
 instead of expensive. Dispatched in parallel; disjoint file sets.
 
 ### T44 — Characterize adapter behaviour on divergent venue payloads
-- status: in-progress
+- status: done
 - model: opus
 - independent: yes
 

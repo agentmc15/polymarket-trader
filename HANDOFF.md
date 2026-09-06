@@ -10,14 +10,16 @@ left" below, and none of it is blocking.
 
 ## State in one paragraph
 
-The `market-edge` kit is fully executed: **24/24 planned tasks, plus 22 unplanned remediation tasks**
-(T21b–T21f, T25–T43) driven by two phase reviews, three red-team passes, a verification pass, and a
-deployment audit. The backend suite went **654 → 841 passing**, migrations **001 → 007**, the
-frontend typechecks and lints clean, and everything is committed and pushed to `main`. Nothing is
-in flight and nothing is blocked.
+The `market-edge` kit is fully executed: **24/24 planned tasks, plus 24 unplanned remediation and
+hardening tasks** (T21b–T21f, T25–T45) driven by five phase reviews, three red-team passes, a
+verification pass, and a deployment audit. Migrations run **001 → 007**, the frontend typechecks and
+lints clean, and everything is committed and pushed to `main`. Nothing is in flight and nothing is
+blocked. Run `cd backend && python3 -m pytest -q` for the current test count — a number written here
+would rot on the next commit, and this file has had it wrong twice.
 
-The routing scorecard reads **40/46 first-try, 81% cheap-model review survival** (run it yourself —
-see "Where things live").
+The routing scorecard reads **42/48 first-try, 79% cheap-model review survival** (run it yourself —
+see "Where things live"). Survival fell from 81% when T45 was recorded `review=revised`: verifying
+it turned up a real leak, and a scorecard that only moves up is not measuring anything.
 
 That figure was **34/40, 80%** until the ledger was audited against `TASKS.md`, and the correction
 is the more useful fact. The scorecard drops outcomes whose task id is not in `TASKS.md`, and six
@@ -63,7 +65,7 @@ deployment audit is fixed, each with a regression test proven to fail against th
 
 ### The one gap I could not close
 
-**Nobody has run this system end to end.** All 841 tests exercise units against fixtures, and the
+**Nobody has run this system end to end.** Every test exercises units against fixtures, and the
 deployment audit was deliberately static because GUARDRAILS §1.4 bars the venue network. So these
 remain genuinely unknown:
 
@@ -75,9 +77,28 @@ remain genuinely unknown:
   against compose's `polymarket:polymarket` Postgres on a local non-Docker run — a plausible
   first-run trap, unverified
 
-**Start in paper mode**, watch the scanner logs for `scan_book_fetch_complete` (it reports
-`books_failed` and per-venue error types), and expect the first real payload to disagree with a
-fixture somewhere.
+**T44 and T45 do not close this gap — nothing inside the fence can.** They make the day it closes
+cheap instead of expensive, from the two ends:
+
+- **`python3 -m app.scripts.preflight` (T45)** checks everything checkable without a venue — trading
+  mode and its fences, credential presence and shape, database reachability and migration drift,
+  broker reachability, settings that are set but inert — and ends with an explicit list of what it
+  did **not** check, venue connectivity first. Only FAIL affects the exit code; WARN never does. Run
+  it before starting the stack.
+- **Payload-divergence hardening (T44)** turned seventeen quiet-and-wrong adapter behaviours into
+  typed `VenuePayloadError`s naming venue, market and field. Read the classification honestly: these
+  are not seventeen confirmed live bugs, they are seventeen classes that *would have been silent*.
+  The mechanism is verified in each case; whether a venue actually sends that shape is exactly what
+  §1.4 prevents anyone here from knowing.
+
+The sharpest example of why this mattered: `bool(gamma_item.get("resolved", False))`. Since
+`bool("false")` is `True`, a string-encoded flag would have marked **every live market resolved** and
+dropped it from **every open scan** — surfacing as an empty opportunity list, which looks exactly
+like a quiet market. That is this repo's signature failure shape, and it is now a raise.
+
+**Start in paper mode**, run the preflight first, watch the scanner logs for
+`scan_book_fetch_complete` (it reports `books_failed` and per-venue error types), and expect the
+first real payload to disagree with a fixture somewhere — it will now say so by name.
 
 ### Small, deliberate, and documented rather than fixed
 
@@ -151,7 +172,8 @@ Useful context; do not re-derive.
 ## How to verify the current state
 
 ```bash
-cd backend && python3 -m pytest -q          # expect 728+ passed, 0 failed
+cd backend && python3 -m app.scripts.preflight   # config/DB/broker; never contacts a venue
+cd backend && python3 -m pytest -q          # expect 0 failed
 cd backend && alembic heads                  # expect 007 (head)
 cd frontend && npx tsc -p tsconfig.app.json --noEmit && npm run lint   # both exit 0
 cd backend && python3 -m app.scripts.sweep --synthetic --levels 500,5000,50000 --out /tmp/s.json
