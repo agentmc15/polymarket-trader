@@ -1,0 +1,26 @@
+{
+  "condition_id": "0x0000000000000000000000000000000000000000000000000000000000a001",
+  "question": "Will Team Alpha win the championship?",
+  "market_slug": "team-alpha-championship",
+  "tokens": [
+    {
+      "token_id": "1000000000000000000000000000000000000000000000000000000000000001",
+      "outcome": "Yes",
+      "price": 0.40,
+      "winner": false
+    },
+    {
+      "token_id": "1000000000000000000000000000000000000000000000000000000000000002",
+      "outcome": "No",
+      "price": 0.60,
+      "winner": false
+    }
+  ],
+  "active": true,
+  "closed": false,
+  "neg_risk": false,
+  "tick_size": "0.01",
+  "min_order_size": "5",
+  "maker_base_fee": 0,
+  "taker_base_fee": 200
+}

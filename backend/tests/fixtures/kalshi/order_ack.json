@@ -1,0 +1,16 @@
+{
+  "order": {
+    "order_id": "b0000000-0000-4000-8000-000000000001",
+    "client_order_id": "intent-0001:0:0",
+    "ticker": "TEST-26DEC31-ALPHA",
+    "status": "resting",
+    "side": "bid",
+    "action": "buy",
+    "type": "limit",
+    "fill_count": 40,
+    "remaining_count": 60,
+    "average_fill_price_dollars": "0.4200",
+    "average_fee_paid_dollars": "0.0098",
+    "ts_ms": 1767225600000
+  }
+}

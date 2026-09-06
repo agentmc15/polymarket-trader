@@ -1,0 +1,28 @@
+{
+  "market": {
+    "ticker": "TEST-26NOV03-DELTA",
+    "event_ticker": "TEST-26NOV03",
+    "title": "Will the ballot measure pass?",
+    "status": "active",
+    "result": "",
+    "rules_primary": "This market resolves YES if the ballot measure officially passes.",
+    "rules_secondary": "",
+    "open_time": "2026-01-01T00:00:00Z",
+    "close_time": "2026-11-03T23:59:00Z",
+    "expected_expiration_time": "2026-11-10T12:00:00Z",
+    "minimum_order_size": 1,
+    "yes_bid": 40,
+    "yes_ask": 42,
+    "no_bid": 58,
+    "no_ask": 60,
+    "last_price": 42,
+    "volume": 3300,
+    "open_interest": 2100,
+    "last_update_ts": 1767225600,
+    "price_level_structure": [
+      {"start_price": 0, "end_price": 5, "tick_size": 0.1},
+      {"start_price": 5, "end_price": 95, "tick_size": 1},
+      {"start_price": 95, "end_price": 100, "tick_size": 0.1}
+    ]
+  }
+}
