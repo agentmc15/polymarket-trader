@@ -96,7 +96,16 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.config import settings
-from app.strategies.base import BaseStrategy, Intent, Leg, MarketSnapshot, Signal
+from app.strategies.base import (
+    EDGE_BASIS_KEY,
+    EDGE_BASIS_OBSERVED,
+    SCORING_EDGE_KEY,
+    BaseStrategy,
+    Intent,
+    Leg,
+    MarketSnapshot,
+    Signal,
+)
 from app.venues.base import FeeModel
 from app.venues.fees import (
     KalshiFeeModel,
@@ -568,7 +577,15 @@ class SettlementEdgeStrategy(BaseStrategy):
                 "filled_size": filled_size,
                 "fill_count": len(fills),
                 "gas_per_contract": gas_per_contract,
-                "edge": residual,
+                # THE SCORING CONTRACT (T31, `app.strategies.base`): a
+                # PRE-risk per-contract edge — `1 - ask - fee - gas`,
+                # net of nothing else. One leg on one market, so there is
+                # no identity risk to declare and nothing for
+                # `app.services.scoring` to haircut; `EDGE_BASIS_OBSERVED`
+                # says every term is an observed fill price or an
+                # `app.venues.fees` rate.
+                SCORING_EDGE_KEY: residual,
+                EDGE_BASIS_KEY: EDGE_BASIS_OBSERVED,
                 "net_edge_fraction": net_edge_fraction,
                 "annualized_return": annualized_return,
                 "hours_to_resolution": hours_to_resolution,

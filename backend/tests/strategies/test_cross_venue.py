@@ -33,7 +33,14 @@ from app.execution.router import OrderRouter
 from app.models.event_link import EventLink
 from app.models.trade import Order as OrderRow
 from app.strategies import STRATEGIES, STRATEGY_CATEGORIES, get_strategy
-from app.strategies.base import DOWNSIZE_TO_CAPITAL_KEY
+from app.strategies.base import (
+    DOWNSIZE_TO_CAPITAL_KEY,
+    EDGE_BASIS_IDENTITY_ESTIMATED,
+    EDGE_BASIS_KEY,
+    IDENTITY_CONFIDENCE_KEY,
+    IDENTITY_WORST_CASE_LOSS_KEY,
+    SCORING_EDGE_KEY,
+)
 from app.strategies.cross_venue_arbitrage import (
     LEDGER_KEY,
     CrossVenueArbitrageStrategy,
@@ -265,6 +272,53 @@ def test_confidence_haircut_lowers_net_edge_and_reports_worst_case_loss() -> Non
     # And the haircut is not decoration: it stops the trade.
     assert doubtful.on_market_data(kalshi_snapshot()) is None
     assert "worst_case_loss" in unsure.as_metadata()
+
+
+def test_the_published_metadata_edge_is_pre_haircut_and_net_edge_is_gone() -> None:
+    """T31: what `as_metadata()` publishes for the scorer, and what it no longer does.
+
+    `app.services.scoring` ranks every strategy's intent in one list, so
+    the edge it reads has to mean the same thing for all of them: USD per
+    unit, net of fees and gas, PRE any risk haircut. This strategy's
+    pre-haircut number is `gross_edge`; its post-haircut number is
+    `net_edge`, which is what its own `min_net_edge` gate uses.
+
+    The defect was that `as_metadata()` published the POST-haircut
+    number under the key `"net_edge"`, the scorer read that key as if it
+    were pre-haircut, and then discounted it AGAIN for being
+    cross-venue. So the assertion that matters most here is a NEGATIVE
+    one: the key `"net_edge"` must not exist in this payload at all. A
+    generic scorer must not be able to pick up a post-risk number under
+    a name three sibling strategies use for a pre-risk one.
+
+    Same worked pair as above at confidence 0.8:
+
+        gross_edge (pre-risk, net of fees + gas) =  0.010464
+        net_edge   = 0.010464*0.8 - 0.2*0.50     = -0.0916288
+
+    The scorer re-derives the second from the first plus
+    `p_same_resolution` and `worst_case_loss`, so both numbers are still
+    on record and only one of them is the ranking input.
+    """
+    doubtful = seeded_strategy(confidence=0.8, pm_yes_ask=0.46, kx_no_ask=0.50)
+    evaluation = doubtful.evaluate(doubtful.links.links[0], "YES")
+    assert evaluation is not None
+
+    metadata = evaluation.as_metadata()
+
+    # The scorer's key carries the PRE-haircut edge.
+    assert metadata[SCORING_EDGE_KEY] == pytest.approx(0.010464, abs=1e-9)
+    assert metadata[SCORING_EDGE_KEY] == pytest.approx(evaluation.gross_edge)
+    # ... and the haircut's two inputs, for the scorer to apply itself.
+    assert metadata[IDENTITY_CONFIDENCE_KEY] == pytest.approx(0.8)
+    assert metadata[IDENTITY_WORST_CASE_LOSS_KEY] == pytest.approx(0.50, abs=1e-9)
+    assert metadata[EDGE_BASIS_KEY] == EDGE_BASIS_IDENTITY_ESTIMATED
+
+    # THE NEGATIVE ASSERTION: the post-haircut number is published, but
+    # never under the name a generic scorer reads as a pre-risk edge.
+    assert "net_edge" not in metadata
+    assert metadata["risk_adjusted_edge"] == pytest.approx(-0.0916288, abs=1e-9)
+    assert metadata["risk_adjusted_edge"] == pytest.approx(evaluation.net_edge)
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,11 @@ Example:
 
     # Unsaved rows for a human to review via `GET /links`.
     links = propose_links(polymarket_markets, kalshi_markets)
+
+    # Filed without ever overwriting a reviewer's decision — the same
+    # call `POST /links/propose` and the periodic `app.tasks.matching`
+    # beat both make. See `app.services.matching.persist`.
+    outcome = await persist_proposals(session, links)
     ```
 """
 from app.services.matching.matcher import (
@@ -49,6 +54,14 @@ from app.services.matching.normalize import (
     normalize_title,
     stem,
 )
+from app.services.matching.persist import (
+    PROPOSED,
+    ProposalOutcome,
+    is_decided,
+    new_proposal,
+    persist_proposals,
+    update_proposal,
+)
 
 __all__ = [
     # normalize
@@ -76,4 +89,11 @@ __all__ = [
     "propose_links",
     "score_pair",
     "tri_state_score",
+    # persist
+    "PROPOSED",
+    "ProposalOutcome",
+    "is_decided",
+    "new_proposal",
+    "persist_proposals",
+    "update_proposal",
 ]

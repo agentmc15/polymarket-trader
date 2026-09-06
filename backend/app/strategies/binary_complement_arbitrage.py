@@ -80,7 +80,16 @@ Example:
 from typing import Any
 
 from app.config import settings
-from app.strategies.base import BaseStrategy, Intent, Leg, MarketSnapshot, Signal
+from app.strategies.base import (
+    EDGE_BASIS_KEY,
+    EDGE_BASIS_OBSERVED,
+    SCORING_EDGE_KEY,
+    BaseStrategy,
+    Intent,
+    Leg,
+    MarketSnapshot,
+    Signal,
+)
 from app.venues.base import FeeModel
 from app.venues.fees import (
     KalshiFeeModel,
@@ -282,7 +291,21 @@ class BinaryComplementArbitrageStrategy(BaseStrategy):
                 "yes_fee": yes_fee,
                 "no_fee": no_fee,
                 "gas_per_contract": gas_per_contract,
-                "edge": edge,
+                # THE SCORING CONTRACT (T31, `app.strategies.base`): a
+                # PRE-risk per-unit edge — net of both legs' taker fees
+                # and amortized redemption gas, and net of nothing else.
+                # It already was, and this is now the key name
+                # `app.services.scoring` is documented to read, so it
+                # cannot drift into meaning something a sibling
+                # strategy's same-named key does not.
+                SCORING_EDGE_KEY: edge,
+                # There is no identity risk to declare: both legs are the
+                # SAME outcome pair on the SAME market on the SAME venue,
+                # so they cannot disagree about what resolved. Every term
+                # above is an observed ask or a `app.venues.fees` rate,
+                # which is what `EDGE_BASIS_OBSERVED` asserts — see
+                # `app.services.scoring`'s "WHAT REMAINS INCOMPARABLE".
+                EDGE_BASIS_KEY: EDGE_BASIS_OBSERVED,
                 "fee_schedule_source": schedule.source,
                 "is_arbitrage": True,
             },

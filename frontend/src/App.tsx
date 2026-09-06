@@ -3,10 +3,13 @@ import { useMarkets } from './hooks/useMarkets'
 import { useTradingMode } from './hooks/useTradingMode'
 import { Backtesting } from './components/backtesting'
 import { OpportunitiesTable } from './components/opportunities/OpportunitiesTable'
+import { LinkReview } from './components/links/LinkReview'
 import { ErrorBoundary } from './components/ErrorBoundary'
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'markets' | 'trading' | 'arbitrage' | 'bots' | 'backtesting'>('markets')
+  const [activeTab, setActiveTab] = useState<
+    'markets' | 'trading' | 'arbitrage' | 'links' | 'bots' | 'backtesting'
+  >('markets')
   const { data: markets, isLoading, error } = useMarkets()
   const { data: tradingMode } = useTradingMode()
 
@@ -46,7 +49,7 @@ function App() {
       <nav className="border-b border-border bg-card">
         <div className="container mx-auto px-4">
           <div className="flex gap-1">
-            {(['markets', 'trading', 'arbitrage', 'bots', 'backtesting'] as const).map((tab) => (
+            {(['markets', 'trading', 'arbitrage', 'links', 'bots', 'backtesting'] as const).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setActiveTab(tab)}
@@ -120,6 +123,12 @@ function App() {
         )}
 
         {activeTab === 'arbitrage' && <OpportunitiesTable />}
+
+        {activeTab === 'links' && (
+          <ErrorBoundary label="Link Review">
+            <LinkReview />
+          </ErrorBoundary>
+        )}
 
         {activeTab === 'bots' && (
           <div className="text-center py-12 text-muted-foreground">

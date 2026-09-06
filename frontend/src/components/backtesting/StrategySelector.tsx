@@ -1,4 +1,5 @@
 import { cn } from '../../utils/cn';
+import { formatStrategyName } from '../../utils/format';
 import type { StrategyInfo } from '../../types';
 
 interface StrategySelectorProps {
@@ -122,7 +123,7 @@ function StrategyCard({ strategy, isSelected, onClick, categoryColor }: Strategy
         </span>
       </div>
 
-      <h4 className="mb-1 font-medium text-foreground">{strategy.display_name}</h4>
+      <h4 className="mb-1 font-medium text-foreground">{formatStrategyName(strategy.name)}</h4>
       <p className="mb-3 text-sm text-muted-foreground line-clamp-2">
         {strategy.description}
       </p>

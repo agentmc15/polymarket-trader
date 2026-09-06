@@ -42,6 +42,81 @@ AtomicityMode = Literal["all_or_none", "best_effort"]
 #: contract count so the hedge is never left lopsided.
 DOWNSIZE_TO_CAPITAL_KEY = "downsize_to_capital"
 
+# --------------------------------------------------------------------------
+# THE SCORING CONTRACT (T31). `Intent.metadata` keys that
+# `app.services.scoring.score` reads to build one comparable `composite`
+# out of every strategy's output.
+#
+# THE RULE, AND IT IS THE WHOLE POINT: a strategy publishes a PRE-RISK
+# edge. `SCORING_EDGE_KEY` is USD per UNIT (one contract of every leg),
+# net of trading fees and gas, and net of NOTHING ELSE — no probability
+# haircut, no confidence multiplier, no discount for the chance that the
+# trade's premise is wrong. Risk is priced by the scorer, in one place,
+# exactly once.
+#
+# Before T31 that rule did not exist, and the four arbitrage strategies
+# each meant something different by their published edge:
+# `cross_venue_arbitrage` published a number ALREADY multiplied by its
+# link confidence, while the three single-market strategies published a
+# number that was not. `scoring` ranked all four against each other and
+# then discounted the cross-venue one a SECOND time in
+# `resolution_risk` — so the repo's centerpiece strategy was penalized
+# twice for a risk the others were not penalized for at all, and the
+# sort order on `GET /api/v1/arbitrage/opportunities` encoded that
+# accounting artifact rather than the trades' merit.
+#
+# A strategy whose two legs might not settle on the same fact declares
+# that risk with the two IDENTITY keys instead of folding it into its
+# edge. The scorer applies `edge * p - (1 - p) * worst_case_loss` — the
+# same formula `cross_venue_arbitrage` used internally — to any intent
+# that publishes them, and leaves the edge alone for any intent that
+# does not.
+
+#: Per-UNIT USD edge, net of fees and gas, BEFORE any risk haircut. The
+#: one number `app.services.scoring` annualizes. "Unit" = one contract of
+#: every leg (a complement pair, a bundle of N outcomes, a cross-venue
+#: pair), which is how all four arbitrage strategies size: equal
+#: contracts on every leg.
+SCORING_EDGE_KEY = "edge"
+
+#: Legacy alias for `SCORING_EDGE_KEY`, read only when it is absent.
+#: `multi_outcome_bundle_arbitrage` published its (already pre-risk)
+#: margin under this name before the contract was written down, and its
+#: persisted rows still carry it. It means exactly the same thing:
+#: pre-risk, per-unit, net of fees. `cross_venue_arbitrage` no longer
+#: publishes this key at all — its post-haircut number rides under
+#: `risk_adjusted_edge`, so no reader can mistake one for the other.
+SCORING_EDGE_LEGACY_KEY = "net_edge"
+
+#: Probability in `[0, 1]` that the intent's legs settle on the SAME
+#: fact. Absent means 1.0 (a single-market intent: every leg resolves off
+#: one question, so there is no identity risk to price). Present only
+#: where the risk is real — `cross_venue_arbitrage` publishes its
+#: `EventLink.confidence` here.
+IDENTITY_CONFIDENCE_KEY = "p_same_resolution"
+
+#: USD per unit lost when the legs DO NOT settle on the same fact. Not
+#: the edge — the losing leg's entire stake. Read only alongside
+#: `IDENTITY_CONFIDENCE_KEY`.
+IDENTITY_WORST_CASE_LOSS_KEY = "worst_case_loss"
+
+#: How the published edge was arrived at, so a human sorting by
+#: `composite` can see which rows carry model risk and which do not.
+#: Rides through `Intent.metadata` to `GET /arbitrage/opportunities`.
+EDGE_BASIS_KEY = "edge_basis"
+
+#: Every term in the edge is an observed price or a published fee/gas
+#: rate. Arithmetic, no estimated parameter.
+EDGE_BASIS_OBSERVED = "observed_costs"
+
+#: The edge is observed costs MINUS an identity haircut whose
+#: probability is an ESTIMATE (`app.services.matching`'s link
+#: confidence), not a measured rate. Two rows with the same `composite`
+#: are the same expected return only to the extent that estimate is
+#: calibrated — see `app.services.scoring`'s "WHAT REMAINS
+#: INCOMPARABLE".
+EDGE_BASIS_IDENTITY_ESTIMATED = "identity_estimated"
+
 #: Canonical spelling for a binary market's two outcomes, keyed by their
 #: case-folded form. `normalize_outcome()` below is the ONLY table this
 #: maps through; every other outcome name (e.g. a multi-outcome bundle's
@@ -361,7 +436,12 @@ class Intent:
         confidence: Strategy confidence level, in [0.0, 1.0].
         expected_resolution_ts: Aware UTC expected resolution time, or
             `None` if unknown.
-        metadata: Additional intent metadata.
+        metadata: Additional intent metadata. Free-form, EXCEPT for the
+            scoring-contract keys defined at the top of this module
+            (`SCORING_EDGE_KEY` and friends): a strategy that wants its
+            intent ranked publishes a PRE-risk edge under those and
+            declares any identity risk separately, so
+            `app.services.scoring` can apply every haircut in one place.
 
     Raises (in `__post_init__`):
         ValueError: If `legs` is empty, if `kind`'s per-kind leg

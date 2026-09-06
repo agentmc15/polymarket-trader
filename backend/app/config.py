@@ -413,6 +413,37 @@ class Settings(BaseSettings):
     )
     max_slippage_bps: float = Field(default=50.0, alias="MAX_SLIPPAGE_BPS")
 
+    # Cross-venue link proposal (PLAN.md D9, T30; app/tasks/matching.py)
+    #
+    # `link_proposal_interval_s` is the Celery beat period for
+    # `app.tasks.matching.propose_event_links`, the periodic caller
+    # `app.services.matching.propose_links` never had — before T30 the
+    # ONLY caller was the manual `POST /links/propose`, so on a fresh
+    # install `event_links` stayed empty forever and
+    # `cross_venue_arbitrage` (which consumes ONLY `approved` links)
+    # scanned nothing, permanently.
+    # A THIRD interval rather than a reuse of `scan_interval_s` or
+    # `near_resolution_scan_interval_s`, for the same two reasons those
+    # two are separate from each other:
+    #   - What it is looking for. The scans chase a mispricing between
+    #     two live order books, which is gone in minutes. This pass
+    #     chases the appearance of a new MARKET on a venue and the
+    #     wording of its rules — a market list turns over on a scale of
+    #     hours-to-days, and its output is not a trade but a row in a
+    #     queue a HUMAN has to read (PLAN.md D9: nothing trades on a
+    #     proposed link). Re-deriving the same proposals every two
+    #     minutes would not move a single approval forward.
+    #   - What it costs to run. `scan()` is bounded by `scan_top_n`
+    #     markets per venue; this pass reads EVERY open market on BOTH
+    #     venues and scores the blocked cross product of the two lists,
+    #     which is the heaviest read-plus-compute in the repo. An hour is
+    #     how that is bounded.
+    # 3600s (30x `scan_interval_s`) is well under the time it takes a
+    # reviewer to work a queue, so no proposal waits on the beat.
+    link_proposal_interval_s: float = Field(
+        default=3600.0, alias="LINK_PROPOSAL_INTERVAL_S"
+    )
+
     # Recorded book-depth collection (PLAN.md D6/D10, T21;
     # app/models/book_snapshot.py, app/services/data_collector.py,
     # app/services/backtesting/data_replay.py)

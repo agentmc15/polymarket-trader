@@ -5,15 +5,18 @@ import type {
   Order,
   OrderRequest,
   Position,
-  Strategy,
   Bot,
-  Backtest,
-  BacktestTrade,
   OpportunitiesResponse,
   ScanResponse,
   EdgeDecayReport,
   TradingModeResponse,
   PaginatedResponse,
+  LinkListResponse,
+  LinkReviewPayload,
+  LinkStatus,
+  EventLink,
+  ApproveLinkRequest,
+  RejectLinkRequest,
 } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
@@ -148,38 +151,29 @@ class ApiClient {
     return data;
   }
 
-  // Backtesting
-  async getBacktests(params?: {
-    skip?: number;
-    limit?: number;
-  }): Promise<PaginatedResponse<Backtest>> {
-    const { data } = await this.client.get('/backtests', { params });
+  // Cross-venue link review (PLAN.md D9, T17) — the human half of the
+  // event-equivalence subsystem. See backend/app/api/routes/links.py's
+  // module docstring for why approval is deliberately one-at-a-time and
+  // gated on a person reading both venues' `rules_text`.
+  async getLinks(status?: LinkStatus): Promise<LinkListResponse> {
+    const { data } = await this.client.get<LinkListResponse>('/links', {
+      params: status ? { status } : undefined,
+    });
     return data;
   }
 
-  async runBacktest(request: {
-    strategy_id: string;
-    start_date: string;
-    end_date: string;
-    initial_capital?: number;
-    parameters?: Record<string, unknown>;
-  }): Promise<Backtest> {
-    const { data } = await this.client.post('/backtests', request);
+  async getLink(linkId: number): Promise<LinkReviewPayload> {
+    const { data } = await this.client.get<LinkReviewPayload>(`/links/${linkId}`);
     return data;
   }
 
-  async getBacktest(backtestId: string): Promise<Backtest> {
-    const { data } = await this.client.get(`/backtests/${backtestId}`);
+  async approveLink(linkId: number, request: ApproveLinkRequest): Promise<EventLink> {
+    const { data } = await this.client.post<EventLink>(`/links/${linkId}/approve`, request);
     return data;
   }
 
-  async getBacktestTrades(backtestId: string): Promise<{ trades: BacktestTrade[] }> {
-    const { data } = await this.client.get(`/backtests/${backtestId}/trades`);
-    return data;
-  }
-
-  async getStrategies(): Promise<{ strategies: Strategy[] }> {
-    const { data } = await this.client.get('/backtests/strategies');
+  async rejectLink(linkId: number, request: RejectLinkRequest): Promise<EventLink> {
+    const { data } = await this.client.post<EventLink>(`/links/${linkId}/reject`, request);
     return data;
   }
 

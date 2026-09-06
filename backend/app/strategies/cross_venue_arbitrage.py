@@ -154,6 +154,11 @@ from app.config import settings
 from app.models.event_link import EventLink
 from app.strategies.base import (
     DOWNSIZE_TO_CAPITAL_KEY,
+    EDGE_BASIS_IDENTITY_ESTIMATED,
+    EDGE_BASIS_KEY,
+    IDENTITY_CONFIDENCE_KEY,
+    IDENTITY_WORST_CASE_LOSS_KEY,
+    SCORING_EDGE_KEY,
     BaseStrategy,
     Intent,
     Leg,
@@ -390,7 +395,13 @@ class CrossVenueEvaluation:
         worst_case_loss: `max(ask_a, ask_b)` — the losing leg's cost,
             which is what is lost outright when they do not.
         net_edge: `gross_edge * p - (1 - p) * worst_case_loss`. The only
-            number this strategy gates on.
+            number this strategy GATES on (`min_net_edge`,
+            `suspect_link_net_edge`). It is published to `Intent.metadata`
+            as `"risk_adjusted_edge"`, never as `"net_edge"` — see
+            `as_metadata`. `app.services.scoring` re-derives exactly this
+            figure from `gross_edge`/`p_same_resolution`/
+            `worst_case_loss` rather than reading it, so the haircut is
+            applied once no matter how many consumers there are.
         hours_to_resolution: Hours from now to the EARLIER of the two
             close times. The earlier one governs: capital is locked until
             both legs are done, but the edge is only real while both are
@@ -446,9 +457,45 @@ class CrossVenueEvaluation:
     def as_metadata(self) -> dict[str, Any]:
         """Return the `Intent.metadata` payload for this evaluation.
 
+        THIS METHOD IS WHERE THE SCORING CONTRACT IS HONOURED (T31, see
+        `app.strategies.base`'s "THE SCORING CONTRACT" and
+        `app.services.scoring`'s module docstring). What changed, and
+        why it mattered:
+
+        - `SCORING_EDGE_KEY` (`"edge"`) is `gross_edge` — `1 - cost`,
+          net of both venues' taker fees and of amortized redemption gas,
+          and net of NOTHING ELSE. It is the same KIND of number
+          `binary_complement_arbitrage` and `multi_outcome_bundle_
+          arbitrage` publish under the same key, which is the whole
+          point: `composite` ranks all of them in one list.
+        - `IDENTITY_CONFIDENCE_KEY`/`IDENTITY_WORST_CASE_LOSS_KEY` are
+          the two inputs the scorer needs to apply this strategy's OWN
+          haircut, `edge * p - (1 - p) * worst_case_loss`, itself. They
+          are `p_same_resolution` and `worst_case_loss` under their
+          original names — nothing new is computed here.
+        - `"net_edge"` IS DELIBERATELY NOT A KEY OF THIS PAYLOAD any
+          more. That name published the POST-haircut number, and
+          `app.services.scoring._net_edge` read it as if it were
+          pre-haircut, annualized it, and then multiplied by
+          `(1 - resolution_risk)` where `resolution_risk` carried a
+          FURTHER `+0.25` for being cross-venue: the same link
+          confidence discounted the same trade twice, while every
+          single-market strategy was discounted neither time. The
+          post-haircut number is still published — as
+          `"risk_adjusted_edge"`, which is what `min_net_edge` gates on
+          and what a reviewer wants to see — under a name no generic
+          scorer will mistake for a pre-risk edge.
+
+        `EDGE_BASIS_KEY` labels the row `identity_estimated`: unlike a
+        same-market strategy's edge, this one's haircut runs on
+        `EventLink.confidence`, an ESTIMATE. It rides through
+        `Intent.metadata` to `GET /arbitrage/opportunities` so an
+        operator sorting by `composite` can see which rows carry model
+        risk (`app.services.scoring`'s "WHAT REMAINS INCOMPARABLE").
+
         Returns:
-            dict[str, Any]: Every field a reviewer or T19's scorer needs
-                to re-derive `net_edge` by hand, plus the R1 tripwire.
+            dict[str, Any]: Every field a reviewer or the scorer needs
+                to re-derive both edges by hand, plus the R1 tripwire.
         """
         return {
             "strategy": CrossVenueArbitrageStrategy.name,
@@ -460,9 +507,11 @@ class CrossVenueEvaluation:
             "gas_per_contract": self.gas_per_contract,
             "cost": self.cost,
             "gross_edge": self.gross_edge,
-            "p_same_resolution": self.p_same_resolution,
-            "worst_case_loss": self.worst_case_loss,
-            "net_edge": self.net_edge,
+            SCORING_EDGE_KEY: self.gross_edge,
+            IDENTITY_CONFIDENCE_KEY: self.p_same_resolution,
+            IDENTITY_WORST_CASE_LOSS_KEY: self.worst_case_loss,
+            EDGE_BASIS_KEY: EDGE_BASIS_IDENTITY_ESTIMATED,
+            "risk_adjusted_edge": self.net_edge,
             "hours_to_resolution": self.hours_to_resolution,
             "annualized": self.annualized,
             "probe_size": self.probe_size,

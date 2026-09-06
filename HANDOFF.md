@@ -61,37 +61,37 @@ answers a `near_resolution` filter with a confident empty list.
 
 ---
 
-## Remaining known defects (from the final review, not yet fixed)
+## Remaining known defects
 
-Ranked. All are recorded in full detail in `.claude/kits/market-edge/NOTES.md` under
-"Final review (Phase 4 + whole kit) — adjudication".
+The queue from the final review is **cleared**. What was item 1-7 is now:
 
-1. **`unmarked_positions` never reaches the API.** T21d added `BacktestResult.unmarked_positions` so
-   a partly-fictional equity curve announces itself. `build_report()` in `app/tasks/backtesting.py`
-   writes only `depth_source` and `fill_at`, so the field is computed, logged at WARNING, then
-   dropped at the persistence boundary. **One line.** Batched, not yet dispatched.
-2. **Fee-basis divergence across strategies.** Four strategies price fees on three different bases.
-   Zero divergence on Polymarket (linear, no per-fill rounding); real on Kalshi only. The two
-   size-1.0 strategies *overstate* the fee (safe — they reject genuine edges);
-   `cross_venue_arbitrage.py` **understates** it by up to 0.53¢/contract, ~35% of its own
-   `min_net_edge` gate of 0.015. **Fix `cross_venue_arbitrage` first** — it is the one erring toward
-   admitting marginal trades *and* the one carrying real cross-venue settlement risk.
-3. **`composite` ranks values the code says not to compare.** `multi_outcome_bundle_arbitrage`'s own
-   comment says "Do not compare this value to `cross_venue_arbitrage`'s `net_edge` as if they
-   measured the same kind of risk" — while `composite` is the sole consumer and does exactly that,
-   in one sorted list.
-4. **Cross-venue arbitrage produces nothing out of the box.** `event_links` is empty on a fresh
-   install and stays empty: `propose_links` is reachable only via `POST /links/propose`, with no beat
-   and no frontend. All five `/links` routes are uncalled by the UI. Approval is *correctly*
-   human-gated (PLAN D9) — but there is nothing to approve.
-5. **`POST /backtests/sweep` has no UI producer.** `BacktestForm` posts to `POST /backtests`, so the
-   EdgeDecayTable built in T23 is reachable only through History.
-6. **Pre-existing frontend/backend contract drift** (not introduced by this kit): `POST /backtests`
-   returns `id` while `backtestApi.ts` reads `backtest_id`, so the Results tab never activates after
-   a run; `metrics` vs `trade_metrics`/`risk_metrics`; `equity_curve`/`final_capital` vs
-   `points`/`final_value`.
-7. **Scan request volume.** ~800 sequential `get_book` calls per scan pass every 120s
-   (`scan_top_n=200` × 2 outcomes × 2 venues). A rate-limit and latency risk, not a correctness one.
+| Was | Status |
+|---|---|
+| `unmarked_positions` never reaching the API | Fixed (T29) — persisted unconditionally, badge fires |
+| Fee-basis divergence | Fixed (T29) — cross-venue prices per fill; worst case was 59% of its own edge gate |
+| `composite` ranking incomparable values | Fixed (T31) — strategies publish pre-risk edge, scoring applies every haircut once |
+| Cross-venue producing nothing out of the box | Fixed (T30) — hourly link-proposal beat, still human-gated |
+| `POST /backtests/sweep` with no UI producer | Fixed (T32) |
+| Frontend/backend contract drift | Fixed (T32) — 12 mismatches, incl. a silent slippage no-op |
+| Stale `types/index.ts` comment | Fixed (T32) |
+
+### Open, lower priority
+
+1. **`extra="ignore"` hides client mistakes.** The slippage bug (client posted `slippage_bps`, backend
+   wanted `slippage_value`, FastAPI silently discarded it, so every backtest used default slippage)
+   and the earlier `TRADING_KILL_SWITCH_PATH` bug are the same shape. **Every request model with
+   pydantic's default `extra="ignore"` is a place a client can be wrong without being told.** Worth a
+   systematic sweep.
+2. **`edge_basis` is persisted but not a first-class `OpportunityOut` column.** It reaches
+   `/opportunities` inside the payload's `metadata`, not as a typed field.
+3. **`favorite_compounder` / `no_bias_exploit` publish an `"edge"` that is a directional mispricing.**
+   Unscored today, but it would mean the wrong thing under T31's new contract if either joins a
+   scanner pass.
+4. **Only 4 of 15 `TradeMetrics`/`RiskMetrics` fields are populated** by `get_backtest_status`. Typed
+   but deliberately unrendered, so the UI never shows an unpopulated metric as a real `0.00`.
+5. **Scan request volume** — ~800 sequential `get_book` calls per scan pass every 120s.
+6. **`mypy`**: one untyped-celery-decorator finding on the new task module, identical to what all four
+   existing task modules report. Left unsilenced deliberately.
 
 ---
 

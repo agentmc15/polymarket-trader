@@ -4,6 +4,7 @@ import { formatPercent, formatRelativeTime } from '../../utils/format';
 import {
   useStrategies,
   useRunBacktest,
+  useRunSweep,
   useBacktest,
   useBacktests,
   useDeleteBacktest,
@@ -12,7 +13,7 @@ import { BacktestForm } from './BacktestForm';
 import { BacktestResults } from './BacktestResults';
 import { TradeList } from './TradeList';
 import { EdgeDecayTable } from './EdgeDecayTable';
-import type { BacktestRequest } from '../../types';
+import type { BacktestRequest, SweepRequest } from '../../types';
 import type { BacktestListItem } from '../../services/backtestApi';
 
 type TabView = 'new' | 'results' | 'history';
@@ -26,12 +27,14 @@ export function Backtesting() {
 
   // Run backtest mutation
   const runBacktestMutation = useRunBacktest();
+  // Run capital sweep mutation (PLAN.md D12, T22 — Defect 2's producer)
+  const runSweepMutation = useRunSweep();
 
   // Current backtest data
   const backtest = useBacktest(currentBacktestId);
 
   // Backtest history
-  const { data: historyData, isLoading: isLoadingHistory } = useBacktests({ page_size: 20 });
+  const { data: historyData, isLoading: isLoadingHistory } = useBacktests({ limit: 20 });
 
   // Delete mutation
   const deleteBacktestMutation = useDeleteBacktest();
@@ -39,10 +42,20 @@ export function Backtesting() {
   const handleRunBacktest = async (request: BacktestRequest) => {
     try {
       const result = await runBacktestMutation.mutateAsync(request);
-      setCurrentBacktestId(result.backtest_id);
+      setCurrentBacktestId(result.id);
       setActiveTab('results');
     } catch (error) {
       console.error('Failed to start backtest:', error);
+    }
+  };
+
+  const handleRunSweep = async (request: SweepRequest) => {
+    try {
+      const result = await runSweepMutation.mutateAsync(request);
+      setCurrentBacktestId(result.id);
+      setActiveTab('results');
+    } catch (error) {
+      console.error('Failed to start sweep:', error);
     }
   };
 
@@ -119,7 +132,9 @@ export function Backtesting() {
           categories={strategiesData?.categories ?? {}}
           isLoadingStrategies={isLoadingStrategies}
           onSubmit={handleRunBacktest}
+          onSubmitSweep={handleRunSweep}
           isSubmitting={runBacktestMutation.isPending}
+          isSubmittingSweep={runSweepMutation.isPending}
         />
       )}
 
@@ -128,10 +143,14 @@ export function Backtesting() {
           <BacktestResults
             status={backtest.status}
             progress={backtest.progress}
-            metrics={backtest.metrics}
+            strategyName={backtest.strategyName}
+            totalReturn={backtest.totalReturn}
+            totalReturnPct={backtest.totalReturnPct}
+            tradeMetrics={backtest.tradeMetrics}
+            riskMetrics={backtest.riskMetrics}
             equityCurve={backtest.equityCurve}
             initialCapital={backtest.initialCapital}
-            finalCapital={backtest.finalCapital}
+            finalValue={backtest.finalValue}
             errorMessage={backtest.errorMessage}
             report={backtest.report}
           />
@@ -240,12 +259,12 @@ function BacktestHistory({
               <td
                 className={cn(
                   'px-4 py-3 text-right text-sm font-mono',
-                  (bt.total_return_pct ?? 0) > 0 && 'text-success',
-                  (bt.total_return_pct ?? 0) < 0 && 'text-destructive'
+                  (bt.total_return ?? 0) > 0 && 'text-success',
+                  (bt.total_return ?? 0) < 0 && 'text-destructive'
                 )}
               >
-                {bt.total_return_pct !== undefined
-                  ? `${bt.total_return_pct >= 0 ? '+' : ''}${formatPercent(bt.total_return_pct)}`
+                {bt.total_return !== null
+                  ? `${bt.total_return >= 0 ? '+' : ''}${formatPercent(bt.total_return * 100)}`
                   : '-'}
               </td>
               <td className="px-4 py-3 text-right text-sm font-mono">

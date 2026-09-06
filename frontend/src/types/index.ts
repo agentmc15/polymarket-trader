@@ -125,11 +125,16 @@ export interface Strategy {
   max_drawdown?: number;
 }
 
-// Enhanced strategy info from new backend
+// Enhanced strategy info from new backend. Mirrors `StrategyInfo`
+// (backend/app/api/routes/backtesting.py) field by field — there is no
+// `display_name`; the registry only carries `name` (its key, e.g.
+// `"catalyst_momentum"`), so a caller wanting a human-friendly label
+// must derive one from `name` client-side (see `formatStrategyName` in
+// `components/backtesting/StrategySelector.tsx`).
 export interface StrategyInfo {
   name: string;
-  display_name: string;
   description: string;
+  version: string;
   category: string;
   default_config: Record<string, unknown>;
 }
@@ -162,10 +167,22 @@ export interface Bot {
   updated_at: string;
 }
 
-// Backtest types
+// Backtest types (PLAN.md D12, T22/T23) — mirror
+// backend/app/api/routes/backtesting.py's pydantic models field by
+// field. That file is the source of truth; do not add a field here
+// that is not declared on the corresponding backend model, and do not
+// rename one to something friendlier — a rename here is exactly the
+// class of bug T32 exists to fix (the client silently drifting from
+// `BacktestResponse.id`, `TradesResponse.total_count`, etc.).
 export type BacktestStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type SlippageModel = 'none' | 'fixed' | 'volume_based' | 'spread_based';
 
+// `BacktestRequest` (backtesting.py). `slippage_value` is a PROBABILITY-
+// UNIT pad (default `0.001` = 0.1%, see `engine.py`'s
+// `BacktestConfig.slippage_value` docstring) added to a BUY limit /
+// subtracted from a SELL limit — it is NOT basis points, and a caller
+// collecting a "basis points" UI value must divide by 10,000 before
+// sending it here (see `BacktestForm`).
 export interface BacktestRequest {
   strategy: string;
   start_date: string;
@@ -173,115 +190,75 @@ export interface BacktestRequest {
   initial_capital?: number;
   fee_rate?: number;
   slippage_model?: SlippageModel;
-  slippage_bps?: number;
-  market_ids?: string[];
+  slippage_value?: number;
+  markets?: string[];
   strategy_config?: Record<string, unknown>;
 }
 
-export interface BacktestMetrics {
-  total_return: number;
-  total_return_pct: number;
-  annualized_return_pct: number;
-  sharpe_ratio: number;
-  sortino_ratio: number;
-  calmar_ratio: number;
-  max_drawdown: number;
-  max_drawdown_pct: number;
-  max_drawdown_duration_days: number;
-  volatility_pct: number;
-  downside_deviation_pct: number;
+// `SweepRequest` (backtesting.py) — `BacktestRequest` plus the capital
+// levels to sweep (PLAN.md D12, T22). `POST /backtests/sweep` is
+// asynchronous exactly like `POST /backtests`: it returns a `SweepResponse`
+// immediately and the actual `EdgeDecayReport` arrives later at
+// `GET /backtests/{id}/edge-decay` once the parent run completes.
+export interface SweepRequest extends BacktestRequest {
+  capital_levels?: number[];
+}
+
+// `TradeMetrics` (backtesting.py). As of this writing,
+// `GET /backtests/{id}` only ever populates `total_trades` and
+// `win_rate` from `BacktestRun` columns — every other field here is a
+// real, typed part of the response, but currently always the pydantic
+// default `0`. Do not render one of those as if it were a measured
+// zero; `BacktestResults` only surfaces the two fields that are
+// actually populated today.
+export interface TradeMetrics {
   total_trades: number;
   winning_trades: number;
   losing_trades: number;
-  win_rate_pct: number;
+  win_rate: number;
+  profit_factor: number;
   avg_win: number;
   avg_loss: number;
-  avg_trade: number;
-  profit_factor: number;
-  expectancy: number;
-  avg_trade_duration_hours: number;
-  max_consecutive_wins: number;
-  max_consecutive_losses: number;
-  skewness: number;
-  kurtosis: number;
-  var_95: number;
-  cvar_95: number;
-  recovery_factor: number;
-  ulcer_index: number;
-  serenity_index: number;
-  avg_exposure_pct: number;
-  max_exposure_pct: number;
-  time_in_market_pct: number;
-  best_trade: number;
-  worst_trade: number;
-  best_day: number;
-  worst_day: number;
-  best_month: number;
-  worst_month: number;
+  largest_win: number;
+  largest_loss: number;
 }
 
+// `RiskMetrics` (backtesting.py). Same caveat as `TradeMetrics`: only
+// `sharpe_ratio` and `max_drawdown` are populated by
+// `GET /backtests/{id}` today.
+export interface RiskMetrics {
+  sharpe_ratio: number;
+  sortino_ratio: number;
+  max_drawdown: number;
+  max_drawdown_pct: number;
+  volatility: number;
+  var_95: number;
+}
+
+// `EquityCurvePoint` (backtesting.py) — one point of
+// `GET /backtests/{id}/equity-curve`'s `points`. There is no
+// `drawdown_pct`; `drawdown` is already `(peak - equity) / peak`.
 export interface EquityPoint {
   timestamp: string;
   equity: number;
   drawdown: number;
-  drawdown_pct: number;
 }
 
-export interface Backtest {
-  id: number;
-  strategy_id: number;
-  strategy_name?: string;
-  name?: string;
-  start_date: string;
-  end_date: string;
-  initial_capital: number;
-  parameters: Record<string, unknown>;
-  status: BacktestStatus;
-  progress: number;
-  error_message?: string;
-  final_capital?: number;
-  total_return?: number;
-  total_return_pct?: number;
-  annualized_return?: number;
-  sharpe_ratio?: number;
-  sortino_ratio?: number;
-  max_drawdown?: number;
-  max_drawdown_pct?: number;
-  volatility?: number;
-  total_trades: number;
-  winning_trades: number;
-  losing_trades: number;
-  win_rate?: number;
-  avg_win?: number;
-  avg_loss?: number;
-  profit_factor?: number;
-  started_at?: string;
-  completed_at?: string;
-  duration_seconds?: number;
-  equity_curve: EquityPoint[];
-  metrics?: BacktestMetrics;
-  created_at: string;
-}
-
+// `TradeRecord` (backtesting.py) — one row of
+// `GET /backtests/{id}/trades`'s `trades`. This is a single FILL, not a
+// closed round-trip position: there is no `entry_time`/`exit_time`
+// pairing, `token_id`, or `market_condition_id` on the wire, and `pnl`
+// is `null` for a fill that has not (yet) realized a gain or loss.
 export interface BacktestTrade {
-  id: number;
-  backtest_id: number;
+  timestamp: string;
   market_id: string;
-  market_condition_id: string;
-  token_id: string;
-  side: OrderSide;
   outcome: string;
-  entry_price: number;
-  exit_price?: number;
+  side: OrderSide;
+  price: number;
   size: number;
   fee: number;
-  slippage?: number;
-  entry_time: string;
-  exit_time?: string;
-  pnl?: number;
-  pnl_pct?: number;
-  signal_type?: string;
-  confidence?: number;
+  pnl: number | null;
+  signal_confidence: number;
 }
 
 // Trading mode (backend/app/config.py `Settings.trading_mode`;
@@ -397,6 +374,16 @@ export interface EdgeDecayRow {
   // about edge at all (see `EdgeDecayReport.unmeasurable_note`).
   zero_trades_cause: string | null;
   downsize_trackable_intents: number;
+  // T28: `pct_intents_downsized` above is the UNION of capital-cap-driven
+  // and book-depth-driven shortfall and is NOT PLAN.md R4's depth signal
+  // on its own (see `CapitalRow`'s docstring in sweep.py). These four
+  // separate the two causes over `sized_intents` as the denominator.
+  sized_intents: number;
+  pct_intents_capital_capped: number;
+  // PLAN.md R4's tripwire number: share of `sized_intents` whose walk
+  // ran out of book. Expected to RISE with capital.
+  pct_intents_depth_limited: number;
+  depth_blocked_intents: number;
 }
 
 export interface EdgeDecayReport {
@@ -425,12 +412,16 @@ export interface EdgeDecayReport {
 // An empty `{}` report (a run that predates report capture) means both
 // are simply absent, not `"recorded"`/`"next"` — do not default them.
 //
-// `unmarked_positions` is NOT currently written to a single run's
-// top-level report by `build_report()` (T21d only threads it through
-// `edge_decay.rows[].unmarked_positions` for a sweep, see
-// backend/app/services/backtesting/sweep.py) — modeled optionally here
-// so a caller can surface it defensively without a backend change, and
-// without reaching for `any` to read a field the type doesn't declare.
+// `unmarked_positions` IS written unconditionally to a single run's
+// top-level report by `build_report()` (backend/app/tasks/backtesting.py;
+// T29), so a clean run persists `[]` there, not an absent key — an
+// ABSENT `unmarked_positions` means this run predates the field, not
+// that its equity curve is fully marked. It stays OPTIONAL here for
+// exactly that reason: a pre-migration run's `report` genuinely has no
+// such key, and `BacktestResults.tsx`'s badge already guards on
+// `Array.isArray(...)` rather than assuming presence. A sweep also
+// carries the same field per level at `edge_decay.rows[].unmarked_positions`
+// (see `sweep.py`), independently of this top-level one.
 export interface BacktestReport {
   depth_source?: ResultDepthSource | string;
   fill_at?: FillAt | string;
@@ -449,4 +440,86 @@ export interface PaginatedResponse<T> {
 export interface ApiError {
   detail: string;
   status_code: number;
+}
+
+// Cross-venue link review types (PLAN.md D9, T17) — mirror
+// backend/app/api/routes/links.py's response models field by field.
+// That module's docstring is the reason this exists at all: two
+// markets a token-overlap score calls equivalent can settle
+// differently, so a human reads both venues' `rules_text` and decides.
+// `question`/`rules_text` are untrusted venue text (GUARDRAILS.md §6):
+// they are rendered for a person to read, never executed or
+// interpreted as instructions.
+export type LinkStatus = 'proposed' | 'approved' | 'rejected';
+
+// `LinkOut` — one persisted `event_links` row.
+export interface EventLink {
+  id: number;
+  venue_a: string;
+  market_a: string;
+  venue_b: string;
+  market_b: string;
+  outcome_map: Record<string, string>;
+  confidence: number;
+  evidence: Record<string, unknown>;
+  status: LinkStatus | string;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  notes: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+// `GET /links` response.
+export interface LinkListResponse {
+  links: EventLink[];
+}
+
+// `MarketSideOut` — one side of the `GET /links/{id}` comparison.
+export interface LinkMarketSide {
+  venue: string;
+  market_id: string;
+  question: string;
+  outcomes: string[];
+  close_time: string;
+  close_time_iso: string;
+  expected_settle_time: string | null;
+  resolution_source: string | null;
+  status: string;
+  rules_text: string;
+}
+
+// `FieldComparison` — one field of the side-by-side comparison.
+export interface LinkFieldComparison {
+  field: string;
+  a: string | null;
+  b: string | null;
+  same: boolean;
+}
+
+// `LinkReviewResponse` (`GET /links/{id}`) — named `...Payload` here,
+// not `LinkReview`, so the type does not collide with the review-surface
+// component it feeds (`components/links/LinkReview.tsx`).
+export interface LinkReviewPayload {
+  link: EventLink;
+  market_a: LinkMarketSide | null;
+  market_b: LinkMarketSide | null;
+  comparison: LinkFieldComparison[];
+  warnings: string[];
+}
+
+// `ApproveRequest` body for `POST /links/{id}/approve`. `outcome_map`
+// omitted (or empty) falls back to the link's existing map — a
+// multi-outcome pair with no map at all (matcher refuses to guess one)
+// 422s until a reviewer supplies one explicitly.
+export interface ApproveLinkRequest {
+  reviewed_by: string;
+  notes?: string;
+  outcome_map?: Record<string, string> | null;
+}
+
+// `RejectRequest` body for `POST /links/{id}/reject`.
+export interface RejectLinkRequest {
+  reviewed_by: string;
+  notes?: string;
 }

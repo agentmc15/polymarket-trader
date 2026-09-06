@@ -40,7 +40,7 @@ from sqlalchemy import select
 
 from app.api.deps import AsyncSessionDep, MarketDataAdaptersDep
 from app.models.event_link import EventLink
-from app.services.matching import propose_links
+from app.services.matching import persist_proposals, propose_links
 from app.strategies.base import normalize_outcome
 from app.utils.time import utcnow
 from app.venues.base import MarketDataAdapter, VenueError
@@ -394,6 +394,13 @@ async def propose(
     proposals ARE refreshed in place, so a moved close time or an edited
     question updates the queue rather than duplicating it.
 
+    That reconciliation is `app.services.matching.persist
+    .persist_proposals`, not a loop written here, because since T30 this
+    endpoint is no longer the only caller: `app.tasks.matching` runs the
+    same matcher on a beat. One implementation of "which rows a re-run
+    may touch" is the point — two copies would eventually let the
+    automatic caller do something this manual one refuses to.
+
     Args:
         session: Database session.
         adapters: Read-only market-data adapters, one per venue. These
@@ -409,61 +416,22 @@ async def propose(
     markets_b = await adapters["kalshi"].list_markets(status="open")
     proposals = propose_links(markets_a, markets_b, min_confidence=min_confidence)
 
-    created = 0
-    updated = 0
-    skipped_reviewed = 0
-    touched: list[EventLink] = []
+    outcome = await persist_proposals(session, proposals)
 
-    for proposal in proposals:
-        existing = (
-            await session.execute(
-                select(EventLink).where(
-                    EventLink.venue_a == proposal.venue_a,
-                    EventLink.market_a == proposal.market_a,
-                    EventLink.venue_b == proposal.venue_b,
-                    EventLink.market_b == proposal.market_b,
-                )
-            )
-        ).scalar_one_or_none()
-
-        if existing is None:
-            row = EventLink(
-                venue_a=proposal.venue_a,
-                market_a=proposal.market_a,
-                venue_b=proposal.venue_b,
-                market_b=proposal.market_b,
-                outcome_map=dict(proposal.outcome_map),
-                confidence=proposal.confidence,
-                evidence=dict(proposal.evidence),
-                status="proposed",
-            )
-            session.add(row)
-            created += 1
-            touched.append(row)
-            continue
-
-        if existing.reviewed_at is not None or existing.status != "proposed":
-            skipped_reviewed += 1
-            touched.append(existing)
-            continue
-
-        existing.confidence = proposal.confidence
-        existing.evidence = dict(proposal.evidence)
-        existing.outcome_map = dict(proposal.outcome_map)
-        updated += 1
-        touched.append(existing)
-
-    await session.commit()
-    for row in touched:
+    # `persist_proposals` commits but does not refresh: only a caller
+    # rendering a response needs the server-side `created_at`/`updated_at`
+    # back, and the beat (which touches every pair on both venues) must
+    # not pay a SELECT per row for timestamps it never reads.
+    for row in outcome.rows:
         await session.refresh(row)
 
     return ProposeResponse(
         scanned_a=len(markets_a),
         scanned_b=len(markets_b),
-        created=created,
-        updated=updated,
-        skipped_reviewed=skipped_reviewed,
-        links=[_link_out(row) for row in touched],
+        created=outcome.created,
+        updated=outcome.updated,
+        skipped_reviewed=outcome.skipped_reviewed,
+        links=[_link_out(row) for row in outcome.rows],
     )
 
 

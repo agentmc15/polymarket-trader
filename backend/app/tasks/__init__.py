@@ -21,6 +21,7 @@ celery_app = Celery(
         "app.tasks.backtesting",
         "app.tasks.execution",
         "app.tasks.scanner",
+        "app.tasks.matching",
     ],
 )
 
@@ -84,5 +85,25 @@ celery_app.conf.beat_schedule = {
     "scan-near-resolution": {
         "task": "app.tasks.scanner.scan_near_resolution",
         "schedule": settings.near_resolution_scan_interval_s,
+    },
+    # T30 (PLAN.md D9): `app.services.matching.propose_links` had ONE
+    # caller, the manual `POST /links/propose`. With no beat,
+    # `event_links` on a fresh install started empty and stayed empty,
+    # and `app.services.scanner._build_strategies` filters to
+    # `status="approved"` before building `LinkBook` — so
+    # `cross_venue_arbitrage`, this repo's centerpiece, was constructed
+    # with nothing and emitted nothing, permanently. This is its feeder.
+    # It PROPOSES ONLY: approval stays a human act in
+    # `app/api/routes/links.py` (PLAN.md D9/R1), and re-running it can
+    # neither duplicate a queued proposal nor resurrect a rejected one —
+    # see `app.services.matching.persist`.
+    # Its own interval (`settings.link_proposal_interval_s`, 3600s by
+    # default), not a reuse of either scan interval: a venue's market
+    # LIST turns over on a scale of hours, the output is a queue a human
+    # reads rather than a trade, and the pass reads every open market on
+    # both venues — see `app/config.py` for the full reasoning.
+    "propose-event-links": {
+        "task": "app.tasks.matching.propose_event_links",
+        "schedule": settings.link_proposal_interval_s,
     },
 }

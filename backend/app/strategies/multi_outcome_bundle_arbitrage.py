@@ -52,7 +52,16 @@ sibling strategy documents.
 """
 from typing import Any
 
-from app.strategies.base import BaseStrategy, Intent, Leg, MarketSnapshot, Signal
+from app.strategies.base import (
+    EDGE_BASIS_KEY,
+    EDGE_BASIS_OBSERVED,
+    SCORING_EDGE_KEY,
+    BaseStrategy,
+    Intent,
+    Leg,
+    MarketSnapshot,
+    Signal,
+)
 from app.venues.base import FeeModel
 from app.venues.fees import (
     KalshiFeeModel,
@@ -223,22 +232,32 @@ class MultiOutcomeBundleArbitrageStrategy(BaseStrategy):
                 "total_cost": total_cost,
                 "total_fees": total_fees,
                 "profit_margin": profit_margin,
-                # `net_edge` is what `app.services.scoring._net_edge` reads
-                # to drive `annualized_return`/`composite` (T21b defect fix:
-                # publishing only `profit_margin` left every bundle intent
-                # scoring a `net_edge` of 0.0). It is `profit_margin` net of
-                # every outcome's taker fee (already subtracted above) and
-                # of nothing else — no gas, and, unlike
-                # `cross_venue_arbitrage`'s same-named key, no
-                # link-confidence haircut, because a bundle is single-venue
-                # and single-market: every leg resolves off the same
-                # question, so there is no cross-venue identity risk to
-                # discount. Do not compare this value to
-                # `cross_venue_arbitrage`'s `net_edge` as if they measured
-                # the same kind of risk; they are both "USD per contract,
-                # net of fees" but only one of them is also net of
-                # resolution-mismatch risk.
+                # THE SCORING CONTRACT (T31, `app.strategies.base`):
+                # `profit_margin` net of every outcome's taker fee
+                # (subtracted above) and of nothing else — no gas, and no
+                # probability haircut, because a bundle is single-venue
+                # and single-market: every leg redeems off the same
+                # question, so there is no identity risk to price.
+                #
+                # This comment used to end "Do not compare this value to
+                # `cross_venue_arbitrage`'s `net_edge` as if they
+                # measured the same kind of risk" — and `composite`, its
+                # only consumer, did exactly that, because that strategy
+                # published a link-confidence-haircut number under the
+                # same key. T31 removed the trap rather than the warning:
+                # cross-venue now publishes its PRE-haircut edge under
+                # this same `SCORING_EDGE_KEY` and declares its
+                # confidence separately, so the two keys finally do mean
+                # the same thing and `app.services.scoring` applies the
+                # one haircut that differs.
+                #
+                # `"net_edge"` is kept as an alias of the same value
+                # (T21b published under that name; persisted rows and
+                # `SCORING_EDGE_LEGACY_KEY` still read it) — it is the
+                # identical number, not a second quantity.
+                SCORING_EDGE_KEY: profit_margin,
                 "net_edge": profit_margin,
+                EDGE_BASIS_KEY: EDGE_BASIS_OBSERVED,
                 "fee_schedule_source": schedule.source,
             },
         )

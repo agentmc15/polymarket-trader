@@ -4300,3 +4300,493 @@ prose is stale.
 
 agent: T29 id=a8c34eb470d2e83f3 role=implementer model=opus
 outcome: T29 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T30
+
+`propose_links` had exactly one caller — `POST /links/propose`, `links.py:410` — and no beat, so on a
+fresh install `event_links` started empty and stayed empty until a human curled the endpoint by hand.
+`scanner._build_strategies:425` filters to `status == "approved"` before constructing `LinkBook`, so
+`cross_venue_arbitrage` — the repo's stated centerpiece — was built over an empty list and scanned
+nothing, forever. Same class of defect as the near-resolution pass before T25: a correct, well-tested
+subsystem with no production caller. The fix is `app/tasks/matching.py::propose_event_links`, a third
+beat on its own interval (`Settings.link_proposal_interval_s`, alias `LINK_PROPOSAL_INTERVAL_S`,
+default 3600s), registered in both `celery_app.conf.include` and `beat_schedule`.
+
+An hour, not two minutes, and its own knob rather than a reuse of either scan interval, for the two
+reasons the near-resolution interval is also separate: what it looks for (a venue's market LIST turns
+over on a scale of hours, and the output is a queue a human has to read, not a trade — re-deriving the
+same proposals every 120s moves no approval forward), and what it costs (it reads EVERY open market on
+both venues and scores the blocked cross product, the heaviest read-plus-compute in the repo, where
+`scan()` is bounded by `scan_top_n`).
+
+The reconciliation rules were pulled out of the route into `app/services/matching/persist.py` rather
+than reimplemented in the task. One implementation of "which rows a re-run may touch" is the whole
+point: two copies would eventually let the automatic caller do something the manual one refuses to.
+The route now calls `persist_proposals` and keeps only its own `refresh` loop, which exists purely to
+render a response — a beat touching every pair on both venues must not pay a SELECT per row for
+timestamps it never reads.
+
+Idempotency, stated as four cases: no row yet -> INSERT `proposed`; an undecided `proposed` row ->
+rescored in place (confidence, evidence, outcome map) so the queue shows today's score rather than the
+one from whenever the pair was first seen; `approved` -> untouched; `rejected` -> untouched. The
+rejected case is the one that matters for an automatic caller. The matcher re-proposes a rejected pair
+on every pass forever, because its score has not changed and nothing in a token-overlap score can see
+the reason for the rejection. A proposer that re-filed it, or reset it to `proposed`, would make
+rejection meaningless and train the operator to ignore the queue — the one control R1 depends on. A
+changed rules text is deliberately NOT allowed to disturb a decided row either; that is a
+human-review concern the side-by-side comparison on `GET /links/{id}` already surfaces, and demoting
+an approved link by machine would be this package writing a lifecycle value it may not write.
+
+No auto-approval, and it is guarded in three independent layers rather than argued for in prose: the
+task contains no lifecycle assignment at all; `persist_proposals` raises `ValueError` on any proposal
+not carrying `PROPOSED`, before writing anything; and `LinkBook` still raises on a non-approved link.
+The 0.875 fixture pair sits far above any plausible auto-approval threshold and comes out `proposed`
+and unreviewed on every pass, which is the assertion that would fail first if someone later "closed
+the loop". Confidence is a similarity score, not a guarantee of identity — a false link is not a
+missed opportunity, it is a position that believes it is hedged while both legs can lose at
+settlement.
+
+A new AST fence in the test file makes that structural instead of a convention: over
+`app/services/matching/*.py` plus `app/tasks/matching.py`, no non-docstring string constant may read
+`approved`, nothing may assign `.status`/`.reviewed_by`/`.reviewed_at` on a row, and the only
+lifecycle keyword permitted on an `EventLink(...)`/`.values(...)` call is `status=PROPOSED`. Injecting
+an auto-approval into `persist.py` turns that fence red as well as the behavioural test, which is what
+makes the pair worth having.
+
+Ten new tests, every one proven red-green in a `$TMPDIR` copy built from `git archive HEAD` plus only
+this task's seven files (757 passed there, zero failures — which is also what isolates this work from
+the concurrent scoring/strategies edits in the live tree). Reverts used: beat entry removed; module
+dropped from `conf.include` while the entry stayed (the check that "scheduled" and "reachable" are two
+different claims); interval aliased onto `scan_interval_s`; the existing-row lookup removed; the
+decided-row guard removed; a `confidence >= 0.85` auto-approval injected; the per-venue read guard
+removed; the `IntegrityError` handler removed; the proposal refusal removed. No test passes on an
+empty corpus — each asserts a non-zero count first.
+
+Two things worth a reviewer's eye. The brief points at `tests/test_fences.py` for the "matcher never
+auto-approves" drift signal; that check actually lives in
+`tests/matching/test_matcher.py::test_matcher_never_advances_a_link_past_proposed`. It exists, it
+still passes, and the new AST fence strengthens it — a pointer to the wrong file, not a missing
+control, so nothing was improvised around it. And `mypy app/tasks/matching.py` reports one finding,
+`Untyped decorator makes function "propose_event_links" untyped`, which every one of the four existing
+task modules reports identically (celery ships no stubs, and none of them carries a suppression);
+adding a `type: ignore` here would have made this file the only one that differs from its siblings.
+
+No migration: `event_links` is unchanged, `alembic heads` stays `007 (head)`, and
+`alembic upgrade head --sql` still emits cleanly (offline only, per §2). No network anywhere — both
+venues are `FixtureAdapter`, substituted for `read_adapters()` before it could construct a real
+adapter. The task takes read-only adapters from `app.tasks.scanner.read_adapters` deliberately rather
+than re-deriving them: that helper is the one place the "`get_read_adapter`, never `get_adapter`"
+policy for periodic tasks is written down, and drifting on it is a money-rule risk, not a style one.
+`app.execution.router` is not imported by any of this.
+
+### T30 adjudication (orchestrator)
+
+Verified: `app/tasks/__init__.py:106` registers `app.tasks.matching.propose_event_links` on
+`settings.link_proposal_interval_s` (3600s, its own knob). Suite **761**. Cross-venue arbitrage is no
+longer structurally unfed -- `scanner._build_strategies:425` filters to `approved`, and until now
+`event_links` could only be populated by a human curling `POST /links/propose`.
+
+THE INTERVAL REASONING IS THE PART WORTH KEEPING: an hour, not either scan interval, because a
+venue's market LIST turns over on a scale of hours, the output is a queue a human reads rather than a
+trade, and this pass reads every open market on both venues -- the heaviest read+compute in the repo,
+where `scan()` is bounded by `scan_top_n`. Reusing a scan interval would have been the silent-default
+failure this kit has hit before.
+
+NO-AUTO-APPROVAL IS ENFORCED IN THREE INDEPENDENT LAYERS, not one: the task assigns no lifecycle value;
+`persist_proposals` RAISES on any proposal not carrying `PROPOSED`, before writing anything; and a new
+AST fence over `app/services/matching/*.py` + `app/tasks/matching.py` forbids a non-docstring
+`"approved"` literal, any assignment to `.status`/`.reviewed_by`/`.reviewed_at`, and any lifecycle
+keyword but `status=PROPOSED` on an `EventLink(...)`/`.values(...)` call. Red-green proved by INJECTING
+a `confidence >= 0.85` auto-approval, which went red on both the behavioural test and the AST fence.
+That is the right shape: the behavioural test catches the bug, the fence catches the next person's
+version of it.
+
+The rejected-link decision is the one I most wanted right, and it is: a rejected row is left untouched,
+and the matcher re-proposes it every pass forever because no token score can see a human's reason. The
+alternative -- re-filing or resetting it -- would make rejection meaningless. Decided rows are never
+rescored even when their score changes, because demoting an approved link by machine would be this
+package writing a lifecycle value it is forbidden to write.
+
+`persist_proposals` was lifted OUT of the route into `services/matching/persist.py` so the beat and
+`POST /links/propose` cannot drift apart -- two callers of one reconciliation rule rather than two
+copies of it.
+
+**MY BRIEF CARRIED A WRONG POINTER.** I wrote that the "matcher never auto-approves" drift check lives
+in `tests/test_fences.py`. It does not -- it is
+`tests/matching/test_matcher.py::test_matcher_never_advances_a_link_past_proposed` (verified at
+`:435`). The implementer located the real control, confirmed it exists and passes, and reported the
+correction rather than trusting my pointer and either failing against a nonexistent test or
+improvising a replacement control. Correctly recorded as a brief pointer error, NOT a `defect:` line,
+since the control was present and my reference was merely wrong.
+
+One `mypy` finding left deliberately unsilenced: `Untyped decorator makes function
+"propose_event_links" untyped`, identical to what all four existing task modules report (celery ships
+no stubs, and none of the siblings carries a suppression). Adding a `type: ignore` would make this the
+only task module that differs. Flagging beats silencing.
+
+agent: T30 id=a99f81ebdabbe8e86 role=implementer model=opus
+outcome: T30 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T32
+
+Four defects, all in `frontend/src/` only — no `backend/` file was read for anything but shape
+(GUARDRAILS.md's ban on touching it while T25-era backend agents were active in
+`app/tasks/`, `app/services/matching/`, `app/api/routes/links.py`, `app/services/scoring.py`,
+`app/strategies/` was respected throughout; `git status --porcelain` at the end shows exactly the
+frontend files listed below plus those other agents' own in-flight `backend/` changes, none of
+which were touched or reverted).
+
+**Defect 1 — the client's backtest shape had drifted from the backend on far more than the three
+named fields.** Read `backend/app/api/routes/backtesting.py` field by field rather than trusting
+the existing `frontend/src/services/backtestApi.ts`/`types/index.ts`, and found the client wrong
+in every one of these ways:
+
+- `BacktestResponse.id` vs the client's `backtest_id` (the named defect — this alone meant
+  `Backtesting.tsx`'s `setCurrentBacktestId(result.backtest_id)` was always `undefined`, so the
+  Results tab literally could never activate after a run).
+- `SweepResponse.id` — same rename, same bug, for the new sweep producer (Defect 2).
+- `BacktestStatusResponse` carries `trade_metrics`/`risk_metrics` (`TradeMetrics`/`RiskMetrics`,
+  9 and 6 fields respectively) plus top-level `final_value`/`total_return`/`total_return_pct`. The
+  client had a single fictitious `metrics?: BacktestMetrics` field (never populated — the backend
+  has no `metrics` key at all) carrying 36 invented fields (`calmar_ratio`, `ulcer_index`,
+  `cvar_95`, `skewness`, `kurtosis`, `best_month`, etc.) that do not exist anywhere in the API.
+  Since `metrics` was always `undefined`, `BacktestResults`'s `if (!metrics)` branch fired on
+  every single completed run — the completed-results view could never render at all, independent
+  of the `id` bug above. Traced further: `get_backtest_status` (backtesting.py) only ever
+  populates `trade_metrics.total_trades`/`.win_rate` and `risk_metrics.sharpe_ratio`/
+  `.max_drawdown` from `BacktestRun` columns (`backend/app/models/backtest_run.py` only stores
+  those four numbers plus `final_value`/`total_return`) — every other field on those two pydantic
+  models is real and typed but currently always the `0.0` default. Typed the full real shape in
+  `types/index.ts` (so a future backend change needs no client change) but only RENDER the four
+  fields that are genuinely populated today in `BacktestResults.tsx`, with a comment explaining
+  why — showing "Profit Factor: 0.00" forever as if it were measured would be the same class of
+  dishonesty GUARDRAILS.md §1.7 exists to prevent for depth/fill labels, one level up.
+- `EquityCurveResponse`: backend returns `points`/`final_value`; client had `equity_curve`/
+  `final_capital`. `EquityCurvePoint` has `timestamp`/`equity`/`drawdown` — no `drawdown_pct`
+  (client invented one).
+- `TradesResponse`: backend returns `trades`/`total_count`; client had `total_trades`/`page`/
+  `page_size` (backend has no pagination echo at all, only `skip`/`limit` request params).
+- `TradeRecord` (`BacktestTrade`): the backend record is one FILL — `timestamp`, `market_id`,
+  `outcome`, `side`, `price`, `size`, `fee`, `pnl`, `signal_confidence`. The client's type modeled
+  a closed round-trip POSITION instead — `entry_time`/`exit_time`, `entry_price`/`exit_price`,
+  `token_id`, `market_condition_id`, `pnl_pct`, `signal_type`, `confidence`, `id`, `backtest_id` —
+  none of which exist on the wire. `TradeList.tsx` was rewritten around the real flat-fill shape
+  (sort/filter over `timestamp`/`side`/`price`/`size`/`pnl`; row key synthesized from
+  `timestamp+market_id+outcome+index` since there is no `id`).
+- `BacktestListItem`/`BacktestListResponse`: backend has `final_value`/`total_return` (fractions)
+  and `skip`/`limit`; client had `final_capital`/`total_return_pct`/`page`/`page_size`/a
+  `completed_at` that doesn't exist on this endpoint. `Backtesting.tsx`'s history table now reads
+  `bt.total_return` and multiplies by 100 at render time instead of expecting a precomputed
+  `_pct` field the backend never sends for list rows.
+- `BacktestRequest.slippage_value` vs the client's `slippage_bps` — not just a name mismatch but a
+  UNIT mismatch: `slippage_value` is a PROBABILITY-unit pad added to a limit price (default
+  `0.001` = 0.1%, `engine.py`'s `BacktestConfig.slippage_value`), and the client was posting a raw
+  basis-points integer under a field name (`slippage_bps`) the backend's pydantic model doesn't
+  even declare — so the whole "Slippage (basis points)" input in `BacktestForm` was silently
+  dropped by FastAPI on every run and the backend's `0.001` default applied regardless of what a
+  user typed. Fixed by keeping the bps UI (least disruptive) and converting at submit:
+  `slippage_value: slippageBps / 10_000`.
+- `BacktestRequest.markets` vs the client's `market_ids` (unused by any current UI control, but
+  fixed for correctness since it's part of the same request type).
+- `StrategyInfo`: backend (`list_strategies()` + the route's pydantic model) has `name`,
+  `description`, `version`, `category`, `default_config` — there is no `display_name`. The client
+  declared one and `StrategySelector.tsx`/`BacktestForm.tsx` rendered it, so every strategy card
+  and the "selected strategy" summary showed a blank heading. Fixed by deriving a label from
+  `name` client-side (`formatStrategyName` in `utils/format.ts`, the same snake-to-title
+  transform `ConfigField`'s labels already use) rather than inventing a backend field.
+- `EdgeDecayRow`(`CapitalRow`)/`capital_row_to_dict`: the type was missing `sized_intents`,
+  `pct_intents_capital_capped`, `pct_intents_depth_limited` and `depth_blocked_intents` — the four
+  fields T28 added per PLAN.md R4 (per an earlier NOTES.md entry in this file). Added them to the
+  type for a complete mirror; did not add new `EdgeDecayTable` UI columns for them, since nothing
+  in this brief asked for it and the table was otherwise untouched (scope discipline).
+- `frontend/src/services/api.ts` carried five entirely dead backtesting methods
+  (`getBacktests`/`runBacktest`/`getBacktest`/`getBacktestTrades`/`getStrategies`) and a `Backtest`
+  domain type, superseded by `backtestApi.ts` since before this task and unreferenced by any
+  component or hook (confirmed by grepping every call site in `frontend/src` — zero hits). They
+  used shapes that were themselves wrong in the same ways as above (e.g. `PaginatedResponse<
+  Backtest>` for a list endpoint that returns `{backtests, total, skip, limit}`, not
+  `{data, total, skip, limit}`). Removed rather than fixed, since fixing dead code just moves the
+  drift risk into a second copy nothing exercises; `api.ts` now only carries the links methods
+  Defect 4 needed plus everything it already had for markets/trading/positions/opportunities/bots.
+
+Verified the fix is complete, not partial, three ways: (1) `grep -rn` across `frontend/src` for
+every old field name (`backtest_id`, `equity_curve`, `final_capital`, `market_ids`, `slippage_bps`,
+`display_name`, `page_size`, `BacktestMetrics`) turned up zero remaining call-site usages — the
+only surviving hits are the two response models where `backtest_id` is genuinely correct
+(`EquityCurveResponse`/`TradesResponse` really do carry that field) and a doc comment. (2) `npx tsc
+-p tsconfig.app.json --noEmit` exits 0 — every renamed field is used consistently end to end
+through `backtestApi.ts` -> `useBacktesting.ts` -> `Backtesting.tsx`/`BacktestResults.tsx`/
+`TradeList.tsx`, and TypeScript would not compile a mismatched consumer. (3) Traced the specific
+user-visible symptom by hand: `handleRunBacktest` now sets `currentBacktestId` from `result.id`
+(matches `BacktestResponse.id`), which flips `activeTab` to `'results'`; `BacktestResults`'s gate
+changed from `if (!metrics)` (always true, since `metrics` never existed) to
+`if (!tradeMetrics || !riskMetrics)` (both populated together whenever `status === "COMPLETED"`,
+per `get_backtest_status`'s own code) — so the Results tab now both activates AND renders past its
+loading gate on a real completed run, which the old code could not do even with `id` fixed in
+isolation. `npm run lint` exits 0 and `grep -rn ": any\b" frontend/src` is empty; no `unknown` cast
+was used to force a payload through — every field access is against a type that matches a
+pydantic model I read.
+
+**Defect 2 — sweep producer added to `BacktestForm`.** A new "Capital Sweep (optional)" section
+posts to `POST /backtests/sweep` via a new `useRunSweep` hook (`backtestApi.runSweep`), separate
+from the existing single-run submit so `initial_capital` keeps its existing meaning. Modeled the
+asynchrony honestly: the mutation resolves with `{id, status: "PENDING"}` exactly like a plain run,
+`Backtesting.tsx` routes to the same `BacktestResults`/`EdgeDecayTable` plumbing that already
+existed for a sweep's parent id (that consumption path was already correct before this task — the
+gap really was only "no producer", as the brief said), and the pending/running copy in
+`BacktestResults` now says "Sweep queued.../Running capital sweep..." with a one-line explanation
+when `strategyName` starts `sweep:`, instead of silently reusing the single-run copy.
+`DEFAULT_CAPITAL_LEVELS` (`backend/app/services/backtesting/sweep.py:112`,
+`(500, 2_000, 10_000, 50_000, 250_000)`) is READ, not exposed through the API as structured data —
+`SweepRequest.capital_levels`'s only trace of it is a human-readable string interpolated into that
+field's OpenAPI `description` (`backtesting.py`'s `SweepRequest`), not a value a client can fetch
+and parse at runtime. Per the brief's own fallback instruction, hardcoded it as a documented
+constant (`DEFAULT_SWEEP_CAPITAL_LEVELS` in `BacktestForm.tsx`) with a comment citing the exact
+backend line and stating plainly that it is not runtime-derived. The field itself is a plain
+comma-separated text input (parsed and filtered to positive numbers, mirroring the backend's own
+`capital_levels must be non-empty`/`every entry must be positive` validation with an inline error
+rather than letting a bad request reach the API as a 422) — deliberately not a fancier chip/tag
+widget, since PLAN.md §2 fences a redesign and nothing here needed one.
+
+**Defect 3 — the stale `unmarked_positions` comment in `types/index.ts` (~line 428, now further
+down after the additions above) rewritten.** Confirmed against `backend/app/tasks/backtesting.py`
+that `build_report()` now writes `"unmarked_positions": list(result.unmarked_positions)`
+unconditionally (per this file's own `### T29` entry), so a clean run persists `[]`, not an absent
+key. Replaced the "NOT currently written" claim with a description of the current, correct
+semantics — an absent key means the run predates the field, not that its equity curve is fully
+marked — and kept the field optional in the type for exactly that reason, per the brief's
+instruction not to touch the (still-correct) optional typing.
+
+**Defect 4 — cross-venue link review surface, built from `backend/app/api/routes/links.py` as
+read (that file was mid-edit by a concurrent agent this session; read the live on-disk version,
+which was internally consistent and fully docstringed, not a committed snapshot).** New
+`frontend/src/hooks/useLinks.ts` (`useLinks` polling `GET /links?status=proposed` every 15s since
+`POST /links/propose` may be scheduled and the queue can grow on its own; `useLinkReview` for
+`GET /links/{id}`; `useApproveLink`/`useRejectLink` for the two POST actions) and
+`frontend/src/components/links/LinkReview.tsx`, added to `api.ts` and wired into `App.tsx` as a
+new "links" tab (`ErrorBoundary`-wrapped, matching how `Backtesting` is already wrapped). The
+queue table (confidence, both venues' `venue:market_id`, proposed time, a per-row "Review" button)
+sits beside a detail panel that renders `links.py`'s own `_COMPARED_FIELDS` order as a table for
+the scalar fields, then gives `rules_text` its own two FULL, independently-scrollable panels
+(`max-h-96 overflow-y-auto whitespace-pre-wrap`, not a `title` tooltip and not line-clamped) side
+by side — the brief's explicit requirement, since that comparison is the entire point of the human
+gate. Approve/Reject each take `reviewed_by` (prefilled with the operating user's own email as a
+default, editable — a legitimate attribution use per this session's userEmail guidance, since it
+never leaves this app's own backend) and `notes`, with a minimal add/remove key-value editor for
+`outcome_map` (required by the backend with a 422 on an empty map for a multi-outcome pair; sending
+an unmodified existing map is harmless since `_canonical_outcome_map` is idempotent on
+already-canonical YES/NO keys). There is deliberately no "approve all"/bulk control anywhere in
+this component — one row's Approve/Reject button acts on exactly that row's `linkId`, per the
+brief's explicit prohibition and the reasoning behind it (a false link is a same-side double bet
+that loses on both legs at settlement, and the one-at-a-time friction is the safety property).
+
+No route or payload in this brief failed to match what `links.py`/`backtesting.py`/`sweep.py`
+actually declare — nothing here required inventing a shape, so there is no `defect:` line for this
+task.
+
+Final gates: `cd frontend && npx tsc -p tsconfig.app.json --noEmit` exits 0; `npm run lint` exits
+0; `grep -rn ": any\b" frontend/src` is empty. `git status --porcelain` shows only files under
+`frontend/src/` as mine (`App.tsx`, `components/backtesting/{BacktestForm,BacktestResults,
+Backtesting,StrategySelector,TradeList}.tsx`, `components/links/LinkReview.tsx` (new),
+`hooks/{useBacktesting,useLinks}.ts` (`useLinks.ts` new), `services/{api,backtestApi}.ts`,
+`types/index.ts`, `utils/format.ts`) plus this NOTES.md entry; every `backend/` modification and
+the three new `backend/`/`tests/` files in that status output belong to the concurrent matching/
+scoring/strategies agents and were not read for anything beyond confirming they were untouched by
+me, let alone edited.
+
+### T32 adjudication (orchestrator)
+
+Verified: `tsc` 0, `npm run lint` 0, `: any` empty, `src/components/links/LinkReview.tsx` and
+`src/hooks/useLinks.ts` exist, and grep confirms NO bulk-approve control of any spelling.
+
+**THE BIGGEST FIND WAS NOT IN THE BRIEF: the slippage control was a silent no-op.** The client posted
+`slippage_bps` (raw basis points); the backend field is `slippage_value` (a fraction, default 0.001),
+and `BacktestRequest.model_config` uses pydantic's default `extra="ignore"` -- verified directly:
+
+    model_config extra = ignore (pydantic default)
+
+So FastAPI accepted the request, DISCARDED the unknown key, and every backtest anyone ever ran used
+default slippage no matter what the UI said. Two bugs stacked: a name mismatch that silently dropped
+the value, and a UNIT mismatch (basis points into a fraction field) that would have made it 10,000x
+wrong had the name matched. Fixed by converting at submit (`slippageBps / 10_000`). This is the same
+family as the `TRADING_KILL_SWITCH_PATH` defect earlier in this kit -- a permissive `extra="ignore"`
+turning a wrong field name into silence rather than an error. **Worth a systematic sweep in a future
+kit: every request model with `extra="ignore"` is a place a client can be wrong without being told.**
+
+I told the implementer not to fix only the three mismatches the review named but to reconcile the
+whole client surface. That was the right call -- it found NINE more, including a fictitious 36-field
+`metrics` type that was always `undefined`, a `BacktestTrade` shape modelling a closed position when
+the backend sends a single-fill `TradeRecord`, and five dead backtesting methods with zero call sites.
+`BacktestResults`'s gate was an always-true `if (!metrics)`, which is why the Results tab never
+rendered even once the id was fixed. Both had to go for the user-visible outcome to actually change.
+
+Completeness was demonstrated rather than asserted: every old field name grepped across `frontend/src`
+returns zero call sites, `tsc` passes end to end, and the fix was traced by hand
+(`result.id` -> `setCurrentBacktestId` -> tab flips to `results`).
+
+Judgment call recorded rather than papered over: only 4 of the 15 combined `TradeMetrics`/`RiskMetrics`
+fields are populated by `get_backtest_status` today. The rest are typed correctly but deliberately NOT
+rendered, so the UI does not show fake zeros as measured data. Right call -- an unpopulated metric
+displayed as `0.00` is indistinguishable from a real zero, which is the same labeling failure
+GUARDRAILS §1.7 exists to prevent.
+
+`DEFAULT_CAPITAL_LEVELS` is not exposed as structured API data (it lives only in an OpenAPI
+description string), so the brief's own fallback applied: a documented constant citing `sweep.py:112`.
+
+agent: T32 id=a9711cab8176a02bf role=implementer model=sonnet
+outcome: T32 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T31
+
+The brief matched repo reality on every point I could check, including the shipped
+`multi_outcome_bundle_arbitrage` comment that says its `net_edge` must not be compared to
+`cross_venue_arbitrage`'s while `composite` was the sole consumer doing exactly that. So there is
+no `defect:` line for this task. Two things beyond the brief turned out to be part of the same
+bug and are recorded below because they changed numbers a reader of `/opportunities` sees.
+
+I chose design (a): strategies publish a PRE-risk edge and `scoring` applies every haircut. The
+deciding argument against (b) was not diff size but rot. Under (b) the scorer must hold a
+per-strategy table of "net of what?", which is the coupling that produced this defect, and it
+fails silently on the day a fifth strategy is added — a new strategy publishing an unhaircut edge
+gets scored as if it were haircut, or the reverse, with nothing in the code able to notice. Under
+(a) a strategy that says nothing about identity risk is scored as having none, which is both the
+common case and the safe reading, and a strategy that does carry the risk has to declare it in the
+payload for it to be priced at all. The contract lives in `app/strategies/base.py` next to
+`DOWNSIZE_TO_CAPITAL_KEY`, because it is a statement about `Intent.metadata` and belongs where
+`Intent` is defined rather than in the consumer.
+
+Identity risk is now priced exactly once, in dollars, inside `scoring._risk_adjusted_edge`, using
+`cross_venue_arbitrage`'s own formula `edge * p - (1 - p) * worst_case_loss` moved out of the
+strategy. The `+0.25` cross-venue term in `resolution_risk` is gone, and it is gone because the
+risk it stood for is now priced upstream of it, not because it looked harsh. Its economic content
+survives in a better form: that term existed because below roughly 0.95 confidence a cross-venue
+pair is usually negative-EV outright rather than merely riskier, and the dollar haircut reproduces
+that directly — such a pair now scores a negative `net_edge`, a negative `composite`, and sorts
+below every viable trade instead of being nudged down a rank. The strategy's own `min_net_edge`
+gate still refuses to emit one, so scoring no longer needs a proxy for a gate that already exists.
+To keep the post-haircut number from being mistaken for a pre-risk one ever again, cross-venue's
+`as_metadata()` no longer publishes a `"net_edge"` key at all; that number rides as
+`"risk_adjusted_edge"`, and a test asserts the absence, not just the presence.
+
+Two things the brief did not name turned out to be the same defect wearing different clothes, and
+I fixed both rather than declaring them residual, because leaving either in place would have made
+the invariant I was asked to state plainly false.
+
+First, `resolution_risk`'s base now compounds over DISTINCT markets: `1 - (1 - 0.15) ** N`. Simply
+deleting the `+0.25` would have left a cross-venue pair carrying exactly the settlement risk of a
+single-market complement, which is wrong for a reason that has nothing to do with identity — two
+venues adjudicate independently, and `_RESOLUTION_RISK_BASE`'s own docstring says it is the chance
+a venue mis-adjudicates one question. N is 1 for a complement, a bundle and a single leg, and 2
+for a cross-venue pair, so `0.15` becomes `0.2775` there and nowhere else. This is the only term
+that still separates cross-venue from same-venue, and what it costs is small, derived and exactly
+statable: at equal capital and equal time a cross-venue pair must earn `1 / 0.85 = 1.176x` the
+same-venue edge to rank equally. Treating the two venues' errors as independent overstates the
+risk (both read the same news), so this is the conservative end.
+
+Second, `annualized_return` is now a return: expected profit over capital committed, not the
+per-contract dollar edge PLAN.md D10 wrote literally. This is a deliberate departure from D10's
+verbatim formula and should be read as one. The justification is in `scanner.py` already: its
+`near_resolution_pass` docstring says `score()`'s formula "never divides by the capital actually
+deployed at all", calls that an adequate approximation for the complement/cross-venue strategies
+and wrong for `settlement_edge`, and works around it by substituting that strategy's own
+capital-normalized figure. But both passes' rows land in ONE list that `GET /opportunities` sorts
+by `composite`, so before this change that sort was comparing USD-per-contract-per-year against a
+dimensionless return-per-year — a unit error in the sort key, and a worse one than the double
+discount. Normalizing here makes the general pass emit the unit the near-resolution pass was
+already emitting, and it leaves the near-resolution numbers untouched because
+`_apply_near_resolution_risk` replaces `annualized_return` outright.
+
+What I could not make comparable, and did not hide. A cross-venue `net_edge` contains
+`p_same_resolution`, which is the matcher's link confidence — a deterministic similarity score in
+[0, 1], not a calibrated probability. Every other term in every strategy's edge is an observed
+price or a published fee/gas rate. So a cross-venue row and a complement row with the same
+`composite` are the same expected return only to the extent that score is calibrated, and the
+cross-venue one carries model risk the complement does not. Rather than bury that, the originating
+strategy stamps `edge_basis` in `Intent.metadata` (which `scanner._persist` copies into
+`extra_data` and `arbitrage.py` returns verbatim as the payload's `metadata`, so it reaches
+`/opportunities` without my touching a route), and `OpportunityScore` carries the same label so it
+travels with the persisted number. The label is derived from whether the intent declared an
+identity confidence, never copied from the strategy's own claim, and an intent that claims an
+estimated basis while declaring no confidence is refused outright — that guard is the anti-rot
+mechanism for the contract, and it has its own test. The second residue is that the two scanner
+passes floor time differently (6h here, 24h there, deliberately, because a near-resolution trade's
+capital is locked until the venue settles); both are returns per dollar per year, so the unit
+matches, but a near-resolution row's annualization is floored harder.
+
+Every changed money expectation was recomputed by hand in the test body with the before number
+kept beside the after one, so a reader can see which change moved what. The red proof reverted the
+five behavioural modules to HEAD in a scratch copy while keeping the new constants importable —
+reverting `base.py` too would have produced an ImportError, which proves nothing about an
+assertion — and all nine new or changed tests failed on values, not on collection. A second,
+narrower mutation put only the `+0.25` back on top of the finished code, and exactly one test
+failed, on `resolution_risk` (0.5275 against the expected 0.2775), which is the assertion that
+should have caught it.
+
+Two notes for whoever picks this up. `OpportunityScore.edge_basis` is persisted in
+`IntentRecord.score` but is NOT in `OpportunityOut`, because `app/api/routes/arbitrage.py` builds
+that model field by field and was outside this task's file set; the label still reaches the payload
+through `metadata`, but a route change would surface it as a first-class column. And
+`app/strategies/{favorite_compounder,no_bias_exploit}.py` publish an `"edge"` key that is a
+directional mispricing, not a riskless per-unit edge — neither is in `ARBITRAGE_STRATEGIES` or the
+near-resolution pass, so neither is scored today, but if either is ever added to a scanner pass its
+`"edge"` will be read under this contract and will mean the wrong thing.
+
+### T31 adjudication (orchestrator)
+
+Suite **761**, `alembic heads` `007`, both invariant tests present
+(`test_equivalent_economics_score_the_same_composite_across_strategies:416`,
+`test_cross_venue_identity_risk_is_discounted_exactly_once:322`).
+
+VERIFIED THE `net_edge`-IS-GONE CLAIM AT AST LEVEL, not by grep. `grep -c '"net_edge"'` returns **3**,
+which read naively contradicts the report. Two are docstring prose and the third (`:806`) is a
+`logger.warning(..., extra={})` field on the suspect-link alert -- not intent metadata, so it never
+reaches `scoring._net_edge`. Walking `as_metadata()` confirms it emits `risk_adjusted_edge` and no
+`net_edge` key at all. Same shape as the T16 grep that reported "ROUTING REACHABLE" on pure docstring
+prose: **a raw count is not evidence in either direction.**
+
+Design (a) chosen -- strategies publish a PRE-risk edge, `scoring` applies every haircut -- and the
+deciding argument was ROT, not diff size: under (b) the scorer holds a per-strategy table of "net of
+what?", which is the exact coupling that produced the bug, and it fails SILENTLY the day a fifth
+strategy is added. Under (a) a strategy that says nothing about identity risk is scored as having none
+(the safe reading), and one that carries it must declare it to have it priced. Correct call.
+
+The `+0.25` removal is not a softening: identity risk moved UPSTREAM of `resolution_risk` into
+`_risk_adjusted_edge` (`edge*p - (1-p)*worst_case_loss`, cross-venue's own formula, relocated). Its
+economic content survives BETTER -- a pair that cannot cover its own haircut now scores NEGATIVE and
+sorts below everything, instead of being nudged one rank. Base settlement risk now compounds over
+distinct markets (`1 - (1-0.15)**N`), so a two-venue pair carries 0.2775 rather than a single market's
+0.15; deleting `+0.25` alone would have left cross-venue carrying too little. The cost is exactly
+statable: a cross-venue pair must earn **1/0.85 = 1.176x** the same-venue edge to rank equally.
+
+**PLAN D10 DEPARTURE, ADJUDICATED AND ACCEPTED.** D10 specifies `annualized_return = net_edge / hours
+x 8760`. T31 makes it profit / capital-committed, annualized. Accepted, because D10's literal formula
+never divides by capital deployed and therefore yields USD-per-contract-per-year, while
+`settlement_edge` computes `(1-ask-fee-gas)/ask` -- a true dimensionless return. Both land in ONE
+`composite`-sorted list, so the sort key was comparing USD/contract/yr against return/yr. `scanner.py`'s
+own docstring already called the formula wrong for `settlement_edge` and worked around it locally,
+which is evidence the architect's spec was the problem rather than the implementation. Near-resolution
+numbers are unchanged (`_apply_near_resolution_risk` replaces `annualized_return` outright). Recorded
+as an amendment to D10, not drift.
+
+RESIDUAL INCOMPARABILITY DECLARED RATHER THAN HIDDEN, which is what I asked for: `p_same_resolution`
+is the matcher's SIMILARITY score, not a calibrated probability, while every other term is an observed
+price or published rate. So `edge_basis` (`"observed_costs"` / `"identity_estimated"`) rides on
+`OpportunityScore` AND in `Intent.metadata`, reaching `/opportunities` through the existing
+`_persist` -> `extra_data` -> payload path with no route change. The label is derived from whether
+identity confidence was DECLARED, never from the strategy's own claim, and an intent claiming the
+estimated basis without declaring confidence is refused. That is the anti-rot guard doing real work.
+
+Red-green proved BOTH ways, which is the standard this kit converged on: reverting the five
+behavioural modules gave 9 failures all on VALUES (`0.08 == 0.022`, `KeyError: 'edge'`,
+`DID NOT RAISE`) -- deliberately keeping `base.py`'s new constants importable, since an ImportError
+would prove nothing about an assertion. Then a targeted mutation putting ONLY the `+0.25` back on the
+finished code failed **exactly one** test, on `resolution_risk` (0.5275 vs 0.2775). A broad revert
+shows the tests are load-bearing; a single-line mutation shows they are precise.
+
+Two follow-ups recorded by the implementer: `edge_basis` is persisted but not a first-class
+`OpportunityOut` column (that route was outside its file set), and `favorite_compounder` /
+`no_bias_exploit` publish an `"edge"` that is a DIRECTIONAL mispricing -- unscored today, but it would
+mean the wrong thing under this contract if either ever joins a scanner pass.
+
+agent: T31 id=a549f9a8a67cfdf61 role=implementer model=opus
+outcome: T31 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5

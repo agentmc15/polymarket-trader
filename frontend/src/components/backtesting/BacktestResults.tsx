@@ -11,15 +11,26 @@ import {
 import { cn } from '../../utils/cn';
 import { formatCurrency, formatPercent, formatNumber, formatDateTime } from '../../utils/format';
 import { DepthSourceBadge, FillAtBadge } from './DepthBadges';
-import type { BacktestMetrics, BacktestReport, EquityPoint, BacktestStatus } from '../../types';
+import type {
+  BacktestReport,
+  EquityPoint,
+  BacktestStatus,
+  TradeMetrics,
+  RiskMetrics,
+} from '../../types';
 
 interface BacktestResultsProps {
   status: BacktestStatus;
   progress: number;
-  metrics?: BacktestMetrics;
+  //: `null`/`undefined` until the run reaches `COMPLETED`
+  //: (`BacktestStatusResponse`, backend/app/api/routes/backtesting.py).
+  totalReturn?: number | null;
+  totalReturnPct?: number | null;
+  tradeMetrics?: TradeMetrics | null;
+  riskMetrics?: RiskMetrics | null;
   equityCurve: EquityPoint[];
   initialCapital: number;
-  finalCapital?: number;
+  finalValue?: number | null;
   errorMessage?: string;
   strategyName?: string;
   //: GUARDRAILS.md §1.7: `depth_source`/`fill_at` are written into
@@ -32,14 +43,19 @@ interface BacktestResultsProps {
 export function BacktestResults({
   status,
   progress,
-  metrics,
+  totalReturn,
+  totalReturnPct,
+  tradeMetrics,
+  riskMetrics,
   equityCurve,
   initialCapital,
-  finalCapital,
+  finalValue,
   errorMessage,
   strategyName,
   report,
 }: BacktestResultsProps) {
+  const isSweep = strategyName?.startsWith('sweep:') ?? false;
+
   // Loading/Pending state
   if (status === 'PENDING' || status === 'RUNNING') {
     return (
@@ -65,10 +81,22 @@ export function BacktestResults({
           </div>
           <div className="text-center">
             <p className="text-lg font-medium">
-              {status === 'PENDING' ? 'Initializing backtest...' : 'Running backtest...'}
+              {isSweep
+                ? status === 'PENDING'
+                  ? 'Sweep queued...'
+                  : 'Running capital sweep...'
+                : status === 'PENDING'
+                  ? 'Initializing backtest...'
+                  : 'Running backtest...'}
             </p>
             {strategyName && (
               <p className="text-sm text-muted-foreground">Strategy: {strategyName}</p>
+            )}
+            {isSweep && (
+              <p className="mt-1 text-sm text-muted-foreground">
+                This runs one full backtest per capital level. The per-level breakdown
+                appears below once every level has completed.
+              </p>
             )}
           </div>
           <div className="w-64">
@@ -116,14 +144,19 @@ export function BacktestResults({
     );
   }
 
-  // Completed state - show results
-  if (!metrics) {
+  // Completed state - show results. `trade_metrics`/`risk_metrics` are
+  // populated together by `get_backtest_status` once `status ===
+  // "COMPLETED"` — see `BacktestStatusResponse` in
+  // backend/app/api/routes/backtesting.py.
+  if (!tradeMetrics || !riskMetrics) {
     return (
       <div className="rounded-lg border border-border bg-card p-8 text-center">
         <p className="text-muted-foreground">No results available</p>
       </div>
     );
   }
+
+  const netGainLoss = finalValue != null ? finalValue - initialCapital : null;
 
   return (
     <div className="space-y-6">
@@ -159,33 +192,37 @@ export function BacktestResults({
         </div>
       )}
 
-      {/* Key Metrics Cards */}
+      {/* Key Metrics Cards. Only fields `GET /backtests/{id}` actually
+          populates today (`total_return`/`total_return_pct` top-level,
+          `risk_metrics.sharpe_ratio`/`max_drawdown`,
+          `trade_metrics.win_rate`/`total_trades`) — see `TradeMetrics`/
+          `RiskMetrics`'s doc comments in types/index.ts for why the
+          rest of those pydantic models isn't rendered as if it were a
+          measured number. */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <MetricCard
           label="Total Return"
-          value={formatPercent(metrics.total_return_pct)}
-          subValue={formatCurrency(metrics.total_return)}
-          isPositive={metrics.total_return > 0}
-          isNegative={metrics.total_return < 0}
+          value={totalReturnPct != null ? formatPercent(totalReturnPct) : '-'}
+          subValue={netGainLoss != null ? formatCurrency(netGainLoss) : undefined}
+          isPositive={(totalReturn ?? 0) > 0}
+          isNegative={(totalReturn ?? 0) < 0}
         />
         <MetricCard
           label="Sharpe Ratio"
-          value={formatNumber(metrics.sharpe_ratio, 2)}
-          subValue={`Sortino: ${formatNumber(metrics.sortino_ratio, 2)}`}
-          isPositive={metrics.sharpe_ratio > 1}
-          isNegative={metrics.sharpe_ratio < 0}
+          value={formatNumber(riskMetrics.sharpe_ratio, 2)}
+          isPositive={riskMetrics.sharpe_ratio > 1}
+          isNegative={riskMetrics.sharpe_ratio < 0}
         />
         <MetricCard
           label="Max Drawdown"
-          value={formatPercent(metrics.max_drawdown_pct)}
-          subValue={formatCurrency(metrics.max_drawdown)}
-          isNegative={true}
+          value={formatPercent(riskMetrics.max_drawdown * 100)}
+          isNegative={riskMetrics.max_drawdown > 0}
         />
         <MetricCard
           label="Win Rate"
-          value={formatPercent(metrics.win_rate_pct)}
-          subValue={`${metrics.winning_trades}/${metrics.total_trades} trades`}
-          isPositive={metrics.win_rate_pct > 50}
+          value={formatPercent(tradeMetrics.win_rate * 100)}
+          subValue={`${tradeMetrics.total_trades} trades`}
+          isPositive={tradeMetrics.win_rate > 0.5}
         />
       </div>
 
@@ -259,36 +296,28 @@ export function BacktestResults({
         </div>
       </div>
 
-      {/* Additional Metrics Grid */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+      {/* Additional Metrics Grid — every value below is a field
+          `GET /backtests/{id}` actually returns (`TradeMetrics`/
+          `RiskMetrics`), not a value this component invents. */}
+      <div className="grid gap-4 md:grid-cols-2">
         <MetricsGroup
           title="Returns"
           metrics={[
-            { label: 'Final Capital', value: formatCurrency(finalCapital ?? 0) },
-            { label: 'Annualized Return', value: formatPercent(metrics.annualized_return_pct) },
-            { label: 'Best Trade', value: formatCurrency(metrics.best_trade) },
-            { label: 'Worst Trade', value: formatCurrency(metrics.worst_trade) },
-            { label: 'Avg Trade', value: formatCurrency(metrics.avg_trade) },
-          ]}
-        />
-        <MetricsGroup
-          title="Risk"
-          metrics={[
-            { label: 'Volatility', value: formatPercent(metrics.volatility_pct) },
-            { label: 'VaR (95%)', value: formatCurrency(metrics.var_95) },
-            { label: 'CVaR (95%)', value: formatCurrency(metrics.cvar_95) },
-            { label: 'Calmar Ratio', value: formatNumber(metrics.calmar_ratio, 2) },
-            { label: 'Ulcer Index', value: formatNumber(metrics.ulcer_index, 2) },
+            { label: 'Initial Capital', value: formatCurrency(initialCapital) },
+            { label: 'Final Value', value: finalValue != null ? formatCurrency(finalValue) : '-' },
+            {
+              label: 'Net Gain/Loss',
+              value: netGainLoss != null ? formatCurrency(netGainLoss) : '-',
+            },
           ]}
         />
         <MetricsGroup
           title="Trading"
           metrics={[
-            { label: 'Total Trades', value: metrics.total_trades.toString() },
-            { label: 'Profit Factor', value: formatNumber(metrics.profit_factor, 2) },
-            { label: 'Avg Win', value: formatCurrency(metrics.avg_win) },
-            { label: 'Avg Loss', value: formatCurrency(metrics.avg_loss) },
-            { label: 'Expectancy', value: formatCurrency(metrics.expectancy) },
+            { label: 'Total Trades', value: tradeMetrics.total_trades.toString() },
+            { label: 'Win Rate', value: formatPercent(tradeMetrics.win_rate * 100) },
+            { label: 'Sharpe Ratio', value: formatNumber(riskMetrics.sharpe_ratio, 2) },
+            { label: 'Max Drawdown', value: formatPercent(riskMetrics.max_drawdown * 100) },
           ]}
         />
       </div>

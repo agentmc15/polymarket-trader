@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { cn } from '../../utils/cn';
 import { formatCurrency, formatPercent, formatDateTime } from '../../utils/format';
 import type { BacktestTrade } from '../../types';
@@ -8,7 +8,11 @@ interface TradeListProps {
   isLoading?: boolean;
 }
 
-type SortField = 'entry_time' | 'exit_time' | 'side' | 'entry_price' | 'size' | 'pnl' | 'pnl_pct';
+// `BacktestTrade` (`TradeRecord` on the wire) is one FILL, not a closed
+// round-trip position — there is no entry/exit pairing on the wire (see
+// that type's doc comment in types/index.ts), so sorting/filtering here
+// is over a flat fill list rather than a position list.
+type SortField = 'timestamp' | 'side' | 'price' | 'size' | 'pnl';
 type SortDirection = 'asc' | 'desc';
 type SideFilter = 'all' | 'BUY' | 'SELL';
 type PnLFilter = 'all' | 'winners' | 'losers';
@@ -33,7 +37,7 @@ function SortIcon({ field, sortField, sortDirection }: SortIconProps) {
 }
 
 export function TradeList({ trades, isLoading }: TradeListProps) {
-  const [sortField, setSortField] = useState<SortField>('entry_time');
+  const [sortField, setSortField] = useState<SortField>('timestamp');
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [sideFilter, setSideFilter] = useState<SideFilter>('all');
   const [pnlFilter, setPnlFilter] = useState<PnLFilter>('all');
@@ -69,27 +73,20 @@ export function TradeList({ trades, isLoading }: TradeListProps) {
     result.sort((a, b) => {
       let comparison = 0;
       switch (sortField) {
-        case 'entry_time':
-          comparison = new Date(a.entry_time).getTime() - new Date(b.entry_time).getTime();
-          break;
-        case 'exit_time':
-          comparison =
-            new Date(a.exit_time ?? 0).getTime() - new Date(b.exit_time ?? 0).getTime();
+        case 'timestamp':
+          comparison = new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
           break;
         case 'side':
           comparison = a.side.localeCompare(b.side);
           break;
-        case 'entry_price':
-          comparison = a.entry_price - b.entry_price;
+        case 'price':
+          comparison = a.price - b.price;
           break;
         case 'size':
           comparison = a.size - b.size;
           break;
         case 'pnl':
           comparison = (a.pnl ?? 0) - (b.pnl ?? 0);
-          break;
-        case 'pnl_pct':
-          comparison = (a.pnl_pct ?? 0) - (b.pnl_pct ?? 0);
           break;
       }
       return sortDirection === 'asc' ? comparison : -comparison;
@@ -187,10 +184,10 @@ export function TradeList({ trades, isLoading }: TradeListProps) {
             <tr>
               <th
                 className="cursor-pointer px-4 py-3 text-left text-sm font-medium"
-                onClick={() => handleSort('entry_time')}
+                onClick={() => handleSort('timestamp')}
               >
-                Entry Time
-                <SortIcon field="entry_time" sortField={sortField} sortDirection={sortDirection} />
+                Time
+                <SortIcon field="timestamp" sortField={sortField} sortDirection={sortDirection} />
               </th>
               <th className="px-4 py-3 text-left text-sm font-medium">Market</th>
               <th
@@ -202,10 +199,10 @@ export function TradeList({ trades, isLoading }: TradeListProps) {
               </th>
               <th
                 className="cursor-pointer px-4 py-3 text-right text-sm font-medium"
-                onClick={() => handleSort('entry_price')}
+                onClick={() => handleSort('price')}
               >
                 Price
-                <SortIcon field="entry_price" sortField={sortField} sortDirection={sortDirection} />
+                <SortIcon field="price" sortField={sortField} sortDirection={sortDirection} />
               </th>
               <th
                 className="cursor-pointer px-4 py-3 text-right text-sm font-medium"
@@ -214,6 +211,7 @@ export function TradeList({ trades, isLoading }: TradeListProps) {
                 Size
                 <SortIcon field="size" sortField={sortField} sortDirection={sortDirection} />
               </th>
+              <th className="px-4 py-3 text-right text-sm font-medium">Fee</th>
               <th
                 className="cursor-pointer px-4 py-3 text-right text-sm font-medium"
                 onClick={() => handleSort('pnl')}
@@ -221,18 +219,12 @@ export function TradeList({ trades, isLoading }: TradeListProps) {
                 P&L
                 <SortIcon field="pnl" sortField={sortField} sortDirection={sortDirection} />
               </th>
-              <th
-                className="cursor-pointer px-4 py-3 text-right text-sm font-medium"
-                onClick={() => handleSort('pnl_pct')}
-              >
-                P&L %
-                <SortIcon field="pnl_pct" sortField={sortField} sortDirection={sortDirection} />
-              </th>
+              <th className="px-4 py-3 text-right text-sm font-medium">Confidence</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
-            {filteredTrades.map((trade) => (
-              <TradeRow key={trade.id} trade={trade} />
+            {filteredTrades.map((trade, index) => (
+              <TradeRow key={`${trade.timestamp}-${trade.market_id}-${trade.outcome}-${index}`} trade={trade} />
             ))}
           </tbody>
         </table>
@@ -246,108 +238,53 @@ interface TradeRowProps {
 }
 
 function TradeRow({ trade }: TradeRowProps) {
-  const [isExpanded, setIsExpanded] = useState(false);
   const pnl = trade.pnl ?? 0;
-  const pnlPct = trade.pnl_pct ?? 0;
 
   return (
-    <>
-      <tr
-        className="cursor-pointer hover:bg-muted/30"
-        onClick={() => setIsExpanded(!isExpanded)}
+    <tr className="hover:bg-muted/30">
+      <td className="px-4 py-3 text-sm">
+        {formatDateTime(trade.timestamp)}
+      </td>
+      <td className="max-w-[200px] truncate px-4 py-3 text-sm">
+        <span className="font-medium">{trade.outcome}</span>
+        <span className="ml-2 text-xs text-muted-foreground">
+          {trade.market_id.slice(0, 8)}...
+        </span>
+      </td>
+      <td className="px-4 py-3 text-sm">
+        <span
+          className={cn(
+            'rounded px-2 py-0.5 text-xs font-medium',
+            trade.side === 'BUY'
+              ? 'bg-success/20 text-success'
+              : 'bg-destructive/20 text-destructive'
+          )}
+        >
+          {trade.side}
+        </span>
+      </td>
+      <td className="px-4 py-3 text-right text-sm font-mono">
+        {formatCurrency(trade.price, 4)}
+      </td>
+      <td className="px-4 py-3 text-right text-sm font-mono">
+        {formatCurrency(trade.size)}
+      </td>
+      <td className="px-4 py-3 text-right text-sm font-mono text-muted-foreground">
+        {formatCurrency(trade.fee)}
+      </td>
+      <td
+        className={cn(
+          'px-4 py-3 text-right text-sm font-mono font-medium',
+          pnl > 0 && 'text-success',
+          pnl < 0 && 'text-destructive'
+        )}
       >
-        <td className="px-4 py-3 text-sm">
-          {formatDateTime(trade.entry_time)}
-        </td>
-        <td className="max-w-[200px] truncate px-4 py-3 text-sm">
-          <span className="font-medium">{trade.outcome}</span>
-          <span className="ml-2 text-xs text-muted-foreground">
-            {trade.market_id.slice(0, 8)}...
-          </span>
-        </td>
-        <td className="px-4 py-3 text-sm">
-          <span
-            className={cn(
-              'rounded px-2 py-0.5 text-xs font-medium',
-              trade.side === 'BUY'
-                ? 'bg-success/20 text-success'
-                : 'bg-destructive/20 text-destructive'
-            )}
-          >
-            {trade.side}
-          </span>
-        </td>
-        <td className="px-4 py-3 text-right text-sm font-mono">
-          {formatCurrency(trade.entry_price, 4)}
-          {trade.exit_price && (
-            <span className="text-muted-foreground">
-              {' \u2192 '}{formatCurrency(trade.exit_price, 4)}
-            </span>
-          )}
-        </td>
-        <td className="px-4 py-3 text-right text-sm font-mono">
-          {formatCurrency(trade.size)}
-        </td>
-        <td
-          className={cn(
-            'px-4 py-3 text-right text-sm font-mono font-medium',
-            pnl > 0 && 'text-success',
-            pnl < 0 && 'text-destructive'
-          )}
-        >
-          {pnl >= 0 ? '+' : ''}{formatCurrency(pnl)}
-        </td>
-        <td
-          className={cn(
-            'px-4 py-3 text-right text-sm font-mono',
-            pnlPct > 0 && 'text-success',
-            pnlPct < 0 && 'text-destructive'
-          )}
-        >
-          {pnlPct >= 0 ? '+' : ''}{formatPercent(pnlPct)}
-        </td>
-      </tr>
-      {isExpanded && (
-        <tr className="bg-muted/20">
-          <td colSpan={7} className="px-4 py-3">
-            <div className="grid grid-cols-2 gap-4 text-sm md:grid-cols-4">
-              <div>
-                <span className="text-muted-foreground">Exit Time:</span>
-                <span className="ml-2">
-                  {trade.exit_time ? formatDateTime(trade.exit_time) : 'Open'}
-                </span>
-              </div>
-              <div>
-                <span className="text-muted-foreground">Token ID:</span>
-                <span className="ml-2 font-mono text-xs">{trade.token_id}</span>
-              </div>
-              <div>
-                <span className="text-muted-foreground">Fee:</span>
-                <span className="ml-2">{formatCurrency(trade.fee)}</span>
-              </div>
-              {trade.slippage !== undefined && (
-                <div>
-                  <span className="text-muted-foreground">Slippage:</span>
-                  <span className="ml-2">{formatCurrency(trade.slippage)}</span>
-                </div>
-              )}
-              {trade.signal_type && (
-                <div>
-                  <span className="text-muted-foreground">Signal:</span>
-                  <span className="ml-2">{trade.signal_type}</span>
-                </div>
-              )}
-              {trade.confidence !== undefined && (
-                <div>
-                  <span className="text-muted-foreground">Confidence:</span>
-                  <span className="ml-2">{formatPercent(trade.confidence * 100)}</span>
-                </div>
-              )}
-            </div>
-          </td>
-        </tr>
-      )}
-    </>
+        {trade.pnl !== null ? `${pnl >= 0 ? '+' : ''}${formatCurrency(pnl)}` : '-'}
+      </td>
+      <td className="px-4 py-3 text-right text-sm font-mono">
+        {formatPercent(trade.signal_confidence * 100)}
+      </td>
+    </tr>
   );
 }
 

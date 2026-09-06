@@ -1,44 +1,148 @@
-"""Opportunity scoring (PLAN.md D10, T19).
+"""Opportunity scoring (PLAN.md D10, T19; rebased on one edge basis in T31).
 
 `score(intent, ctx)` is the ONE place every strategy's output is reduced
 to a single, comparable `composite` ranking number, regardless of which
-strategy produced it or which venue(s) it touches. It is deliberately
-generic over `Intent.kind`: `binary_complement_arbitrage` stamps its
-per-contract edge under `metadata["edge"]`,
-`cross_venue_arbitrage` (T18) under `metadata["net_edge"]`, and a plain
-`Signal.to_intent()` stamps neither — `score()` reads whichever key a
-strategy actually published and falls back to `0.0` (no measurable
-riskless edge) rather than inventing one a strategy never computed.
+strategy produced it or which venue(s) it touches.
 
-THE FORMULA (PLAN.md D10, verbatim)::
+THE INVARIANT THIS MODULE OWES ITS CALLERS
+------------------------------------------
+    Two intents with the same `composite` represent the same expected
+    risk-adjusted return PER DOLLAR OF CAPITAL LOCKED UP, whichever
+    strategy produced them.
 
-    annualized_return = net_edge / max(hours_to_resolution, min_hours) * 8760
-    fill_confidence    = min over legs of (contracts fillable within
-                          max_slippage_bps of the leg's limit) / requested
-    resolution_risk    = 0.15 base
-                         + 0.25 if any leg's market has rules_text < 200 chars
-                         + 0.20 if any leg's market has resolution_source is None
-                         + 0.25 if kind == "cross_venue" and confidence < 0.95
-                         + 0.15 if hours_to_resolution < 6  (dispute window)
-                         , capped at 1.0
-    composite          = annualized_return * fill_confidence * (1 - resolution_risk)
+`GET /api/v1/arbitrage/opportunities` sorts one list by `composite` and a
+human reads that order as a ranking. So the number has to mean one thing.
+Three separate things had to be fixed for it to (see "WHAT REMAINS
+INCOMPARABLE" for the honest limits of the claim):
 
-WHY THE CROSS-VENUE TERM IS THE MOST CONSEQUENTIAL NUMBER HERE — MEASURED,
-NOT A FUDGE FACTOR. Same-venue complement arbitrage needs roughly a 2.5%
-gross edge to clear Polymarket's taker fee at mid-range prices; cross-venue
-is far harder because BOTH legs must actually settle on the same fact.
-Measured against this repo's own fee models and PLAN.md D8's arithmetic,
-the gross edge required to make a cross-venue pair worth trading AT ALL
-is approximately 1.50% at link confidence 1.00, 2.55% at 0.98, 4.21% at
-0.95, 7.22% at 0.90, and 14.37% at 0.80 — because a resolution mismatch
-does not cost the gross edge, it costs the LOSING LEG'S ENTIRE STAKE
-(`app.strategies.cross_venue_arbitrage`'s worked example: Polymarket YES
-0.46 + Kalshi NO 0.50 nets +1.05% gross, +1.05%*p at p=1.00, but -1.5% at
-p=0.95 and -9.2% at p=0.80 once the haircut is applied). `0.95` is where
-that asymmetry turns sharply negative for realistic gross edges, which is
-why `resolution_risk` adds a flat 0.25 there rather than scaling smoothly
-with confidence — below 0.95 the trade is usually negative-EV outright,
-not merely "riskier".
+1. ONE EDGE BASIS. Strategies publish a PRE-RISK edge and this module
+   applies every haircut — `app.strategies.base`'s scoring contract
+   (`SCORING_EDGE_KEY`, `IDENTITY_CONFIDENCE_KEY`,
+   `IDENTITY_WORST_CASE_LOSS_KEY`). Before T31, `cross_venue_arbitrage`
+   published a number already multiplied by its link confidence while
+   the three single-market strategies published one that was not, and
+   `composite` ranked all four against each other anyway —
+   `multi_outcome_bundle_arbitrage`'s own comment said "do not compare
+   this value to `cross_venue_arbitrage`'s `net_edge`", and `composite`
+   was the sole consumer doing exactly that.
+
+   THE ALTERNATIVE WAS CONSIDERED AND REJECTED: leaving strategies to
+   publish POST-risk edges and teaching the scorer which risks each one
+   had already priced in. That is a smaller diff, but it makes the
+   scorer carry a per-strategy table of "net of what?", which is
+   precisely the coupling that produced the bug — and it fails silently
+   the day a fifth strategy is added, because a new strategy publishing
+   an unhaircut edge would be scored as if it were haircut (or the
+   reverse) with nothing in the code to notice. Under the pre-risk rule
+   a new strategy that says nothing about identity risk is scored as
+   having none, which is both the common case and the safe reading:
+   nothing is silently double-discounted, and a strategy that DOES carry
+   the risk has to say so in the payload to have it priced.
+
+2. IDENTITY RISK IS PRICED EXACTLY ONCE, HERE. `_risk_adjusted_edge`
+   applies `edge * p - (1 - p) * worst_case_loss` — the same formula
+   `cross_venue_arbitrage` used to apply internally — to any intent that
+   declares `p_same_resolution`, and to no other. `resolution_risk`
+   correspondingly no longer carries the old `+0.25 if kind ==
+   "cross_venue" and confidence < 0.95` term: that term was the SECOND
+   discount, applied to an edge that had already been haircut, so a
+   cross-venue opportunity paid for its identity risk twice while every
+   single-market strategy paid for it neither time. It was not removed
+   in favour of nothing — it was removed because the risk it stood for
+   is now priced upstream of it, in dollars, at the intent's own
+   confidence rather than at a step at 0.95. Its economic content
+   survives: that term existed because below ~0.95 confidence a
+   cross-venue pair is usually negative-EV outright rather than merely
+   riskier, and `edge * p - (1 - p) * worst_case_loss` reproduces that
+   directly — a pair that cannot cover its own haircut now scores a
+   NEGATIVE `net_edge`, a negative `composite`, and sorts below every
+   viable trade instead of being nudged down a rank.
+   `CrossVenueArbitrageStrategy`'s `min_net_edge` gate still refuses to
+   emit such a pair at all; scoring no longer needs a proxy for a gate
+   that already exists.
+
+3. ONE DENOMINATOR. `annualized_return` is a RETURN — expected profit
+   divided by the capital actually committed — not the per-contract
+   dollar edge PLAN.md D10 wrote as `net_edge / hours * 8760`. That
+   formula never divided by capital at all, which `app.services.scanner`
+   already documented as "an adequate approximation for
+   binary_complement_arbitrage/cross_venue_arbitrage ... but NOT here"
+   for the near-resolution pass, and worked around by substituting
+   `settlement_edge`'s own capital-normalized figure. Both passes'
+   rows land in ONE list sorted by `composite`, so before T31 that sort
+   compared USD-per-contract-per-year against a dimensionless
+   return-per-year. Normalizing here makes the general pass produce the
+   same unit the near-resolution pass was already producing, and makes
+   the invariant above literally true rather than true-when-every-leg-
+   happens-to-cost-about-a-dollar.
+
+THE FORMULA::
+
+    units             = max over legs of contracts requested
+                        (all four arbitrage strategies size equal
+                         contracts on every leg, so this is the number
+                         of complete "units" bought)
+    edge              = strategy-published PRE-risk edge, USD per unit
+    net_edge          = edge * p - (1 - p) * worst_case_loss
+                        (p = 1.0, i.e. net_edge == edge, for any intent
+                         that declares no identity risk)
+    annualized_return = (net_edge * units / capital_lockup_usd)
+                        / max(hours_to_resolution, min_hours) * 8760
+    fill_confidence   = min over legs of (contracts fillable within
+                        max_slippage_bps of the leg's limit) / requested
+    resolution_risk   = 1 - (1 - 0.15) ** (number of DISTINCT markets)
+                        + 0.25 if any leg's market has rules_text < 200 chars
+                        + 0.20 if any leg's market has resolution_source is None
+                        + 0.15 if hours_to_resolution < 6  (dispute window)
+                        , capped at 1.0
+    composite         = annualized_return * fill_confidence * (1 - resolution_risk)
+
+WHY THE BASE RISK COMPOUNDS OVER DISTINCT MARKETS. `_RESOLUTION_RISK_BASE`
+is the chance a venue mis-adjudicates, delays, or disputes a resolution.
+A complement or a bundle is exposed to that once — every leg redeems off
+ONE question on ONE venue. A cross-venue pair is exposed to it twice, on
+two venues that adjudicate independently, and `1 - (1 - 0.15)**2 =
+0.2775` is that exposure, not a penalty chosen to keep cross-venue in its
+place. It is also the only term that still distinguishes a cross-venue
+intent from a same-venue one, and the distinction it draws is small and
+derived: at equal capital and equal time, a cross-venue pair must earn
+`1 / 0.85 = 1.176x` the edge of a same-venue pair to rank equally —
+exactly the price of the second venue's settlement risk, and nothing
+more. Treating the two venues' adjudication errors as independent
+OVERSTATES the risk (both venues read the same news), so this is the
+conservative end of the range.
+
+WHAT REMAINS INCOMPARABLE, AND WHY IT IS LABELLED RATHER THAN HIDDEN.
+`composite` is an honest ranking of expected risk-adjusted return per
+dollar, but two residues do not reduce to one number:
+
+  a. `p_same_resolution` IS AN ESTIMATE, and the fee/gas terms are not.
+     A cross-venue intent's `net_edge` is `edge * p - (1 - p) * L` where
+     `p` is `app.services.matching`'s link confidence — a deterministic
+     similarity score in `[0, 1]`, not a measured or calibrated
+     probability. Every other term in every strategy's edge is an
+     observed price or a published rate. So a cross-venue row and a
+     complement row with the same `composite` have the same expected
+     return only to the extent that score is calibrated, and the
+     cross-venue one additionally carries model risk the complement does
+     not. `OpportunityScore.edge_basis` says which of the two a row is
+     (`"observed_costs"` / `"identity_estimated"`), and the originating
+     strategy stamps the same label in `Intent.metadata[EDGE_BASIS_KEY]`
+     so it reaches `/opportunities`' payload, not just the persisted
+     score. Sorting by one column is fine; trusting a cross-venue row
+     over a same-venue row on a 3% `composite` difference is not, and
+     the label is there so an operator can see that without reading this
+     module.
+  b. THE TWO SCANNER PASSES FLOOR TIME DIFFERENTLY. This module floors
+     at `settings.min_hours_for_annualization` (6h);
+     `app.services.scanner.near_resolution_pass` substitutes
+     `settlement_edge`'s own figure, floored at
+     `settings.settlement_delay_hours` (24h), because a near-resolution
+     trade's capital is locked until the venue actually settles, not
+     until `close_time`. Both are returns per dollar per year — the unit
+     matches — but a near-resolution row's annualization is floored
+     harder, i.e. deliberately conservative relative to a general-pass
+     row of the same true duration.
 
 DEPTH_SOURCE AND LINK_STATUS RIDE THROUGH TO THE PAYLOAD (GUARDRAILS.md
 §1.7, PLAN.md D9). `OpportunityScore.depth_source` is `"recorded"` only
@@ -91,7 +195,17 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from app.config import Settings
-from app.strategies.base import Intent, Leg
+from app.strategies.base import (
+    EDGE_BASIS_IDENTITY_ESTIMATED,
+    EDGE_BASIS_KEY,
+    EDGE_BASIS_OBSERVED,
+    IDENTITY_CONFIDENCE_KEY,
+    IDENTITY_WORST_CASE_LOSS_KEY,
+    SCORING_EDGE_KEY,
+    SCORING_EDGE_LEGACY_KEY,
+    Intent,
+    Leg,
+)
 from app.venues.types import OrderBook, VenueMarket, WalkSide
 
 #: Hours in a 365-day year — the same annualization constant
@@ -100,10 +214,14 @@ from app.venues.types import OrderBook, VenueMarket, WalkSide
 #: imported (scoring must not depend on any one strategy module).
 HOURS_PER_YEAR = 8760.0
 
-#: `resolution_risk`'s unconditional floor (PLAN.md D10) — every
-#: hold-to-resolution intent carries SOME settlement risk (a venue can
-#: mis-adjudicate, delay, or dispute a resolution) even with perfect
-#: documentation and a certain link.
+#: `resolution_risk`'s unconditional floor (PLAN.md D10), PER DISTINCT
+#: MARKET — the chance ONE venue mis-adjudicates, delays, or disputes ONE
+#: question, even with perfect documentation and a certain link. An
+#: intent spanning N distinct markets is exposed N times over, so the
+#: base term is `1 - (1 - 0.15)**N` (see the module docstring's "WHY THE
+#: BASE RISK COMPOUNDS OVER DISTINCT MARKETS"). N is 1 for a complement,
+#: a bundle and a single-leg intent — every leg redeems off one question
+#: — and 2 for a cross-venue pair.
 _RESOLUTION_RISK_BASE = 0.15
 
 #: Below this many characters, a market's `rules_text` is too thin to
@@ -114,10 +232,12 @@ _RULES_TEXT_PENALTY = 0.25
 #: No named resolution authority at all.
 _NO_RESOLUTION_SOURCE_PENALTY = 0.20
 
-#: See the module docstring's "WHY THE CROSS-VENUE TERM..." section —
-#: this is a measured breakpoint, not a round number chosen for looks.
-_CROSS_VENUE_CONFIDENCE_FLOOR = 0.95
-_CROSS_VENUE_PENALTY = 0.25
+#: T31 removed `_CROSS_VENUE_CONFIDENCE_FLOOR = 0.95` /
+#: `_CROSS_VENUE_PENALTY = 0.25` from `_resolution_risk`. They were the
+#: SECOND discount on a `net_edge` that `cross_venue_arbitrage` had
+#: already haircut by the same link confidence; identity risk is now
+#: priced once, in dollars, by `_risk_adjusted_edge`. See the module
+#: docstring's point 2 — this is not a relaxation, it is a relocation.
 
 #: PLAN.md D10's dispute-window proxy: inside 6 hours of resolution,
 #: Polymarket's proposed-but-challengeable window and Kalshi's
@@ -197,15 +317,23 @@ class OpportunityScore:
     contract, not an internal detail reshaped later.
 
     Attributes:
-        net_edge: Per-contract riskless edge, USD, already net of fees,
-            gas, and (for a cross-venue intent) the resolution-mismatch
-            haircut — whatever the ORIGINATING STRATEGY computed and
-            published in `Intent.metadata` (`"net_edge"` or `"edge"`);
-            `0.0` if the strategy published neither (a non-arbitrage
-            intent has no riskless edge for this field to report).
-        annualized_return: `net_edge` expressed as a fraction of capital
-            per year, floored per `settings.min_hours_for_annualization`
-            — see the module docstring's "THE ANNUALIZATION FLOOR".
+        net_edge: Per-UNIT edge, USD, net of fees, gas AND — for an
+            intent that declared identity risk — the resolution-mismatch
+            haircut this module applied (`edge * p - (1 - p) *
+            worst_case_loss`). The strategy publishes the PRE-risk half
+            (`Intent.metadata[SCORING_EDGE_KEY]`) and this module applies
+            the haircut, so "net of what?" has one answer for every
+            strategy. `0.0` if the strategy published no edge at all (a
+            non-arbitrage intent has no riskless edge for this field to
+            report). A "unit" is one contract of every leg.
+        annualized_return: `net_edge` expressed as a fraction of the
+            capital actually committed, per year: `net_edge * units /
+            capital_lockup_usd / max(hours, min_hours) * 8760`, floored
+            per `settings.min_hours_for_annualization` — see the module
+            docstring's "THE ANNUALIZATION FLOOR" and its point 3 on why
+            this divides by capital where PLAN.md D10's literal formula
+            did not. `0.0` when the intent commits no capital at all
+            (nothing to earn a return ON).
         hours_to_resolution: UNFLOORED hours from `ScoreContext.now` to
             `Intent.expected_resolution_ts`. Always positive — an
             already-past resolution time raises `UnscorableIntent`
@@ -233,6 +361,17 @@ class OpportunityScore:
             aggregate `OrderBook.depth_source` across every leg this
             context could find a book for; `"synthetic"` (the
             conservative default) if none could be found at all.
+        edge_basis: `"observed_costs"` when every term of `net_edge` is
+            an observed price or a published fee/gas rate, or
+            `"identity_estimated"` when it also contains a haircut driven
+            by an ESTIMATED probability (`p_same_resolution`). This is
+            the residue `composite` cannot express — see the module
+            docstring's "WHAT REMAINS INCOMPARABLE" (a). Derived from
+            whether the intent DECLARED an identity confidence, not
+            copied from the strategy's own `EDGE_BASIS_KEY` claim, so an
+            intent cannot label its way out of the caveat (and one that
+            claims the caveat while declaring no confidence for scoring
+            to price is refused outright — `_risk_adjusted_edge`).
     """
 
     net_edge: float
@@ -244,6 +383,7 @@ class OpportunityScore:
     composite: float
     link_status: str | None
     depth_source: str
+    edge_basis: str
 
 
 def score(
@@ -285,17 +425,22 @@ def score(
     Raises:
         UnscorableIntent: If `intent.expected_resolution_ts` is `None`,
             if any leg's `(venue, market_id)` is not in `ctx.markets`, if
-            any leg's market is already `"resolved"`, or (unless
-            `allow_past_close`) if any leg's market is past its
-            `close_time`.
+            any leg's market is already `"resolved"`, if (unless
+            `allow_past_close`) any leg's market is past its
+            `close_time`, or if any scoring-contract metadata value the
+            intent DID publish is unreadable as a number or out of range
+            (see `_published_edge`/`_risk_adjusted_edge`).
     """
     leg_markets = _leg_markets(intent, ctx, allow_past_close=allow_past_close)
     hours_to_resolution = _hours_to_resolution(intent, ctx.now)
-    net_edge = _net_edge(intent)
-    annualized_return = _annualized_return(net_edge, hours_to_resolution, ctx.settings)
-    fill_confidence = _fill_confidence(intent, ctx)
-    resolution_risk = _resolution_risk(intent, leg_markets, hours_to_resolution)
+    published_edge = _published_edge(intent)
+    net_edge, declares_identity_risk = _risk_adjusted_edge(intent, published_edge)
     capital_lockup_usd = _capital_lockup_usd(intent)
+    annualized_return = _annualized_return(
+        net_edge, _units(intent), capital_lockup_usd, hours_to_resolution, ctx.settings
+    )
+    fill_confidence = _fill_confidence(intent, ctx)
+    resolution_risk = _resolution_risk(leg_markets, hours_to_resolution)
     composite = annualized_return * fill_confidence * (1.0 - resolution_risk)
     depth_source = _depth_source(intent, ctx)
 
@@ -312,6 +457,11 @@ def score(
         composite=composite,
         link_status=link_status,
         depth_source=depth_source,
+        edge_basis=(
+            EDGE_BASIS_IDENTITY_ESTIMATED
+            if declares_identity_risk
+            else EDGE_BASIS_OBSERVED
+        ),
     )
 
 
@@ -388,34 +538,177 @@ def _hours_to_resolution(intent: Intent, now: datetime) -> float:
     return (intent.expected_resolution_ts - now).total_seconds() / 3600.0
 
 
-def _net_edge(intent: Intent) -> float:
-    """Return the strategy-published per-contract net edge, or `0.0`.
+def _metadata_float(intent: Intent, key: str) -> float:
+    """Return `intent.metadata[key]` as a float, or refuse to score.
 
-    Reads whichever key the ORIGINATING strategy actually published —
-    `"net_edge"` (`app.strategies.cross_venue_arbitrage`, already net of
-    the resolution-mismatch haircut) takes priority over `"edge"`
-    (`app.strategies.binary_complement_arbitrage`). Scoring never
-    RECOMPUTES an edge from fees/books itself: doing so would require
-    guessing which fee schedule and haircut a given `Intent.kind` needs,
+    A scoring-contract value a strategy DID publish but that cannot be
+    read as a number is not a number to default around: silently
+    substituting one would put an invented figure into a ranking a human
+    reads as money. `app.services.scanner.scan()` already catches
+    `UnscorableIntent` and skips the intent, so refusing here costs one
+    row and never the pass.
+
+    Args:
+        intent: The intent being scored.
+        key: The metadata key to read. Must be present.
+
+    Returns:
+        float: The value.
+
+    Raises:
+        UnscorableIntent: If the value is not convertible to `float`.
+    """
+    raw = intent.metadata[key]
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise UnscorableIntent(
+            f"intent.metadata[{key!r}] is {raw!r}, which is not a number; "
+            "scoring will not invent one in its place"
+        ) from exc
+
+
+def _published_edge(intent: Intent) -> float:
+    """Return the strategy-published PRE-RISK per-unit edge, or `0.0`.
+
+    The scoring contract (`app.strategies.base`): a strategy publishes
+    `SCORING_EDGE_KEY` — USD per unit, net of fees and gas and net of
+    NOTHING ELSE. `SCORING_EDGE_LEGACY_KEY` (`"net_edge"`) is read only
+    when the preferred key is absent, and means the same thing;
+    `multi_outcome_bundle_arbitrage` published under it before the
+    contract was written down, and persisted rows still carry it.
+
+    Scoring never RECOMPUTES an edge from fees/books itself: that would
+    require guessing which fee schedule a given `Intent.kind` needs,
     which is exactly the strategy-specific logic PLAN.md D8 already
-    lives in. An intent kind that publishes neither key (a directional
-    single-leg intent) has no measurable riskless edge for this field.
+    lives in. An intent publishing neither key (a directional single-leg
+    intent) has no measurable riskless edge for this field.
 
     Args:
         intent: The intent being scored.
 
     Returns:
-        float: The published net edge, or `0.0`.
+        float: The published pre-risk edge, or `0.0`.
+
+    Raises:
+        UnscorableIntent: If a published edge is not a number.
     """
-    if "net_edge" in intent.metadata:
-        return float(intent.metadata["net_edge"])
-    if "edge" in intent.metadata:
-        return float(intent.metadata["edge"])
+    if SCORING_EDGE_KEY in intent.metadata:
+        return _metadata_float(intent, SCORING_EDGE_KEY)
+    if SCORING_EDGE_LEGACY_KEY in intent.metadata:
+        return _metadata_float(intent, SCORING_EDGE_LEGACY_KEY)
     return 0.0
 
 
-def _annualized_return(net_edge: float, hours_to_resolution: float, settings: Settings) -> float:
-    """Return `net_edge` annualized, floored at `settings.min_hours_for_annualization`.
+def _risk_adjusted_edge(intent: Intent, published_edge: float) -> tuple[float, bool]:
+    """Apply the identity haircut to `published_edge`. Once, and only here.
+
+    `edge * p - (1 - p) * worst_case_loss`, where `p` is the probability
+    the intent's legs settle on the SAME fact. A mismatch does not cost
+    the edge — it costs the losing leg's entire stake, which is why the
+    second term is a stake and not a margin. This is
+    `cross_venue_arbitrage`'s own formula, moved here so it is applied
+    exactly once for every strategy rather than once inside one strategy
+    and again in `resolution_risk` (see the module docstring's point 2).
+
+    An intent that declares no `IDENTITY_CONFIDENCE_KEY` has no identity
+    risk to price — every leg redeems off one question — so the edge is
+    returned untouched. `IDENTITY_WORST_CASE_LOSS_KEY` defaults to `0.0`
+    only for `p == 1.0`, where it cannot matter; declaring real identity
+    risk without saying what a mismatch costs is unscorable, not free.
+
+    Args:
+        intent: The intent being scored.
+        published_edge: `_published_edge`'s result.
+
+    Returns:
+        tuple[float, bool]: The risk-adjusted edge, and whether the
+            intent DECLARED identity risk at all — which is what
+            `OpportunityScore.edge_basis` reports. Declared-at-`p=1.0`
+            still counts as declared: the haircut is zero but the `1.0`
+            is still an estimate, and a row whose edge rests on one is
+            not the same kind of number as one that does not.
+
+    Raises:
+        UnscorableIntent: If `p` is unreadable or outside `[0, 1]`, if a
+            declared `worst_case_loss` is unreadable or negative, if
+            `p < 1.0` with no `worst_case_loss` declared at all, or if
+            the intent CLAIMS an identity-estimated edge basis while
+            declaring no confidence for the haircut to use.
+    """
+    if IDENTITY_CONFIDENCE_KEY not in intent.metadata:
+        # The one way the contract could rot back into T31's defect: a
+        # strategy that has already haircut its own edge, says so via
+        # `EDGE_BASIS_KEY`, but publishes no `p` for this function to
+        # apply. Scoring it would take the strategy's post-risk number
+        # as a pre-risk one and under-discount it silently, which is the
+        # same class of bug in the other direction. Refuse instead.
+        if intent.metadata.get(EDGE_BASIS_KEY) == EDGE_BASIS_IDENTITY_ESTIMATED:
+            raise UnscorableIntent(
+                f"intent claims {EDGE_BASIS_KEY}={EDGE_BASIS_IDENTITY_ESTIMATED!r} "
+                f"but published no {IDENTITY_CONFIDENCE_KEY!r}; scoring prices "
+                "identity risk itself and cannot verify an edge already haircut "
+                "somewhere else"
+            )
+        return published_edge, False
+    p_same = _metadata_float(intent, IDENTITY_CONFIDENCE_KEY)
+    if not 0.0 <= p_same <= 1.0:
+        raise UnscorableIntent(
+            f"intent.metadata[{IDENTITY_CONFIDENCE_KEY!r}] is {p_same}, outside "
+            "[0, 1]; it is read as a probability and cannot be clamped into one"
+        )
+    if p_same >= 1.0:
+        return published_edge, True
+    if IDENTITY_WORST_CASE_LOSS_KEY not in intent.metadata:
+        raise UnscorableIntent(
+            f"intent declares {IDENTITY_CONFIDENCE_KEY!r}={p_same} but no "
+            f"{IDENTITY_WORST_CASE_LOSS_KEY!r}; a mismatch costs the losing leg's "
+            "whole stake and scoring will not assume that stake is zero"
+        )
+    worst_case_loss = _metadata_float(intent, IDENTITY_WORST_CASE_LOSS_KEY)
+    if worst_case_loss < 0.0:
+        raise UnscorableIntent(
+            f"intent.metadata[{IDENTITY_WORST_CASE_LOSS_KEY!r}] is "
+            f"{worst_case_loss}; a loss is not negative"
+        )
+    return published_edge * p_same - (1.0 - p_same) * worst_case_loss, True
+
+
+def _units(intent: Intent) -> float:
+    """Return how many complete UNITS this intent buys.
+
+    A "unit" is one contract of every leg — the thing the published edge
+    is quoted per. All four arbitrage strategies size equal contracts on
+    every leg (a complement pair, an N-outcome bundle, a cross-venue
+    pair), so the unit count is the per-leg contract count; `max` rather
+    than `min` reads a legitimately one-sided intent (a single-leg
+    `settlement_edge` capital-lockup trade, or a leg left unsized) as the
+    size it actually asked for rather than as zero.
+
+    Args:
+        intent: The intent being scored.
+
+    Returns:
+        float: The unit count, `0.0` for an entirely unsized intent.
+    """
+    return max((_leg_contracts(leg) for leg in intent.legs), default=0.0)
+
+
+def _annualized_return(
+    net_edge: float,
+    units: float,
+    capital_lockup_usd: float,
+    hours_to_resolution: float,
+    settings: Settings,
+) -> float:
+    """Return expected profit per dollar committed, per year.
+
+    `net_edge * units` is the whole position's expected profit in USD;
+    `capital_lockup_usd` is what it takes to hold it. Their ratio is the
+    return, and it is what makes two strategies' `composite` values mean
+    the same thing (module docstring, point 3) — PLAN.md D10's literal
+    formula divided by time but never by capital, which ranked a $0.02
+    edge on a $0.98 pair level with the same $0.02 edge on a $0.20 leg.
 
     See the module docstring's "THE ANNUALIZATION FLOOR". Below the
     floor, `hours_to_resolution` is treated AS IF it were the floor for
@@ -423,15 +716,22 @@ def _annualized_return(net_edge: float, hours_to_resolution: float, settings: Se
     is reported unfloored elsewhere.
 
     Args:
-        net_edge: Per-contract net edge, USD.
+        net_edge: Per-unit edge after every haircut, USD.
+        units: `_units(intent)` — contracts of every leg.
+        capital_lockup_usd: `_capital_lockup_usd(intent)`.
         hours_to_resolution: Unfloored hours to resolution.
         settings: Supplies `min_hours_for_annualization`.
 
     Returns:
-        float: `net_edge / max(hours_to_resolution, min_hours) * 8760`.
+        float: `(net_edge * units / capital_lockup_usd) / max(hours,
+            min_hours) * 8760`, or `0.0` when no capital is committed —
+            an intent that locks up nothing has no return per dollar to
+            report, and `net_edge` still carries the raw edge.
     """
+    if capital_lockup_usd <= _PRICE_EPSILON:
+        return 0.0
     floor_hours = max(hours_to_resolution, settings.min_hours_for_annualization)
-    return (net_edge / floor_hours) * HOURS_PER_YEAR
+    return ((net_edge * units) / capital_lockup_usd / floor_hours) * HOURS_PER_YEAR
 
 
 def _leg_contracts(leg: Leg) -> float:
@@ -556,32 +856,41 @@ def _fill_confidence(intent: Intent, ctx: ScoreContext) -> float:
 
 
 def _resolution_risk(
-    intent: Intent, leg_markets: list[VenueMarket], hours_to_resolution: float
+    leg_markets: list[VenueMarket], hours_to_resolution: float
 ) -> float:
     """Return `resolution_risk` in `[0.0, 1.0]` (PLAN.md D10).
 
-    See the module docstring's formula and its "WHY THE CROSS-VENUE
-    TERM..." explanation. `intent.confidence` is used verbatim as the
-    cross-venue link's `p_same_resolution` — `app.strategies
-    .cross_venue_arbitrage._build_intent` stamps
-    `Intent.confidence = evaluation.p_same_resolution` for exactly this
-    reason, so no separate link lookup is needed here.
+    SETTLEMENT risk only — the chance a venue mis-adjudicates, delays or
+    disputes a question this intent's legs redeem off. IDENTITY risk (the
+    chance two markets are not the same event at all) is NOT here: it is
+    priced in dollars by `_risk_adjusted_edge`, once. Pricing it in both
+    places is the T31 defect — see the module docstring's point 2.
+
+    The base term compounds over DISTINCT `(venue, market_id)` pairs, not
+    over legs: a bundle's five legs redeem off one question and carry one
+    adjudication risk; a cross-venue pair's two legs carry two. This is
+    the only term that treats a cross-venue intent differently from a
+    same-venue one, and `1 - (1 - 0.15)**2 = 0.2775` is derived from
+    `_RESOLUTION_RISK_BASE`'s own stated meaning rather than chosen.
+
+    `intent` is deliberately NOT a parameter any more: every input is a
+    property of the MARKETS the legs settle on, and reading
+    `intent.confidence` here was how the second identity discount got in.
 
     Args:
-        intent: The intent being scored.
-        leg_markets: One `VenueMarket` per leg, from `_leg_markets`.
+        leg_markets: One `VenueMarket` per leg, from `_leg_markets`
+            (duplicated for legs sharing a market — de-duplicated here).
         hours_to_resolution: Unfloored hours to resolution.
 
     Returns:
         float: In `[0.0, 1.0]`.
     """
-    risk = _RESOLUTION_RISK_BASE
+    distinct_markets = len({(market.venue, market.market_id) for market in leg_markets})
+    risk = 1.0 - (1.0 - _RESOLUTION_RISK_BASE) ** distinct_markets
     if any(len(market.rules_text) < _RULES_TEXT_MIN_CHARS for market in leg_markets):
         risk += _RULES_TEXT_PENALTY
     if any(market.resolution_source is None for market in leg_markets):
         risk += _NO_RESOLUTION_SOURCE_PENALTY
-    if intent.kind == "cross_venue" and intent.confidence < _CROSS_VENUE_CONFIDENCE_FLOOR:
-        risk += _CROSS_VENUE_PENALTY
     if hours_to_resolution < _DISPUTE_WINDOW_HOURS:
         risk += _DISPUTE_WINDOW_PENALTY
     return min(_RESOLUTION_RISK_CAP, risk)

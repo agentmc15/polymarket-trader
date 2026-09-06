@@ -1,15 +1,35 @@
 import { useState } from 'react';
 import { cn } from '../../utils/cn';
-import { formatCurrency } from '../../utils/format';
-import type { StrategyInfo, BacktestRequest, SlippageModel } from '../../types';
+import { formatCurrency, formatStrategyName } from '../../utils/format';
+import type { StrategyInfo, BacktestRequest, SlippageModel, SweepRequest } from '../../types';
 import { StrategySelector } from './StrategySelector';
+
+// Mirrors `DEFAULT_CAPITAL_LEVELS` (backend/app/services/backtesting/
+// sweep.py). Not exposed as structured API data — `SweepRequest.
+// capital_levels`'s only trace of it is a human-readable string baked
+// into that field's OpenAPI description, not a value a client can read
+// at runtime — so this is a documented constant, kept in sync by hand.
+const DEFAULT_SWEEP_CAPITAL_LEVELS = [500, 2000, 10000, 50000, 250000];
 
 interface BacktestFormProps {
   strategies: StrategyInfo[];
   categories: Record<string, string[]>;
   isLoadingStrategies: boolean;
   onSubmit: (request: BacktestRequest) => void;
+  //: Producer for `POST /backtests/sweep` (PLAN.md D12, T22) — runs the
+  //: selected strategy once per capital level and reports where the
+  //: edge stops being viable. Asynchronous, like `onSubmit`.
+  onSubmitSweep: (request: SweepRequest) => void;
   isSubmitting: boolean;
+  isSubmittingSweep: boolean;
+}
+
+/** Parse a comma-separated capital-levels field into positive numbers. */
+function parseCapitalLevels(text: string): number[] {
+  return text
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
 }
 
 const SLIPPAGE_MODELS: { value: SlippageModel; label: string; description: string }[] = [
@@ -24,7 +44,9 @@ export function BacktestForm({
   categories,
   isLoadingStrategies,
   onSubmit,
+  onSubmitSweep,
   isSubmitting,
+  isSubmittingSweep,
 }: BacktestFormProps) {
   const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
   const [showStrategyPicker, setShowStrategyPicker] = useState(true);
@@ -42,6 +64,15 @@ export function BacktestForm({
   const [feeRate, setFeeRate] = useState(0.001);
   const [slippageModel, setSlippageModel] = useState<SlippageModel>('fixed');
   const [slippageBps, setSlippageBps] = useState(5);
+
+  // Capital sweep (PLAN.md D12, T22): a separate producer from the
+  // single-run submit below, so `initial_capital` above stays what it
+  // has always been — the single run's capital — while this drives
+  // `SweepRequest.capital_levels` instead.
+  const [capitalLevelsText, setCapitalLevelsText] = useState(
+    DEFAULT_SWEEP_CAPITAL_LEVELS.join(', ')
+  );
+  const [capitalLevelsError, setCapitalLevelsError] = useState<string | null>(null);
 
   // Dynamic strategy config
   const [strategyConfig, setStrategyConfig] = useState<Record<string, unknown>>({});
@@ -81,8 +112,32 @@ export function BacktestForm({
       initial_capital: initialCapital,
       fee_rate: feeRate,
       slippage_model: slippageModel,
-      slippage_bps: slippageBps,
+      // `BacktestRequest.slippage_value` is a probability-unit pad
+      // (0.001 = 0.1%), not basis points — see that field's doc comment
+      // in types/index.ts.
+      slippage_value: slippageBps / 10_000,
       strategy_config: strategyConfig,
+    });
+  };
+
+  const handleRunSweep = () => {
+    if (!selectedStrategy) return;
+    const levels = parseCapitalLevels(capitalLevelsText);
+    if (levels.length === 0) {
+      setCapitalLevelsError('Enter at least one positive capital level, comma-separated.');
+      return;
+    }
+    setCapitalLevelsError(null);
+
+    onSubmitSweep({
+      strategy: selectedStrategy,
+      start_date: startDate,
+      end_date: endDate,
+      fee_rate: feeRate,
+      slippage_model: slippageModel,
+      slippage_value: slippageBps / 10_000,
+      strategy_config: strategyConfig,
+      capital_levels: levels,
     });
   };
 
@@ -119,7 +174,7 @@ export function BacktestForm({
             <div className="rounded-md border border-primary/30 bg-primary/5 p-3">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="font-medium">{selectedStrategyInfo.display_name}</p>
+                  <p className="font-medium">{formatStrategyName(selectedStrategyInfo.name)}</p>
                   <p className="text-sm text-muted-foreground">
                     {selectedStrategyInfo.description}
                   </p>
@@ -253,6 +308,52 @@ export function BacktestForm({
           </div>
         </div>
       )}
+
+      {/* Capital Sweep (PLAN.md D12, T22) — a second, asynchronous
+          producer alongside the single run below. `POST /backtests/sweep`
+          runs `strategy` once per level in `capital_levels` and reports
+          where the edge stops being viable; the parent run's
+          `strategy_name` begins `sweep:`. It does not use the Initial
+          Capital field above at all. */}
+      <div className="rounded-lg border border-border bg-card p-4">
+        <h3 className="mb-1 font-medium">Capital Sweep (optional)</h3>
+        <p className="mb-4 text-sm text-muted-foreground">
+          Instead of one run at a fixed capital, run this strategy once per capital level
+          below and find where the edge dies. Runs asynchronously — the report appears on
+          the Results tab once every level has completed, not immediately.
+        </p>
+        <label htmlFor="capital-levels" className="mb-2 block text-sm font-medium">
+          Capital Levels (USD, comma-separated)
+        </label>
+        <input
+          id="capital-levels"
+          type="text"
+          value={capitalLevelsText}
+          onChange={(e) => {
+            setCapitalLevelsText(e.target.value);
+            setCapitalLevelsError(null);
+          }}
+          placeholder={DEFAULT_SWEEP_CAPITAL_LEVELS.join(', ')}
+          className="w-full max-w-md rounded-md border border-input bg-background px-3 py-2 text-sm"
+        />
+        {capitalLevelsError && (
+          <p className="mt-1 text-xs text-destructive">{capitalLevelsError}</p>
+        )}
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={handleRunSweep}
+            disabled={!selectedStrategy || isSubmittingSweep}
+            className={cn(
+              'rounded-md border border-primary px-4 py-2 text-sm font-medium text-primary transition-colors',
+              'hover:bg-primary/10',
+              'disabled:cursor-not-allowed disabled:opacity-50'
+            )}
+          >
+            {isSubmittingSweep ? 'Queuing sweep...' : 'Run Capital Sweep'}
+          </button>
+        </div>
+      </div>
 
       {/* Submit */}
       <div className="flex items-center justify-between">

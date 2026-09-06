@@ -46,6 +46,17 @@ export function formatRelativeTime(date: string | Date): string {
   return formatDistanceToNow(d, { addSuffix: true });
 }
 
+// The strategy registry (backend/app/strategies/__init__.py's
+// `list_strategies()`) only carries `name` (its snake_case key, e.g.
+// `"catalyst_momentum"`) — there is no `display_name` field on
+// `StrategyInfo` (see that type's doc comment in types/index.ts). This
+// derives a human-friendly label client-side.
+export function formatStrategyName(name: string): string {
+  return name
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
 export function shortenAddress(address: string, chars = 4): string {
   if (!address) return '';
   return `${address.slice(0, chars + 2)}...${address.slice(-chars)}`;
