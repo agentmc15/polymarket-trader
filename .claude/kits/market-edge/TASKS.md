@@ -1625,3 +1625,31 @@ cd backend && python3 -m app.scripts.preflight; python3 -m pytest -q tests/scrip
 ```
 
 ---
+
+### T46 — Refuse a strategy the scan cannot score, instead of answering it empty
+- status: done
+- model: opus (orchestrator-performed, not dispatched — see NOTES.md)
+- independent: yes
+
+**Brief.** T40's implementer flagged, and nobody adjudicated, that nine strategies are registered
+while the README describes four as though the list were exhaustive. Tracing it found a live defect
+rather than a doc gap: `POST /arbitrage/scan?strategies=favorite_compounder` returned
+`200 {"found": 0}`. Both `favorite_compounder` and `no_bias_exploit` unconditionally stamp
+`EDGE_BASIS_DIRECTIONAL`, `_published_edge` refuses every basis outside `SCORABLE_EDGE_BASES` (T34),
+so `score()` raises for 100% of their intents and `scan()` skips every one. The route already refuses
+`settlement_edge` with a 400 on exactly this principle — "answering 200 {found: 0} would report no
+edges when the truth is this pass cannot see any" — so the principle was established and applied to
+one of three cases.
+
+**Acceptance.** The rejection set is DERIVED from a class-level `declared_edge_basis`, never a
+hand-written name list; the two directional strategies get a 400 whose message points at
+`/backtests` rather than at the near-resolution pass (no scan can score a directional estimate); the
+four live strategies and the three no-basis ones are untouched; the class declaration and the
+stamped metadata cannot drift.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/strategies/test_declared_edge_basis.py tests/api/test_arbitrage.py
+```
+
+---

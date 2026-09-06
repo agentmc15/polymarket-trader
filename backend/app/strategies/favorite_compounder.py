@@ -60,6 +60,12 @@ class FavoriteCompounderStrategy(BaseStrategy):
     """
 
     name = "favorite_compounder"
+    #: Unconditional: every Signal this strategy emits stamps this basis
+    #: (see the single `Signal(...)` site below, which reads it from
+    #: here). Declared at class level so `scan()`'s caller can refuse
+    #: the strategy up front instead of running a whole pass whose
+    #: every intent is skipped as unscorable.
+    declared_edge_basis = EDGE_BASIS_DIRECTIONAL
     description = "Compound gains on high-probability favorites"
     version = "1.0.0"
 
@@ -183,7 +189,7 @@ class FavoriteCompounderStrategy(BaseStrategy):
                 "edge": edge,
                 "expected_value": expected_value,
                 "payout_ratio": payout_ratio,
-                EDGE_BASIS_KEY: EDGE_BASIS_DIRECTIONAL,
+                EDGE_BASIS_KEY: self.declared_edge_basis,
             },
         )
 

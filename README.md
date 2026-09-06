@@ -30,14 +30,26 @@ kill switch, and is off by default. Read [Money safety](#money-safety) before ch
 
 ### Inefficiency detection
 
-Four strategies, all fee-aware and all sourcing rates from `app/venues/fees.py` rather than literals:
+**Four strategies reach the live scanner**, all fee-aware and all sourcing rates from
+`app/venues/fees.py` rather than literals:
 
-| Strategy | What it looks for | Venue scope |
-|---|---|---|
-| `binary_complement_arbitrage` | YES + NO priced below \$1.00 on the same market | single venue |
-| `cross_venue_arbitrage` | The same event priced differently on Polymarket vs Kalshi | cross venue |
-| `multi_outcome_bundle_arbitrage` | All outcomes of an N-way market summing below \$1.00 | single venue |
-| `settlement_edge` | Near-certain outcomes trading below \$1.00 with a short lockup | single venue |
+| Strategy | What it looks for | Venue scope | Live path |
+|---|---|---|---|
+| `binary_complement_arbitrage` | YES + NO priced below \$1.00 on the same market | single venue | `scan()` |
+| `cross_venue_arbitrage` | The same event priced differently on Polymarket vs Kalshi | cross venue | `scan()` |
+| `multi_outcome_bundle_arbitrage` | All outcomes of an N-way market summing below \$1.00 | single venue | `scan()` |
+| `settlement_edge` | Near-certain outcomes trading below \$1.00 with a short lockup | single venue | `near_resolution_pass()` |
+
+**Nine are registered.** The other five are backtest-only, and the split is a real distinction rather
+than a backlog. The scanner ranks a *riskless, fee-netted, settlement-realized* edge, and only these
+four produce one — `scoring.py` will not read any other kind of number as if it were that:
+
+| Strategy | Why it is not on a live path |
+|---|---|
+| `favorite_compounder`, `no_bias_exploit` | Publish a **directional mispricing estimate**. Scoring refuses it by design — annualizing a directional punt as riskless arbitrage is the exact failure the edge-basis allowlist exists to prevent. `POST /arbitrage/scan?strategies=…` returns **400** naming them, not an empty list. |
+| `catalyst_momentum`, `correlation_hedging`, `term_structure_spreads` | Publish no edge figure at all, so they score 0.0. Reachable via an explicit `?strategies=`, and left reachable — they score poorly rather than being unscorable. |
+
+All nine are backtestable via `POST /backtests`; `GET /backtests/strategies` lists them.
 
 Trader-mimicry strategies were **deliberately removed** — copying other accounts is not sustainable
 with the data available, and the surface (whale tracking, copy trading, trader models and routes) was
@@ -418,7 +430,7 @@ backend/app/
 │   ├── kalshi/          #   adapter.py, live.py (order placement allowed)
 │   └── paper.py         #   PaperVenueAdapter — simulated fills
 ├── execution/           # router.py, ledger.py, fences.py, fill_engine.py, reconcile.py
-├── strategies/          # four inefficiency strategies + base types
+├── strategies/          # nine strategies (four on the live scanner) + base types
 ├── services/
 │   ├── matching/        # deterministic event matcher (normalize.py, matcher.py)
 │   ├── backtesting/     # engine.py, data_replay.py, metrics.py, sweep.py

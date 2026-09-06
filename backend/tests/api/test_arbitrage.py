@@ -635,3 +635,47 @@ async def test_a_row_with_no_persisted_basis_reports_none_rather_than_observed(
     assert [o["id"] for o in body["opportunities"]] == ["unlabeled"]
     assert "edge_basis" in body["opportunities"][0]
     assert body["opportunities"][0]["edge_basis"] is None
+
+
+async def test_a_directional_strategy_is_refused_rather_than_answered_empty(
+    client: AsyncClient,
+) -> None:
+    """Same principle as the `settlement_edge` 400 above, other side.
+
+    `favorite_compounder` and `no_bias_exploit` unconditionally declare a
+    DIRECTIONAL edge basis, which `_published_edge` refuses (T34), so
+    `score()` raises for 100% of their intents and this pass skips every
+    one. Before this change the route answered `200 {"found": 0}` — "no
+    opportunities" when the truth is "this pass cannot score this
+    strategy at all", which is precisely the lie the settlement_edge
+    check exists to prevent.
+
+    The message must NOT point at the near-resolution pass: unlike
+    settlement_edge there is no scan that can score a directional
+    estimate, so the honest destination is the backtester.
+    """
+    for name in ("favorite_compounder", "no_bias_exploit"):
+        response = await client.post(
+            "/api/v1/arbitrage/scan", params={"strategies": [name]}
+        )
+
+        assert response.status_code == 400, name
+        detail = response.json()["detail"]
+        assert name in detail
+        assert "directional" in detail.lower()
+        assert "/backtests" in detail
+        assert "near-resolution" not in detail
+
+
+async def test_the_default_scan_is_unaffected_by_the_directional_refusal(
+    client: AsyncClient,
+) -> None:
+    """No `strategies=` param still runs the three arbitrage strategies.
+
+    The refusal must not narrow the default pass: a false positive here
+    would take away a working discovery surface, which is worse than the
+    empty-list bug it closes.
+    """
+    response = await client.post("/api/v1/arbitrage/scan")
+
+    assert response.status_code == 200

@@ -669,6 +669,23 @@ class BaseStrategy(ABC):
     description: str = "Base strategy interface"
     version: str = "1.0.0"
 
+    #: The `EDGE_BASIS_KEY` value this strategy stamps on EVERY intent it
+    #: emits, or `None` when it does not always declare one.
+    #:
+    #: This exists so a caller can ask "can `scan()` score this strategy
+    #: at all?" WITHOUT running it. `_published_edge` reads the basis off
+    #: each intent's metadata at scoring time, which is the right seam
+    #: for scoring but useless to a route deciding whether to accept a
+    #: `?strategies=` name — by then the pass has already run and skipped
+    #: everything.
+    #:
+    #: A strategy whose basis is unconditional MUST declare it here and
+    #: stamp its metadata FROM this attribute, so the two cannot drift;
+    #: `tests/strategies/test_declared_edge_basis.py` pins that. Leave it
+    #: `None` when the basis genuinely varies per intent — absence means
+    #: "ask the intent", which is the pre-existing behaviour.
+    declared_edge_basis: str | None = None
+
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         """Initialize the strategy with configuration.
 

@@ -6730,3 +6730,60 @@ kit keeps recording.
 
 agent: T44 id=aabf1e7cc7ccea913 role=implementer model=opus
 outcome: T44 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T46 — the third case of a principle the repo had already established once
+
+Followed up the one finding T40's implementer raised and no one adjudicated: nine strategies
+registered, four described in the README as if that were the list. It read like a documentation gap
+and was not.
+
+**The defect.** `POST /arbitrage/scan?strategies=favorite_compounder` returned `200 {"found": 0}`,
+always. Both `favorite_compounder` and `no_bias_exploit` have exactly one `Signal(...)` construction
+site each — every other path returns `None` — and both stamp `EDGE_BASIS_DIRECTIONAL` there
+unconditionally. `_published_edge` refuses any basis outside `SCORABLE_EDGE_BASES` (T34, deliberately:
+reading a directional number as a fee-netted riskless edge would annualize a punt as arbitrage), so
+`score()` raises `UnscorableIntent` for 100% of their intents and `scan()` skips every one. "100%" is
+exact here, not approximate — it follows from the single emission site, which is why this is a
+structural claim rather than a sampling one.
+
+What makes it a defect rather than a quirk is that **the repo had already decided this question**.
+The route refuses `settlement_edge` with a 400, and the comment explaining why is explicit: answering
+`200 {"found": 0}` "would report 'no settlement edges' when what actually happened is that this pass
+cannot see any." Identical property, two more strategies, no handling. The principle was written
+down and applied to one of the three cases that have it.
+
+**Why the fix is a class attribute rather than a name list.** The basis is stamped per-signal at
+scoring time, which is the right seam for `score()` and useless to a route deciding whether to accept
+a `?strategies=` name — by then the pass has run and skipped everything. So `BaseStrategy` gained
+`declared_edge_basis`, the two strategies declare it and now stamp their metadata FROM it (one source,
+not two literals agreeing), and `scanner.UNSCORABLE_BY_SCAN` is a dict comprehension over the
+registry. A hand-written tuple would have been the `stale-pin` defect kind this kit already records
+against its own briefs: a new directional strategy would be covered the moment someone remembered,
+rather than the moment it declares its basis.
+
+**The message deliberately differs from settlement_edge's.** That one redirects to
+`/arbitrage/scan/near-resolution`, because a pass exists that CAN score it. No pass can score a
+directional estimate, so pointing at another scan would be a second lie; the 400 names the strategies
+and sends the caller to `POST /backtests`. Copying the existing message would have been the easy and
+wrong move.
+
+**Not overcorrected.** `catalyst_momentum`, `correlation_hedging` and `term_structure_spreads` declare
+no basis and publish no `edge` key, so `_published_edge` returns 0.0 for them exactly as before. They
+stay reachable: this refuses strategies that CANNOT be scored, not strategies that score badly. A test
+pins that distinction, and another pins that no live-path strategy is ever swept in — a false positive
+here would remove a working discovery surface, which is worse than the bug being closed.
+
+**Red-green, both fences, run by me.** Removing the route block: the new route test FAILS, and the
+captured log shows the bug verbatim — `POST /api/v1/arbitrage/scan?strategies=favorite_compounder
+"HTTP/1.1 200 OK"`. Re-hardcoding the metadata value so it drifts from the class attribute: the
+consistency test FAILS. Both files restored and `cmp`-verified byte-identical. Suite 927 → **935**.
+
+**No `outcome:` line for this task, deliberately.** I performed it myself rather than dispatching it,
+so there was no implementer and no independent verification — recording it as a first-try pass on
+`opus` would inflate the routing scorecard with work that never went through the routing being
+measured. The `TASKS.md` entry exists so the task is visible; the ledger stays evidence about
+dispatch.
+
+Also corrected the README, which was the surface finding: the strategy table now says four reach the
+live scanner, lists the other five with the reason each is off it, and states that all nine are
+backtestable. A table titled "four strategies" reads as exhaustive when nine are registered.

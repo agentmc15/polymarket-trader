@@ -319,12 +319,13 @@ from app.models.event_link import EventLink
 from app.models.intent import IntentRecord
 from app.models.price_history import PriceHistory
 from app.services.scoring import (
+    SCORABLE_EDGE_BASES,
     OpportunityScore,
     ScoreContext,
     UnscorableIntent,
     score,
 )
-from app.strategies import STRATEGY_CATEGORIES, get_strategy
+from app.strategies import STRATEGIES, STRATEGY_CATEGORIES, get_strategy
 from app.strategies.base import (
     BaseStrategy,
     Intent,
@@ -354,6 +355,31 @@ ARBITRAGE_STRATEGIES: tuple[str, ...] = tuple(STRATEGY_CATEGORIES["arbitrage"])
 #: Named here so `app.api.routes.arbitrage` can reject a request that
 #: asks the general pass for it, rather than answering with an empty list.
 NEAR_RESOLUTION_STRATEGY: str = SettlementEdgeStrategy.name
+
+#: Registered strategies that `scan()` structurally cannot score, mapped
+#: to the non-scorable edge basis each one always declares.
+#:
+#: Same property as `NEAR_RESOLUTION_STRATEGY` above, reached from the
+#: other side. Those strategies publish a DIRECTIONAL mispricing
+#: estimate, `_published_edge` refuses every basis outside
+#: `SCORABLE_EDGE_BASES` (T34, deliberately — reading a directional
+#: number as a fee-netted riskless edge would annualize and rank a
+#: punt as arbitrage), so `score()` raises `UnscorableIntent` for 100%
+#: of their intents and `scan()` skips every one. A caller naming one
+#: gets `200 {"found": 0}`: "no opportunities" when the truth is "this
+#: pass cannot see any" — the exact answer the route already refuses to
+#: give for `settlement_edge`.
+#:
+#: DERIVED from each strategy class's `declared_edge_basis`, never a
+#: hand-written name list, so a new directional strategy is covered the
+#: moment it declares its basis rather than the moment someone
+#: remembers to add it here.
+UNSCORABLE_BY_SCAN: dict[str, str] = {
+    strategy_name: strategy_class.declared_edge_basis
+    for strategy_name, strategy_class in STRATEGIES.items()
+    if strategy_class.declared_edge_basis is not None
+    and strategy_class.declared_edge_basis not in SCORABLE_EDGE_BASES
+}
 
 #: `IntentRecord.extra_data` key naming WHICH PASS produced a row, and
 #: the two values it takes (T25). Every persisted scan row carries one.

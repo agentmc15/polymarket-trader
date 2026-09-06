@@ -295,7 +295,15 @@ _CROSSED_QUOTES_KEY = "crossed_quotes"
 #: strategy landing in `STRATEGY_CATEGORIES["arbitrage"]` by a one-line
 #: mistake fails loudly instead of being annualized and ranked as if its
 #: directional bet were a riskless edge.
-_SCORABLE_EDGE_BASES = frozenset({EDGE_BASIS_OBSERVED, EDGE_BASIS_IDENTITY_ESTIMATED})
+SCORABLE_EDGE_BASES: frozenset[str] = frozenset(
+    {EDGE_BASIS_OBSERVED, EDGE_BASIS_IDENTITY_ESTIMATED}
+)
+
+#: Kept as the module-private spelling this file's own docstrings and
+#: tests already reference. Public alias above is what callers outside
+#: scoring import, so a route can ask whether a strategy's DECLARED
+#: basis is scorable without reaching into a private name.
+_SCORABLE_EDGE_BASES = SCORABLE_EDGE_BASES
 
 
 class UnscorableIntent(ValueError):

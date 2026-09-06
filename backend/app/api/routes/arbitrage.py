@@ -45,6 +45,7 @@ from app.services.scanner import (
     ARBITRAGE_STRATEGIES,
     NEAR_RESOLUTION_STRATEGY,
     SCAN_PASS_KEY,
+    UNSCORABLE_BY_SCAN,
     ScoredIntent,
     near_resolution_pass,
     scan,
@@ -402,6 +403,26 @@ async def trigger_scan(
                 f"'{NEAR_RESOLUTION_STRATEGY}' cannot be scored by the general "
                 "scan (its markets are past close). Use "
                 "POST /arbitrage/scan/near-resolution instead."
+            ),
+        )
+    # Identical reasoning to the block above, reached from the other side.
+    # These strategies declare a DIRECTIONAL edge basis, which
+    # `_published_edge` refuses (T34), so `score()` raises for 100% of
+    # their intents and this pass would answer `200 {"found": 0}`. The
+    # difference from `settlement_edge` is that there is no other pass to
+    # send the caller to: a directional estimate is not the riskless,
+    # fee-netted number the scan contract ranks, so the honest
+    # destination is the backtester, not another scan.
+    directional = [name for name in names if name in UNSCORABLE_BY_SCAN]
+    if directional:
+        listed = ", ".join(f"'{name}'" for name in directional)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"{listed} publish a directional mispricing estimate, not the "
+                "fee-netted riskless edge this scan ranks, so every intent they "
+                "emit is unscorable here and the pass would return an empty list. "
+                "Backtest them with POST /backtests instead."
             ),
         )
     scored = await scan(names, adapters, links, session)
