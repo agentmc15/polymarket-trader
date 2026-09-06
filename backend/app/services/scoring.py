@@ -632,6 +632,31 @@ def _published_edge(intent: Intent) -> float:
     at all is unaffected: absence is the pre-T34 default, and every
     strategy that predates this label is still read exactly as before.
 
+    L2/L3 (NOTES.md): `EDGE_BASIS_KEY` is looked up by PRESENCE
+    (`in intent.metadata`), not by `.get(...) is not None` — the old
+    check treated an EXPLICITLY declared `{EDGE_BASIS_KEY: None}` as
+    "nothing declared" and read the bare edge anyway, when a declared
+    value outside the allowlist (`None` included) is exactly the case
+    this function exists to refuse. A key that differs from
+    `EDGE_BASIS_KEY` only by surrounding whitespace is treated as a
+    declaration too, for the same reason: it is a strategy that tried to
+    say something about its edge basis and mis-typed the key, and the
+    value under the real key was never read — silently scoring that as
+    "no basis declared" is the same failure as the `None` case, just
+    reached from the other side. Genuinely omitting the key (no key
+    resembling `EDGE_BASIS_KEY` present at all) is unaffected by either
+    check and still defaults to reading `SCORING_EDGE_KEY` as a plain
+    fee-netted edge, exactly as before (scoring.py:285-298) — that
+    default is deliberate and is NOT what either check above is for.
+
+    A malformed `intent.metadata` — not a mapping at all, or a mapping
+    whose `EDGE_BASIS_KEY` value is unhashable (e.g. a `list`) — raises
+    `UnscorableIntent` rather than `AttributeError`/`TypeError`, so
+    `app.services.scanner.scan()`'s existing `except UnscorableIntent`
+    skips the one bad intent instead of the whole pass dying on it (T39
+    L3: the blast radius of a buggy strategy's metadata should be one
+    row, not every intent behind it in the scan).
+
     Args:
         intent: The intent being scored.
 
@@ -639,21 +664,56 @@ def _published_edge(intent: Intent) -> float:
         float: The published pre-risk edge, or `0.0`.
 
     Raises:
-        UnscorableIntent: If a published edge is not a number, or if
-            `intent.metadata[EDGE_BASIS_KEY]` is declared and is not one
-            of `_SCORABLE_EDGE_BASES` — i.e. the strategy itself says its
-            edge is not this contract's kind of number.
+        UnscorableIntent: If a published edge is not a number, if
+            `intent.metadata` is not a mapping, or if
+            `intent.metadata[EDGE_BASIS_KEY]` (or a whitespace-mangled
+            spelling of that key) is declared and is not one of
+            `_SCORABLE_EDGE_BASES` — i.e. the strategy itself says its
+            edge is not this contract's kind of number, or said something
+            unreadable while trying to.
     """
-    declared_basis = intent.metadata.get(EDGE_BASIS_KEY)
-    if declared_basis is not None and declared_basis not in _SCORABLE_EDGE_BASES:
+    if not isinstance(intent.metadata, Mapping):
         raise UnscorableIntent(
-            f"intent.metadata[{EDGE_BASIS_KEY!r}] is {declared_basis!r}, which is "
-            f"not one of {sorted(_SCORABLE_EDGE_BASES)!r}; this intent's "
-            f"{SCORING_EDGE_KEY!r}/{SCORING_EDGE_LEGACY_KEY!r} (if any) is not the "
-            "fee-netted, settlement-realized, per-contract USD figure the "
-            "scoring contract requires (app.strategies.base), and score() will "
-            "not read it as one"
+            f"intent.metadata is a {type(intent.metadata).__name__}, not a "
+            "mapping; score() cannot read the scoring contract off it"
         )
+    if EDGE_BASIS_KEY in intent.metadata:
+        declared_basis = intent.metadata[EDGE_BASIS_KEY]
+        try:
+            basis_is_scorable = declared_basis in _SCORABLE_EDGE_BASES
+        except TypeError as exc:
+            raise UnscorableIntent(
+                f"intent.metadata[{EDGE_BASIS_KEY!r}] is {declared_basis!r}, "
+                f"an unhashable {type(declared_basis).__name__}; it cannot be "
+                f"one of {sorted(_SCORABLE_EDGE_BASES)!r} either"
+            ) from exc
+        if not basis_is_scorable:
+            raise UnscorableIntent(
+                f"intent.metadata[{EDGE_BASIS_KEY!r}] is {declared_basis!r}, which is "
+                f"not one of {sorted(_SCORABLE_EDGE_BASES)!r}; this intent's "
+                f"{SCORING_EDGE_KEY!r}/{SCORING_EDGE_LEGACY_KEY!r} (if any) is not the "
+                "fee-netted, settlement-realized, per-contract USD figure the "
+                "scoring contract requires (app.strategies.base), and score() will "
+                "not read it as one"
+            )
+    else:
+        near_miss = next(
+            (
+                key
+                for key in intent.metadata
+                if isinstance(key, str)
+                and key != EDGE_BASIS_KEY
+                and key.strip() == EDGE_BASIS_KEY
+            ),
+            None,
+        )
+        if near_miss is not None:
+            raise UnscorableIntent(
+                f"intent.metadata contains {near_miss!r}, which is "
+                f"{EDGE_BASIS_KEY!r} with stray whitespace rather than the "
+                "key itself; score() will not guess whether this was meant "
+                "to declare an edge basis and silently treat it as omitted"
+            )
     if SCORING_EDGE_KEY in intent.metadata:
         return _metadata_float(intent, SCORING_EDGE_KEY)
     if SCORING_EDGE_LEGACY_KEY in intent.metadata:
