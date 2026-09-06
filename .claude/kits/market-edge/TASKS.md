@@ -1653,3 +1653,26 @@ cd backend && python3 -m pytest -q tests/strategies/test_declared_edge_basis.py 
 ```
 
 ---
+
+### T47 — Make the database default able to reach the database the README starts
+- status: done
+- model: opus (orchestrator-performed, not dispatched — see NOTES.md)
+- independent: yes
+
+**Brief.** HANDOFF.md listed as an unverified first-run trap that `Settings`' default DB URL might
+not authenticate against compose's Postgres. Verified: it could not. Three files declare these
+credentials — `.env.example` and `docker-compose.yml` say `polymarket:polymarket`, `app/config.py`
+said `postgres:postgres`. The default applies only when nothing configured it, i.e. the first run,
+and the documented first run is `docker compose up`, whose container is created with a `polymarket`
+superuser.
+
+**Acceptance.** The default matches the other two sources; a test compares userinfo across all three
+so the drift cannot reopen silently; host and database name are NOT compared, since `localhost` vs
+`postgres` differ for a correct reason.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/test_database_url_default.py
+```
+
+---

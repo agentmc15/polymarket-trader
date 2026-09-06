@@ -73,9 +73,16 @@ remain genuinely unknown:
 - whether Postgres/TimescaleDB accepts migration `001`–`007` against a live database (offline SQL
   only; **never** run `alembic upgrade head` from a kit task)
 - whether the three beats behave under real venue latency and rate limits
-- whether `Settings`' default `postgresql+asyncpg://postgres:postgres@…` fails an auth handshake
-  against compose's `polymarket:polymarket` Postgres on a local non-Docker run — a plausible
-  first-run trap, unverified
+
+The fourth item that used to sit here — the `postgres:postgres` first-run trap — is **closed** (T47).
+It was real and more specific than "plausible": three files declared the same database credentials
+and one disagreed. `.env.example` and `docker-compose.yml` both said `polymarket:polymarket`, while
+`Settings.database_url` defaulted to `postgres:postgres`. That default applies in exactly one
+situation, nothing configured it, which is the first run — and the documented first run starts a
+compose Postgres whose superuser is `polymarket`, so no `postgres` role exists to authenticate as.
+The default now matches, and `backend/tests/test_database_url_default.py` compares the userinfo in
+all three sources so the drift cannot reopen silently (host and database name are deliberately not
+compared — `localhost` vs `postgres` differ for a correct reason).
 
 **T44 and T45 do not close this gap — nothing inside the fence can.** They make the day it closes
 cheap instead of expensive, from the two ends:

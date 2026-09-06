@@ -117,8 +117,18 @@ class Settings(BaseSettings):
     secret_key: SecretStr = Field(default=SecretStr("change-me-in-production"))
 
     # Database
+    #: Default credentials MATCH `.env.example` and `docker-compose.yml`
+    #: (`polymarket:polymarket`), and that is load-bearing rather than
+    #: cosmetic. This default applies in exactly one situation — nothing
+    #: configured it — which is the first run, and the documented first
+    #: run is `docker compose up` for Postgres. That container is created
+    #: with `POSTGRES_USER/PASSWORD` defaulting to `polymarket`, so the
+    #: old `postgres:postgres` default could not authenticate against the
+    #: database this repo tells you to start. Three files declared these
+    #: credentials and this was the one that disagreed.
+    #: `tests/test_database_url_default.py` pins the agreement.
     database_url: str = Field(
-        default="postgresql+asyncpg://postgres:postgres@localhost:5432/polymarket",
+        default="postgresql+asyncpg://polymarket:polymarket@localhost:5432/polymarket",
         alias="DATABASE_URL",
     )
     database_pool_size: int = 5

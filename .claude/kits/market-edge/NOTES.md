@@ -6787,3 +6787,32 @@ dispatch.
 Also corrected the README, which was the surface finding: the strategy table now says four reach the
 live scanner, lists the other five with the reason each is off it, and states that all nine are
 backtestable. A table titled "four strategies" reads as exhaustive when nine are registered.
+
+### T47 — the first-run trap was real, and more specific than "plausible"
+
+HANDOFF.md carried this as an unverified suspicion. Checking it took three greps and it is confirmed,
+with a sharper shape than the note guessed: this is not a subtle handshake question, it is **three
+files declaring the same credentials and one disagreeing**. `.env.example:25` and every
+`DATABASE_URL` in `docker-compose.yml` say `polymarket:polymarket`; `app/config.py` said
+`postgres:postgres`.
+
+What makes it a trap rather than a typo is *when* the default applies: only when nothing configured
+it, which is precisely the first run — and the first run this repo documents is `docker compose up`
+for Postgres, a container created with `POSTGRES_USER`/`POSTGRES_PASSWORD` defaulting to
+`polymarket`. So the value that exists to make the unconfigured case work was the one value that
+could not reach the database the README tells you to start, and the failure lands on the person with
+the least context to debug it.
+
+Aligned the default and pinned the agreement with `tests/test_database_url_default.py`, which
+compares **userinfo only** across the three sources. Host and database name deliberately are not
+compared: `localhost` for a local process and `postgres` for the compose network differ for a correct
+reason, and a test that failed on those would be noise that gets deleted. Red-green: all three tests
+fail against the old default, pass against the new one, `config.py` restored byte-identical in
+between. Suite 935 → **938**.
+
+Same family as `test_env_example_coverage.py` (T40) and worth naming as a family: **a value declared
+in more than one file drifts silently until something tries to use it.** This repo now has two
+structural tests on that axis, both written after the drift had already happened once.
+
+**No `outcome:` line, same reasoning as T46** — orchestrator-performed, no implementer dispatch and
+no independent verification, so it is not evidence about routing.
