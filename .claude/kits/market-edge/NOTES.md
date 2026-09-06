@@ -6404,3 +6404,22 @@ into SQL. Sequential rejections -- what a review queue actually produces -- are 
 
 agent: T43 id=a879286350e15cc03 role=implementer model=opus
 outcome: T43 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### Red-team follow-up — one correction, one process lesson
+
+The red-team agent woke to report a killed background probe and inferred that **F3 and F4 appear
+unaddressed**. **That inference is wrong: both are fixed in `1806d85`.** Verified in the tree --
+`threading.Lock()` at `adapter.py:233`, acquired at `:288` and `:312` (F4), and the cap sweep moved
+inside `_lock_for`, the only function that grows the lock table (F3). The commit's SUBJECT is about
+`reject_link` and its notes; the memo fixes are in its body. Reading a subject line and inferring
+coverage is exactly the mistake, and the agent flagged its own uncertainty correctly -- "I have not
+verified those fixes -- that is a fresh verification pass, not something I can claim from the commit
+subjects" -- which is why the error was cheap to catch rather than propagating into the ledger.
+
+PROCESS LESSON, owned by the agent and worth keeping: a third redundant re-confirmation of F4 at
+`sys.setswitchinterval(1e-7)` -- 4-8 threads each running `asyncio.run` in a tight loop -- was killed
+by the system for memory pressure. F4 had ALREADY been reproduced twice independently (`memo4.py` at
+1e-7, `memo10.py` at 1e-5), so nothing was lost. The lesson is to cap a stress workload once the
+finding is confirmed rather than leaving further runs queued; a scheduler-hostile probe is a cost
+with no remaining evidentiary value after the second reproduction. No stray processes remain
+(`pgrep` clean) and `git status --porcelain` is empty.
