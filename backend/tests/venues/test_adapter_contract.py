@@ -31,14 +31,36 @@ of which venue answered:
     raising.
   * `stream_books` raises `NotImplementedError` rather than faking a
     stream (PLAN.md §2: REST polling only in this kit).
+
+T44 added a second half to the contract, about what happens when a real
+payload DISAGREES with the shape each adapter was written against. These
+are cross-venue promises because the failure they prevent is cross-venue:
+an adapter that answers a divergent payload with a plausible-looking
+wrong number, in silence, is the same defect whichever venue sent it.
+
+  * a market payload whose values the domain types reject raises a
+    `VenueError`, never a bare `ValueError` (which is not in
+    `app.services.scanner.VENUE_READ_FAULTS`, so it would abort a scan
+    pass instead of skipping that venue).
+  * a balance payload carrying no amount raises, rather than reporting a
+    funded account as `$0.00`.
+  * a page of orders NONE of which parse raises, rather than reporting
+    "nothing is resting" -- which `app.execution.reconcile` acts on.
+  * an unknown extra key is TOLERATED, on markets and on books. Venues
+    add fields; that must never be an outage, and this half of the
+    contract is what stops a later hardening pass from making it one.
 """
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
-from app.venues.base import FeeModel
+from app.venues.base import FeeModel, VenueError, VenuePayloadError
 from app.venues.polymarket.adapter import PolymarketAdapter
 from app.venues.types import OrderBook, VenueMarket
+from tests.venues import test_kalshi_adapter as kalshi_tests
+from tests.venues import test_polymarket_adapter as polymarket_tests
 from tests.venues.test_kalshi_adapter import ALPHA as KALSHI_ALPHA
 from tests.venues.test_kalshi_adapter import make_adapter as make_kalshi_adapter
 from tests.venues.test_polymarket_adapter import MARKET_A001, _make_transport
@@ -57,6 +79,75 @@ def _kalshi_case() -> tuple[Any, str, str]:
 VENUE_CASES = [
     pytest.param(_polymarket_case, id="polymarket"),
     pytest.param(_kalshi_case, id="kalshi"),
+]
+
+
+@dataclass(frozen=True)
+class DivergenceCase:
+    """One venue's builders for the T44 half of the contract.
+
+    Each builder answers the SAME question in that venue's own payload
+    vocabulary -- Polymarket's minimum order size arrives on the CLOB
+    market payload and Kalshi's on the market itself, so the shared test
+    asks for "an adapter whose market payload the domain type rejects"
+    rather than for a literal field. `monkeypatch` is accepted by every
+    builder because Polymarket's credentialed reads go through
+    `py_clob_client` and are stubbed out (no network, no real key -- see
+    `tests.venues.test_polymarket_adapter.credentialed_adapter`);
+    Kalshi's go over its `httpx.MockTransport` and ignore it.
+
+    Attributes:
+        market_id: A market id present in that venue's happy fixtures.
+        outcome: An outcome name valid on that market.
+        bad_market: Adapter whose market payload carries a value
+            `VenueMarket` rejects.
+        bad_balance: Adapter whose balance payload carries no amount.
+        unparseable_orders: Adapter whose open orders none of them parse.
+        extra_keys: Adapter whose market and book payloads carry unknown
+            extra fields.
+    """
+
+    market_id: str
+    outcome: str
+    bad_market: Callable[[pytest.MonkeyPatch], Any]
+    bad_balance: Callable[[pytest.MonkeyPatch], Any]
+    unparseable_orders: Callable[[pytest.MonkeyPatch], Any]
+    extra_keys: Callable[[pytest.MonkeyPatch], Any]
+
+
+DIVERGENCE_CASES = [
+    pytest.param(
+        DivergenceCase(
+            market_id=MARKET_A001,
+            outcome="Yes",
+            bad_market=lambda _mp: (
+                polymarket_tests.adapter_with_a_market_the_domain_type_rejects()
+            ),
+            bad_balance=(
+                polymarket_tests.adapter_with_a_balance_payload_missing_its_amount
+            ),
+            unparseable_orders=polymarket_tests.adapter_with_orders_that_never_parse,
+            extra_keys=lambda _mp: polymarket_tests.adapter_with_extra_unknown_keys(),
+        ),
+        id="polymarket",
+    ),
+    pytest.param(
+        DivergenceCase(
+            market_id=KALSHI_ALPHA,
+            outcome="YES",
+            bad_market=lambda _mp: (
+                kalshi_tests.adapter_with_a_market_the_domain_type_rejects()
+            ),
+            bad_balance=lambda _mp: (
+                kalshi_tests.adapter_with_a_balance_payload_missing_its_amount()
+            ),
+            unparseable_orders=lambda _mp: (
+                kalshi_tests.adapter_with_orders_that_never_parse()
+            ),
+            extra_keys=lambda _mp: kalshi_tests.adapter_with_extra_unknown_keys(),
+        ),
+        id="kalshi",
+    ),
 ]
 
 
@@ -195,3 +286,91 @@ def test_stream_books_is_not_faked(case: Any) -> None:
 
     with pytest.raises(NotImplementedError):
         adapter.stream_books([(market_id, outcome)])
+
+
+# ---------------------------------------------------------------------------
+# T44: the same promises about DIVERGENT payloads, on both venues.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", DIVERGENCE_CASES)
+async def test_a_market_the_domain_types_reject_is_a_typed_venue_error(
+    case: DivergenceCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Out-of-domain market values raise `VenueError`, never a bare `ValueError`.
+
+    `VenueMarket`'s validators name the offending field but raise a plain
+    `ValueError`. That is not a `VenueError`, so it is not in
+    `app.services.scanner.VENUE_READ_FAULTS`, so a single malformed
+    market would propagate out of `scan()` as if it were a programming
+    error and abort the whole pass -- instead of skipping one venue's
+    listing, which is what every other venue fault does.
+    """
+    adapter = case.bad_market(monkeypatch)
+
+    with pytest.raises(VenueError) as excinfo:
+        await adapter.list_markets()
+
+    assert isinstance(excinfo.value, VenuePayloadError)
+    # The message must still say WHICH field was wrong -- the whole point
+    # of the wrap is legibility, not just the type.
+    assert "size" in str(excinfo.value) or "tick" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", DIVERGENCE_CASES)
+async def test_a_balance_payload_with_no_amount_is_refused(
+    case: DivergenceCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No amount field is an ERROR, never `$0.00`.
+
+    A zero balance and a balance we could not read are the same number to
+    every caller, and that number decides how much capital exists
+    (GUARDRAILS.md §1.6: capital is per venue and never guessed).
+    """
+    adapter = case.bad_balance(monkeypatch)
+
+    with pytest.raises(VenuePayloadError):
+        await adapter.get_balance()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", DIVERGENCE_CASES)
+async def test_a_page_of_orders_that_none_parse_is_not_reported_as_empty(
+    case: DivergenceCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every row failing is a schema disagreement, not "nothing is resting".
+
+    `app.execution.reconcile` treats a read that RAISED as "we do not
+    know" and refuses to conclude anything from it, but treats a
+    successful empty read as "the venue holds nothing" and acts on it.
+    Silently dropping every unparseable order collapses the first case
+    into the second, and reports every live order as gone.
+    """
+    adapter = case.unparseable_orders(monkeypatch)
+
+    with pytest.raises(VenuePayloadError):
+        await adapter.get_open_orders()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", DIVERGENCE_CASES)
+async def test_an_unknown_extra_key_is_tolerated(
+    case: DivergenceCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TOLERANCE PIN, on both venues, for markets AND books.
+
+    This is the half of the contract that protects against overcorrection:
+    venues add fields all the time, and an adapter that refuses a payload
+    carrying one it has never heard of would fail on the first harmless
+    addition -- an outage of its own, caused by the fix rather than the
+    divergence.
+    """
+    adapter = case.extra_keys(monkeypatch)
+
+    markets = await adapter.list_markets()
+    book = await adapter.get_book(case.market_id, case.outcome)
+
+    assert markets
+    assert book.bids or book.asks

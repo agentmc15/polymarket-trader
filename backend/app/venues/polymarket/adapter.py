@@ -93,11 +93,12 @@ live response before trusting them for sizing.
 """
 import asyncio
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from datetime import UTC, datetime
-from typing import Any, Generic, Literal, TypeVar, cast
+from typing import Any, Generic, Literal, TypeVar, cast, overload
 
 import httpx
 from py_clob_client.clob_types import (
@@ -125,6 +126,8 @@ from app.venues.types import (
     VenueId,
     VenueMarket,
 )
+
+logger = logging.getLogger(__name__)
 
 #: `OrderAck.status`'s literal type, named here so parsers can `cast` a
 #: validated `str` back to it without reaching for `Any`.
@@ -504,14 +507,35 @@ class PolymarketAdapter(BaseAdapter):
         event_id: str | None,
         clob_item: dict[str, Any] | None,
     ) -> VenueMarket:
-        """Build a `VenueMarket` from a Gamma item plus optional CLOB enrichment."""
+        """Build a `VenueMarket` from a Gamma item plus optional CLOB enrichment.
+
+        Raises:
+            VenuePayloadError: If the payload carries no id, no
+                `outcomes`, no parseable `endDate`, a `resolved`/`closed`
+                flag that is not a boolean, a CLOB fee that is not in
+                basis points, or values `VenueMarket` itself rejects.
+        """
         market_id = _market_id(gamma_item)
         if market_id is None:
             raise VenuePayloadError(
                 "gamma market payload missing id/conditionId", raw=gamma_item
             )
-        question = str(gamma_item.get("question", ""))
-        outcomes = tuple(str(o) for o in _parse_list_field(gamma_item.get("outcomes", [])))
+        # `str(gamma_item.get("question", ""))` would turn an explicit
+        # `"question": null` into the literal string "None" — a market
+        # displayed and scored under a title it does not have (T44).
+        question = str(gamma_item.get("question") or "")
+        if "outcomes" not in gamma_item:
+            raise VenuePayloadError(
+                f"gamma market {market_id} has no 'outcomes' — a market whose "
+                "outcomes are unknown cannot be quoted, matched or traded, and "
+                "must not be listed as if it could be",
+                raw=gamma_item,
+            )
+        outcomes = tuple(str(o) for o in _parse_list_field(gamma_item["outcomes"]))
+        if not outcomes:
+            raise VenuePayloadError(
+                f"gamma market {market_id} listed an EMPTY 'outcomes'", raw=gamma_item
+            )
         token_ids_field = gamma_item.get("clobTokenIds", gamma_item.get("token_ids", []))
         token_ids = [str(t) for t in _parse_list_field(token_ids_field)]
         outcome_ids = dict(zip(outcomes, token_ids, strict=False))
@@ -524,8 +548,8 @@ class PolymarketAdapter(BaseAdapter):
         if not isinstance(end_date, str):
             raise VenuePayloadError("gamma market missing endDate", raw=gamma_item)
         close_time = _parse_iso8601(end_date)
-        resolved = bool(gamma_item.get("resolved", False))
-        closed = bool(gamma_item.get("closed", False))
+        resolved = _to_bool(gamma_item.get("resolved"), field="resolved")
+        closed = _to_bool(gamma_item.get("closed"), field="closed")
         status: MarketStatus = (
             "resolved" if resolved else ("closed" if closed else "open")
         )
@@ -546,30 +570,41 @@ class PolymarketAdapter(BaseAdapter):
             if taker_bps is not None:
                 maker_bps = clob_item.get("maker_base_fee")
                 fee = FeeSchedule(
-                    taker_rate=float(cast(Any, taker_bps)) / 10_000.0,
-                    maker_rate=float(cast(Any, maker_bps)) / 10_000.0
+                    taker_rate=_fee_rate_from_bps(taker_bps, field="taker_base_fee"),
+                    maker_rate=_fee_rate_from_bps(maker_bps, field="maker_base_fee")
                     if maker_bps is not None
                     else 0.0,
                     source="clob_market",
                 )
-        return VenueMarket(
-            venue="polymarket",
-            market_id=market_id,
-            event_id=event_id,
-            question=question,
-            outcomes=outcomes,
-            outcome_ids=outcome_ids,
-            rules_text=rules_text,
-            resolution_source=resolution_source,
-            close_time=close_time,
-            expected_settle_time=None,
-            status=status,
-            result=result,
-            tick_size=tick_size,
-            min_size=min_size,
-            fee=fee,
-            raw=gamma_item,
-        )
+        try:
+            return VenueMarket(
+                venue="polymarket",
+                market_id=market_id,
+                event_id=event_id,
+                question=question,
+                outcomes=outcomes,
+                outcome_ids=outcome_ids,
+                rules_text=rules_text,
+                resolution_source=resolution_source,
+                close_time=close_time,
+                expected_settle_time=None,
+                status=status,
+                result=result,
+                tick_size=tick_size,
+                min_size=min_size,
+                fee=fee,
+                raw=gamma_item,
+            )
+        except ValueError as exc:
+            # `VenueMarket`'s validators name the field but raise a BARE
+            # `ValueError`, which is not a `VenueError` and so is outside
+            # `app.services.scanner.VENUE_READ_FAULTS`: a single CLOB
+            # `tick_size: 0` would abort a whole scan pass rather than
+            # skipping this venue's listing (T44).
+            raise VenuePayloadError(
+                f"polymarket market {market_id} did not validate: {exc}",
+                raw=gamma_item,
+            ) from exc
 
     async def _fetch_gamma_markets(
         self, params: dict[str, str] | None = None
@@ -702,11 +737,23 @@ class PolymarketAdapter(BaseAdapter):
         market = await self._book_market_memo.get(
             market_id, lambda: self.get_market(market_id)
         )
+        if not market.outcome_ids:
+            # Distinguished from "you asked for the wrong outcome name"
+            # because the cause and the fix are different: the market
+            # parsed fine, Gamma just carried no `clobTokenIds` for it,
+            # and the book endpoint is keyed by token id (T44).
+            raise VenuePayloadError(
+                f"market {market_id!r} carries no outcome -> token_id mapping "
+                "(gamma 'clobTokenIds' was absent or empty), so its CLOB book "
+                "cannot be addressed",
+                raw=dict(market.raw),
+            )
         try:
             token_id = market.outcome_ids[outcome]
         except KeyError:
             raise VenuePayloadError(
-                f"unknown outcome {outcome!r} for market {market_id!r}",
+                f"unknown outcome {outcome!r} for market {market_id!r}; known "
+                f"outcomes are {sorted(market.outcome_ids)}",
                 raw=dict(market.outcome_ids),
             ) from None
         response = await self._clob_client.get("/book", params={"token_id": token_id})
@@ -780,14 +827,36 @@ class PolymarketAdapter(BaseAdapter):
 
         Raises:
             VenueAuthError: If `settings.polymarket_private_key` is empty.
+            VenuePayloadError: If the payload is not an object, carries no
+                `balance`, or carries one that is not a usable USD amount.
+                It used to default to `0.0` on all three (T44), which
+                reported a funded account as empty — a number a caller
+                cannot tell from a real zero, on the field that decides
+                how much capital exists. Kalshi's `get_balance` has always
+                raised here; this is the same promise on both venues.
         """
         wrapper = await self._ensure_clob_wrapper()
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         raw: object = await asyncio.to_thread(wrapper.client.get_balance_allowance, params)
         if not isinstance(raw, dict):
             raise VenuePayloadError("balance-allowance payload was not an object", raw=raw)
-        available = _to_float(raw.get("balance"), default=0.0)
-        return Balance(venue="polymarket", available=available, locked=0.0)
+        if "balance" not in raw:
+            raise VenuePayloadError(
+                "polymarket balance-allowance payload has no 'balance' field",
+                raw=raw,
+            )
+        available = _try_float(raw["balance"])
+        if available is None:
+            raise VenuePayloadError(
+                f"polymarket balance {raw['balance']!r} is not a number", raw=raw
+            )
+        try:
+            return Balance(venue="polymarket", available=available, locked=0.0)
+        except ValueError as exc:
+            raise VenuePayloadError(
+                f"polymarket balance {available!r} is not a usable USD amount: {exc}",
+                raw=raw,
+            ) from exc
 
     async def get_positions(self) -> list[Position]:
         """Fetch open Polymarket positions, derived from fill history.
@@ -816,11 +885,16 @@ class PolymarketAdapter(BaseAdapter):
         raw: object = await asyncio.to_thread(wrapper.client.get_orders, OpenOrderParams())
         items = _require_list_of_dicts(raw, context="get_orders")
         acks: list[OrderAck] = []
+        unusable = 0
         for item in items:
             try:
                 acks.append(_parse_order_ack(item))
-            except ValueError:
-                continue
+            except (ValueError, VenuePayloadError) as exc:
+                unusable += 1
+                _log_skipped("order", str(exc))
+        _require_not_all_dropped(
+            items, kept=len(acks), unusable=unusable, context="polymarket get_orders"
+        )
         return acks
 
     async def get_fills(self, since: datetime) -> list[Fill]:
@@ -837,13 +911,21 @@ class PolymarketAdapter(BaseAdapter):
         raw: object = await asyncio.to_thread(wrapper.client.get_trades, TradeParams())
         items = _require_list_of_dicts(raw, context="get_trades")
         fills: list[Fill] = []
+        parsed = 0
+        unusable = 0
         for item in items:
             try:
                 fill = _parse_fill(item)
-            except ValueError:
+            except (ValueError, VenuePayloadError) as exc:
+                unusable += 1
+                _log_skipped("fill", str(exc))
                 continue
+            parsed += 1
             if fill.ts >= since:
                 fills.append(fill)
+        _require_not_all_dropped(
+            items, kept=parsed, unusable=unusable, context="polymarket get_trades"
+        )
         return fills
 
     def fee_model(self) -> FeeModel:
@@ -873,6 +955,139 @@ def _require_list_of_dicts(value: object, *, context: str) -> list[dict[str, Any
             raise VenuePayloadError(f"{context}: expected a list of objects", raw=value)
         result.append(item)
     return result
+
+
+def _log_skipped(kind: str, reason: str) -> None:
+    """Log one skipped payload entry at WARNING (T44).
+
+    Skipping a single malformed row is the right behaviour — one bad row
+    must not cost the whole read — but doing it in silence is what makes
+    a schema change undiagnosable. Carries the reason, never the payload.
+    """
+    logger.warning(
+        "venue",
+        extra={
+            "event": f"polymarket_{kind}_entry_skipped",
+            "venue": "polymarket",
+            "reason": reason,
+        },
+    )
+
+
+def _require_not_all_dropped(
+    entries: list[dict[str, Any]], *, kept: int, unusable: int, context: str
+) -> None:
+    """Raise if the venue sent entries and NONE of them survived parsing.
+
+    WHY (T44). Per-entry skipping is deliberately tolerant, but "every
+    row failed" is not a bad row, it is a disagreement about the schema —
+    and tolerating it yields an empty list, which
+    `app.execution.reconcile` reads as "the venue holds nothing" and acts
+    on (a read that RAISED it treats as "we do not know" and refuses to
+    conclude from). A whole page of orders priced in cents, or under a
+    renamed id key, would otherwise report every live order as gone.
+
+    Args:
+        entries: The raw entries the venue returned.
+        kept: How many parsed successfully.
+        unusable: How many failed to parse.
+        context: Endpoint name, for the error message.
+
+    Raises:
+        VenuePayloadError: If `entries` is non-empty, nothing was kept,
+            and every entry was unusable.
+    """
+    if entries and kept == 0 and unusable == len(entries):
+        raise VenuePayloadError(
+            f"{context}: the venue returned {len(entries)} entr"
+            f"{'y' if len(entries) == 1 else 'ies'} and NONE parsed — reporting "
+            "an empty result would be indistinguishable from the venue holding "
+            "nothing",
+            raw=entries,
+        )
+
+
+def _to_bool(value: object, *, field: str) -> bool:
+    """Read a Gamma boolean flag that may arrive as a JSON bool or a string.
+
+    `bool(value)` is NOT enough (T44): Gamma sends `resolved`/`closed` as
+    real JSON booleans today, but `bool("false")` is `True`, so the day
+    either arrives as a STRING every live market silently becomes
+    `status="resolved"` — dropped from every scan, with nothing said.
+
+    Args:
+        value: The raw flag. `None`/absent reads as `False` (the flag is
+            optional and its absence has always meant "not set").
+        field: Field name, for the error message.
+
+    Returns:
+        bool: The flag.
+
+    Raises:
+        VenuePayloadError: If `value` is neither a boolean, nor `None`,
+            nor a recognizable boolean spelling. Guessing is what caused
+            the failure this exists to prevent.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "1", "yes"):
+            return True
+        if text in ("false", "0", "no", ""):
+            return False
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise VenuePayloadError(
+        f"gamma market {field}: expected a boolean, got {value!r}", raw=value
+    )
+
+
+def _fee_rate_from_bps(value: object, *, field: str) -> float:
+    """Convert a CLOB basis-point fee to the dimensionless rate.
+
+    Args:
+        value: The payload's fee value, in BASIS POINTS (module
+            docstring: `taker_base_fee`/`maker_base_fee`/`fee_rate_bps`
+            are bps, verified against the installed `py_clob_client`).
+        field: Field name, for the error message.
+
+    Returns:
+        float: `value / 10_000`, e.g. `200` bps -> `0.02`.
+
+    Raises:
+        VenuePayloadError: If `value` is not a number, is negative, or
+            lies strictly between 0 and 1. That last band is the
+            unit-drift guard (T44): a value like `0.02` is what this
+            field looks like once it is a RATE rather than bps, and
+            dividing it by 10,000 again yields `0.000002` — a fee of
+            effectively zero, which makes every marginal edge look
+            profitable and is exactly the silent-wrong-number failure
+            this venue has no other defence against. A whole `0` (an
+            explicit fee waiver) and any bps value >= 1 are untouched.
+    """
+    bps = _try_float(value)
+    if bps is None:
+        raise VenuePayloadError(
+            f"polymarket CLOB {field}: expected basis points, got {value!r}",
+            raw=value,
+        )
+    if bps < 0.0:
+        raise VenuePayloadError(
+            f"polymarket CLOB {field}={value!r} is negative; fee rates are >= 0",
+            raw=value,
+        )
+    if 0.0 < bps < 1.0:
+        raise VenuePayloadError(
+            f"polymarket CLOB {field}={value!r} is under one basis point. This "
+            "field is BASIS POINTS (200 = 2%); a value in (0, 1) is a fee RATE, "
+            f"and dividing it by 10,000 would report a fee of {bps / 10_000.0!r} "
+            "— effectively free, on every fill",
+            raw=value,
+        )
+    return bps / 10_000.0
 
 
 def _parse_list_field(value: object) -> list[Any]:
@@ -973,14 +1188,22 @@ def _parse_book(payload: dict[str, Any], *, market_id: str, outcome: str) -> Ord
 
     Returns:
         OrderBook: `bids`/`asks` price/size decimal strings converted to
-            `float`; `timestamp` (ms) converted to aware UTC; the
-            payload's OWN `tick_size`/`min_order_size`/`neg_risk`/
-            `last_trade_price`/`hash` recorded on `metadata` (NOT on
+            `float`; `timestamp` converted to aware UTC — MILLISECONDS as
+            PLAN.md §3 pins it, but a seconds-valued epoch is read as
+            seconds rather than divided by 1000 again (T44: `1767225600`
+            treated as milliseconds dates the book to 1970-01-21, a
+            56-year-old snapshot produced in silence). Milliseconds are
+            distinguished by magnitude exactly as `_try_epoch` and
+            Kalshi's `_parse_timestamp` already do; a seconds epoch above
+            `1e12` would be the year 33658.
+        The payload's OWN `tick_size`/`min_order_size`/`neg_risk`/
+            `last_trade_price`/`hash` are recorded on `metadata` (NOT on
             `OrderBook`, which has no such fields by design — those live
             on `VenueMarket`, populated separately in `_build_market`).
 
     Raises:
-        VenuePayloadError: If `bids`/`asks` are missing or malformed.
+        VenuePayloadError: If `bids`/`asks` are missing or malformed, or
+            `timestamp` is absent/unparseable.
     """
     if "bids" not in payload or "asks" not in payload:
         raise VenuePayloadError("CLOB book payload missing bids/asks", raw=payload)
@@ -997,10 +1220,16 @@ def _parse_book(payload: dict[str, Any], *, market_id: str, outcome: str) -> Ord
             BookLevel(price=float(lvl["price"]), size=float(lvl["size"]))
             for lvl in raw_asks
         ]
-        ts_ms = int(payload["timestamp"])
     except (KeyError, TypeError, ValueError) as exc:
         raise VenuePayloadError(f"malformed CLOB book payload: {exc}", raw=payload) from exc
-    ts = datetime.fromtimestamp(ts_ms / 1000.0, tz=UTC)
+    ts = _try_epoch(payload.get("timestamp"))
+    if ts is None:
+        raise VenuePayloadError(
+            f"CLOB book payload has no parseable 'timestamp' "
+            f"(got {payload.get('timestamp')!r}); a book with no read time cannot "
+            "be aged, and inventing one would hide a stale quote",
+            raw=payload,
+        )
     metadata: dict[str, Any] = {
         "tick_size": payload.get("tick_size"),
         "min_order_size": payload.get("min_order_size"),
@@ -1032,8 +1261,30 @@ def _positions_from_trades(trades: list[dict[str, Any]]) -> list[Position]:
     the token id, and cross-referencing it back to a name would require
     an extra `get_market` call per distinct market seen here. Documented
     limitation, not exercised by this kit's tests.
+
+    THE DERIVED AVERAGE PRICE IS NO LONGER CLAMPED (T44). It used to be
+    `min(max(cost_basis / net_size, 0.0), 1.0)`, so a trades payload
+    priced in cents (`42`) — or carrying any other out-of-domain price —
+    produced a position at `avg_price=1.0`: a real-looking cost basis of
+    $1.00 per contract, on a position that is used for sizing, with
+    nothing raised and nothing logged. Only IEEE-754 dust at the
+    boundaries is absorbed now; a materially out-of-range average is a
+    `VenuePayloadError` naming the venue, the field and the range.
+
+    Raises:
+        VenuePayloadError: If a netted average price is outside `[0,1]`,
+            or if every trade was unusable (which would otherwise report
+            a funded account as flat).
     """
+    #: Absolute tolerance for the netted average price at the [0,1]
+    #: boundaries. `cost_basis / net_size` is a weighted mean of prices
+    #: that are each already in `[0,1]`, so in exact arithmetic it cannot
+    #: leave the range; chained float rounding can put it a few ULPs
+    #: outside, and that dust is absorbed rather than reported as a bad
+    #: payload. Many orders of magnitude below any real price error.
+    epsilon = 1e-9
     totals: dict[tuple[str, str], list[float]] = {}
+    unusable = 0
     for trade in trades:
         market = trade.get("market")
         asset_id = trade.get("asset_id")
@@ -1041,6 +1292,16 @@ def _positions_from_trades(trades: list[dict[str, Any]]) -> list[Position]:
         price = _try_float(trade.get("price"))
         size = _try_float(trade.get("size"))
         if market is None or asset_id is None or price is None or size is None:
+            unusable += 1
+            _log_skipped("trade", "market/asset_id/price/size missing or non-numeric")
+            continue
+        if side not in ("BUY", "SELL"):
+            # `side if "BUY" else -size` used to net ANY unrecognized
+            # side (including an absent one) as a SELL, which silently
+            # cancels the buy it should have added and can erase a real
+            # position entirely (T44).
+            unusable += 1
+            _log_skipped("trade", f"side {trade.get('side')!r} is neither BUY nor SELL")
             continue
         key = (str(market), str(asset_id))
         signed = size if side == "BUY" else -size
@@ -1051,7 +1312,11 @@ def _positions_from_trades(trades: list[dict[str, Any]]) -> list[Position]:
     for (market, asset_id), (net_size, cost_basis) in totals.items():
         if net_size <= 0:
             continue
-        avg_price = min(max(cost_basis / net_size, 0.0), 1.0)
+        avg_price = cost_basis / net_size
+        if -epsilon <= avg_price < 0.0:
+            avg_price = 0.0
+        elif 1.0 < avg_price <= 1.0 + epsilon:
+            avg_price = 1.0
         try:
             positions.append(
                 Position(
@@ -1062,8 +1327,17 @@ def _positions_from_trades(trades: list[dict[str, Any]]) -> list[Position]:
                     avg_price=avg_price,
                 )
             )
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise VenuePayloadError(
+                f"polymarket position in market {market!r} netted an average price "
+                f"of {avg_price!r} from its trades, which is not a probability in "
+                f"[0,1] ({exc}). Trade prices are probabilities; a payload in "
+                "cents would look exactly like this",
+                raw=trades,
+            ) from exc
+    _require_not_all_dropped(
+        trades, kept=len(positions), unusable=unusable, context="polymarket positions"
+    )
     return positions
 
 
@@ -1073,27 +1347,96 @@ def _parse_order_ack(raw: dict[str, Any]) -> OrderAck:
     `py_clob_client.get_orders` returns a plain `list[dict]` with no
     pinned schema (PLAN.md §3 does not cover it); key names below are a
     best-effort guess, not a verified contract.
+
+    OPTIONAL STAYS OPTIONAL, PRESENT-BUT-WRONG DOES NOT (T44). An absent
+    `size_matched`/`original_size`/`price` still falls back exactly as
+    before — those fields are not guaranteed. But a field that IS present
+    and does not parse used to fall back too: `_try_float(...) or 0.0`
+    turned `"size_matched": "abc"` into `0.0`, reporting a partly-filled
+    order as untouched, and an unparseable `price` into "nothing has
+    filled yet". Those are now `VenuePayloadError`s naming the field.
+    `get_open_orders` skips a single such entry and logs it, and raises
+    if EVERY entry failed.
+
+    Raises:
+        VenuePayloadError: If the entry carries no order id, or a
+            present numeric field is unparseable, or the resulting values
+            are outside `OrderAck`'s domain (a `price` of `42` is what a
+            cents-encoded payload looks like).
     """
     order_id = str(raw.get("id") or raw.get("order_id") or "")
-    size_matched = _try_float(raw.get("size_matched")) or 0.0
-    original_size = (
-        _try_float(raw.get("original_size")) or _try_float(raw.get("size")) or size_matched
-    )
+    if not order_id:
+        # Kalshi's `parse_order_ack` has always refused this. An ack with
+        # an empty id is indexed under "" by `app.execution.reconcile`
+        # and can be matched to the wrong order.
+        raise VenuePayloadError(
+            "polymarket order payload carries neither 'id' nor 'order_id'", raw=raw
+        )
+    size_matched = _present_float(raw, "size_matched", default=0.0)
+    original_size = _present_float(raw, "original_size", default=None)
+    if original_size is None:
+        original_size = _present_float(raw, "size", default=size_matched)
     remaining = max(original_size - size_matched, 0.0)
-    avg_fill_price = _try_float(raw.get("price"))
+    avg_fill_price = _present_float(raw, "price", default=None)
     status_raw = str(raw.get("status", "open")).lower()
+    if status_raw not in _ORDER_ACK_STATUSES:
+        logger.warning(
+            "order",
+            extra={
+                "event": "polymarket_unknown_order_status",
+                "venue": "polymarket",
+                "order_id": order_id,
+                "status": status_raw,
+                "assumed": "open",
+            },
+        )
     status = status_raw if status_raw in _ORDER_ACK_STATUSES else "open"
     ts = _try_epoch(raw.get("created_at") or raw.get("timestamp")) or utcnow()
-    return OrderAck(
-        venue="polymarket",
-        order_id=order_id,
-        client_order_id=str(raw.get("client_order_id") or order_id) or order_id or "unknown",
-        status=cast(_OrderAckStatus, status),
-        filled_size=size_matched,
-        remaining_size=remaining,
-        avg_fill_price=avg_fill_price,
-        ts=ts,
-    )
+    try:
+        return OrderAck(
+            venue="polymarket",
+            order_id=order_id,
+            client_order_id=str(raw.get("client_order_id") or order_id),
+            status=cast(_OrderAckStatus, status),
+            filled_size=size_matched,
+            remaining_size=remaining,
+            avg_fill_price=avg_fill_price,
+            ts=ts,
+        )
+    except ValueError as exc:
+        raise VenuePayloadError(
+            f"polymarket order {order_id} did not validate: {exc}", raw=raw
+        ) from exc
+
+
+@overload
+def _present_float(raw: dict[str, Any], key: str, *, default: float) -> float: ...
+
+
+@overload
+def _present_float(raw: dict[str, Any], key: str, *, default: None) -> float | None: ...
+
+
+def _present_float(
+    raw: dict[str, Any], key: str, *, default: float | None
+) -> float | None:
+    """Return `raw[key]` as a float; `default` only when the key is ABSENT.
+
+    The distinction is the whole point (T44): a missing optional field
+    keeps its documented fallback, while a field the venue DID send and
+    we cannot read is a disagreement, not a zero.
+
+    Raises:
+        VenuePayloadError: If `key` is present but not a finite number.
+    """
+    if key not in raw or raw[key] is None:
+        return default
+    parsed = _try_float(raw[key])
+    if parsed is None:
+        raise VenuePayloadError(
+            f"polymarket order field {key}={raw[key]!r} is not a number", raw=raw
+        )
+    return parsed
 
 
 def _parse_fill(raw: dict[str, Any]) -> Fill:
@@ -1109,31 +1452,71 @@ def _parse_fill(raw: dict[str, Any]) -> Fill:
     PLAN.md §3 — and this never applies a maker rate). Not exercised by
     this kit's tests (GUARDRAILS.md §1.4 forbids the network access that
     would be needed to observe a real payload).
+
+    AN ABSENT `fee_rate_bps` IS AN ESTIMATE, NOT A ZERO (T44). It used to
+    produce `fee=$0.00`, silently, for exactly the reason Kalshi's
+    `_parse_fill` refuses to: "a fabricated zero fee is exactly the input
+    that makes a marginal edge look profitable". The conservative
+    category-table rate is applied instead, and which of the two happened
+    is recorded in `Fill.metadata["fee_source"]` (`"venue_rate"` when the
+    trade carried its own bps, `"category_estimate"` when it did not) —
+    the same contract Kalshi's fills already carry.
+
+    A FILL WITH NO PARSEABLE TIMESTAMP IS DROPPED, not stamped `now()`:
+    `get_fills` filters on `ts >= since`, so an invented "now" makes an
+    old fill look like a new one. Kalshi has always dropped these.
+
+    Raises:
+        VenuePayloadError: If `price`/`size` are missing or unparseable,
+            if no timestamp parses, if `fee_rate_bps` is not in basis
+            points, or if the values are outside `Fill`'s domain.
     """
     price = _try_float(raw.get("price"))
     size = _try_float(raw.get("size"))
     if price is None or size is None:
-        raise ValueError("trade payload missing price/size")
-    fee_rate_bps = _try_float(raw.get("fee_rate_bps")) or 0.0
-    schedule = FeeSchedule(
-        taker_rate=fee_rate_bps / 10_000.0, maker_rate=0.0, source="clob_market"
-    )
+        raise VenuePayloadError("trade payload missing price/size", raw=raw)
+    fee_rate_bps = raw.get("fee_rate_bps")
+    if fee_rate_bps is None:
+        schedule = category_fee_schedule(None)
+        fee_source = "category_estimate"
+    else:
+        schedule = FeeSchedule(
+            taker_rate=_fee_rate_from_bps(fee_rate_bps, field="fee_rate_bps"),
+            maker_rate=0.0,
+            source="clob_market",
+        )
+        fee_source = "venue_rate"
     liquidity: Liquidity = "taker"
     fee = PolymarketFeeModel().fee(
         price=price, size_contracts=size, liquidity=liquidity, schedule=schedule
     )
     order_id = str(raw.get("taker_order_id") or raw.get("id") or "")
     ts = _try_epoch(raw.get("match_time") or raw.get("last_update") or raw.get("timestamp"))
-    return Fill(
-        venue="polymarket",
-        order_id=order_id,
-        price=price,
-        size=size,
-        fee=fee,
-        ts=ts or utcnow(),
-        liquidity=liquidity,
-        metadata={"market": raw.get("market"), "asset_id": raw.get("asset_id")},
-    )
+    if ts is None:
+        raise VenuePayloadError(
+            "trade payload has no parseable timestamp (match_time/last_update/"
+            "timestamp); it cannot be placed on either side of a `since` bound",
+            raw=raw,
+        )
+    try:
+        return Fill(
+            venue="polymarket",
+            order_id=order_id,
+            price=price,
+            size=size,
+            fee=fee,
+            ts=ts,
+            liquidity=liquidity,
+            metadata={
+                "market": raw.get("market"),
+                "asset_id": raw.get("asset_id"),
+                "fee_source": fee_source,
+            },
+        )
+    except ValueError as exc:
+        raise VenuePayloadError(
+            f"polymarket trade did not validate: {exc}", raw=raw
+        ) from exc
 
 
 def _try_epoch(value: object) -> datetime | None:

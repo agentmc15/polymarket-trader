@@ -26,6 +26,18 @@ T05's fee model raises on an out-of-domain price), but reading ``4.5``
 cents as ``0.45`` instead of ``0.045`` is NOT caught by anything
 downstream and would fabricate a 40-point edge against Polymarket.
 
+The mirror image of that — a fixed-point DOLLAR STRING arriving under a
+BARE (legacy cents) key, ``{"yes": [["0.42", 120]]}`` or
+``{"balance": "1234.56"}`` — is equally invisible to every validator
+downstream, because ``0.42 / 100 = 0.0042`` is still a valid probability
+and still a valid dollar amount, merely 100x too small. `_to_dollars`
+rejects exactly that shape (T44), using the venue's OWN convention as
+the discriminator: the ``*_dollars`` fields are STRINGS, the legacy
+cents fields are NUMBERS. What it deliberately does NOT do is guess from
+magnitude — a bare key carrying the number ``0.40`` is a legal 0.4-cent
+price on a market whose tick is a tenth of a cent, and inventing a
+threshold there would reject real quotes.
+
 THE BOOK IS BIDS-ONLY — READ THIS BEFORE TOUCHING `build_book`
 --------------------------------------------------------------
 Kalshi's ``GET /markets/{ticker}/orderbook`` returns RESTING BIDS ON
@@ -80,6 +92,7 @@ non-textual guarantee is the GET-only `_get` above, which no amount of
 grep evasion could fake, plus `tests/venues/test_kalshi_adapter.py::
 test_the_read_adapter_cannot_place_or_cancel_orders`.
 """
+import logging
 import math
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -113,6 +126,8 @@ from app.venues.types import (
     VenueId,
     VenueMarket,
 )
+
+logger = logging.getLogger(__name__)
 
 #: `/portfolio` path root — see the module docstring's note on why the
 #: four portfolio paths below are composed rather than written out.
@@ -394,8 +409,8 @@ class KalshiAdapter(BaseAdapter):
             if cursor:
                 params["cursor"] = cursor
             body = await self._get("/markets", params=params)
-            page = _require_list_of_dicts(
-                body.get("markets", []), context="kalshi /markets"
+            page = _require_envelope_list(
+                body, ("markets",), context="kalshi /markets"
             )
             payloads.extend(page)
             cursor = str(body.get("cursor") or "")
@@ -477,38 +492,67 @@ class KalshiAdapter(BaseAdapter):
             status: MarketStatus = "resolved"
             result: str | None = result_raw
         else:
-            status = _MARKET_STATUS_FROM_PAYLOAD.get(
-                str(raw.get("status") or "").strip().lower(), "open"
-            )
+            status_text = str(raw.get("status") or "").strip().lower()
+            mapped = _MARKET_STATUS_FROM_PAYLOAD.get(status_text)
+            if mapped is None and status_text:
+                # NOT fatal: venues add lifecycle states, and refusing to
+                # parse the whole catalog over one new word is its own
+                # outage. But defaulting to "open" makes an unknown state
+                # look tradable, so it is at least said out loud (T44).
+                logger.warning(
+                    "venue",
+                    extra={
+                        "event": "kalshi_unknown_market_status",
+                        "venue": "kalshi",
+                        "market_id": market_id,
+                        "status": status_text,
+                        "assumed": "open",
+                    },
+                )
+            status = mapped if mapped is not None else "open"
             result = None
         rules_parts = [
             str(raw.get(key) or "").strip()
             for key in ("rules_primary", "rules_secondary")
         ]
         rules_text = "\n\n".join(part for part in rules_parts if part)
-        return VenueMarket(
-            venue="kalshi",
-            market_id=market_id,
-            event_id=str(event_ticker) if event_ticker else None,
-            question=str(raw.get("title") or ""),
-            outcomes=("YES", "NO"),
-            outcome_ids={"YES": market_id, "NO": market_id},
-            rules_text=rules_text,
-            resolution_source=None,
-            close_time=close_time,
-            expected_settle_time=_parse_timestamp(raw.get("expected_expiration_time")),
-            status=status,
-            result=result,
-            tick_size=_tick_size_at(
-                raw.get("price_level_structure"), _current_price(raw)
-            ),
-            min_size=_to_float(
-                raw.get("minimum_order_size", raw.get("min_order_size")),
-                default=_DEFAULT_MIN_SIZE,
-            ),
-            fee=self._fee_schedule(raw),
-            raw=raw,
-        )
+        try:
+            return VenueMarket(
+                venue="kalshi",
+                market_id=market_id,
+                event_id=str(event_ticker) if event_ticker else None,
+                question=str(raw.get("title") or ""),
+                outcomes=("YES", "NO"),
+                outcome_ids={"YES": market_id, "NO": market_id},
+                rules_text=rules_text,
+                resolution_source=None,
+                close_time=close_time,
+                expected_settle_time=_parse_timestamp(
+                    raw.get("expected_expiration_time")
+                ),
+                status=status,
+                result=result,
+                tick_size=_tick_size_at(
+                    raw.get("price_level_structure"), _current_price(raw)
+                ),
+                min_size=_to_float(
+                    raw.get("minimum_order_size", raw.get("min_order_size")),
+                    default=_DEFAULT_MIN_SIZE,
+                ),
+                fee=self._fee_schedule(raw),
+                raw=raw,
+            )
+        except ValueError as exc:
+            # `VenueMarket`'s own validators speak in field names
+            # (`min_size must be a finite value >= 0`) but raise a BARE
+            # `ValueError`, which is not a `VenueError` and so is not in
+            # `app.services.scanner.VENUE_READ_FAULTS` — one negative
+            # `minimum_order_size` would abort a whole scan pass instead
+            # of skipping that venue's listing (T44). Re-raised as the
+            # typed error, naming the venue and the market.
+            raise VenuePayloadError(
+                f"kalshi market {market_id} did not validate: {exc}", raw=raw
+            ) from exc
 
     def _fee_schedule(self, raw: dict[str, Any]) -> FeeSchedule:
         """Build a market's `FeeSchedule`, honoring an active fee waiver.
@@ -590,8 +634,18 @@ class KalshiAdapter(BaseAdapter):
         body = await self._get(_BALANCE_PATH, require_auth=True)
         available = _usd_from(body, "balance")
         if available is None:
-            raise VenuePayloadError("kalshi balance payload missing balance", raw=body)
-        return Balance(venue="kalshi", available=available, locked=0.0)
+            raise VenuePayloadError(
+                "kalshi balance payload carries neither balance_dollars nor a "
+                "numeric balance (integer cents)",
+                raw=body,
+            )
+        try:
+            return Balance(venue="kalshi", available=available, locked=0.0)
+        except ValueError as exc:
+            raise VenuePayloadError(
+                f"kalshi balance {available!r} is not a usable USD amount: {exc}",
+                raw=body,
+            ) from exc
 
     async def get_positions(self) -> list[Position]:
         """Fetch open positions.
@@ -612,19 +666,31 @@ class KalshiAdapter(BaseAdapter):
             VenueAuthError: If Kalshi credentials are not configured.
         """
         body = await self._get(_POSITIONS_PATH, require_auth=True)
-        entries = _require_list_of_dicts(
-            body.get("market_positions", body.get("positions", [])),
+        entries = _require_envelope_list(
+            body,
+            ("market_positions", "positions"),
             context="kalshi /portfolio positions",
         )
         positions: list[Position] = []
+        unusable = 0
         for entry in entries:
             ticker = entry.get("ticker")
             signed = _try_float(entry.get("position"))
-            if not ticker or signed is None or signed == 0:
+            if not ticker or signed is None:
+                unusable += 1
+                _log_skipped("position", "ticker/position missing or non-numeric")
+                continue
+            if signed == 0:
+                # A flat row is a real, ordinary state (a settled market
+                # stays in the listing), NOT a parse failure.
                 continue
             size = abs(signed)
             exposure = _usd_from(entry, "market_exposure")
             if exposure is None:
+                unusable += 1
+                _log_skipped(
+                    "position", f"{ticker}: no market_exposure to derive avg_price from"
+                )
                 continue
             try:
                 positions.append(
@@ -636,8 +702,12 @@ class KalshiAdapter(BaseAdapter):
                         avg_price=exposure / size,
                     )
                 )
-            except ValueError:
-                continue
+            except ValueError as exc:
+                unusable += 1
+                _log_skipped("position", f"{ticker}: {exc}")
+        _require_not_all_dropped(
+            entries, kept=len(positions), unusable=unusable, context="kalshi positions"
+        )
         return positions
 
     async def get_open_orders(self) -> list[OrderAck]:
@@ -652,15 +722,23 @@ class KalshiAdapter(BaseAdapter):
         body = await self._get(
             _RESTING_ORDERS_PATH, params={"status": "resting"}, require_auth=True
         )
-        entries = _require_list_of_dicts(
-            body.get("orders", []), context="kalshi resting orders"
+        entries = _require_envelope_list(
+            body, ("orders",), context="kalshi resting orders"
         )
         acks: list[OrderAck] = []
+        unusable = 0
         for entry in entries:
             try:
                 acks.append(parse_order_ack(entry))
-            except (ValueError, VenuePayloadError):
-                continue
+            except (ValueError, VenuePayloadError) as exc:
+                unusable += 1
+                _log_skipped("order", str(exc))
+        _require_not_all_dropped(
+            entries,
+            kept=len(acks),
+            unusable=unusable,
+            context="kalshi resting orders",
+        )
         return acks
 
     async def get_fills(self, since: datetime) -> list[Fill]:
@@ -687,12 +765,22 @@ class KalshiAdapter(BaseAdapter):
         """
         ensure_aware(since)
         body = await self._get(_FILLS_PATH, require_auth=True)
-        entries = _require_list_of_dicts(body.get("fills", []), context="kalshi fills")
+        entries = _require_envelope_list(body, ("fills",), context="kalshi fills")
         fills: list[Fill] = []
+        parsed = 0
+        unusable = 0
         for entry in entries:
             fill = self._parse_fill(entry)
-            if fill is not None and fill.ts >= since:
+            if fill is None:
+                unusable += 1
+                _log_skipped("fill", "price/size/timestamp missing or unparseable")
+                continue
+            parsed += 1
+            if fill.ts >= since:
                 fills.append(fill)
+        _require_not_all_dropped(
+            entries, kept=parsed, unusable=unusable, context="kalshi fills"
+        )
         return fills
 
     def _parse_fill(self, raw: dict[str, Any]) -> Fill | None:
@@ -701,8 +789,27 @@ class KalshiAdapter(BaseAdapter):
         UNVERIFIED SHAPE: PLAN.md §3 pins the fills ENDPOINT but not the
         fill object's fields, so key names here are best-effort and
         every one of them is optional-with-a-fallback.
+
+        Raises:
+            VenuePayloadError: If `side` is PRESENT but is neither
+                `"yes"` nor `"no"` (T44). An absent side still defaults
+                to YES — that is the documented optional-with-a-fallback
+                rule — but a side spelled in some other vocabulary
+                (`"bid"`/`"ask"`, as the ORDER payloads use) must not be
+                silently read as YES: it would price a NO fill from
+                `yes_price` and label it `outcome="YES"`, and both the
+                price and the position it lands in would be wrong with
+                nothing said.
         """
-        side = str(raw.get("side") or "yes").strip().lower()
+        side_raw = raw.get("side")
+        side = str(side_raw or "yes").strip().lower()
+        if side not in ("yes", "no"):
+            raise VenuePayloadError(
+                f"kalshi fill: side {side_raw!r} is neither 'yes' nor 'no' — the "
+                "outcome it names decides which price field is read, so it cannot "
+                "be guessed",
+                raw=raw,
+            )
         outcome = "NO" if side == "no" else "YES"
         price = _usd_from(raw, "no_price" if outcome == "NO" else "yes_price")
         if price is None:
@@ -813,6 +920,95 @@ def _require_list_of_dicts(value: object, *, context: str) -> list[dict[str, Any
     return items
 
 
+def _log_skipped(kind: str, reason: str) -> None:
+    """Log one skipped payload entry at WARNING (T44).
+
+    A per-entry skip is the right behaviour — one malformed row must not
+    cost the whole read — but doing it in silence is what makes a schema
+    change undiagnosable. Carries no payload body, only the reason.
+    """
+    logger.warning(
+        "venue",
+        extra={
+            "event": f"kalshi_{kind}_entry_skipped",
+            "venue": "kalshi",
+            "reason": reason,
+        },
+    )
+
+
+def _require_not_all_dropped(
+    entries: list[dict[str, Any]], *, kept: int, unusable: int, context: str
+) -> None:
+    """Raise if the venue sent entries and NONE of them survived parsing.
+
+    WHY (T44). Per-entry skipping is deliberately tolerant, but "every
+    row failed" is not a bad row, it is a disagreement about the schema —
+    and the result of tolerating it is an empty list, which
+    `app.execution.reconcile` reads as "the venue holds nothing" and acts
+    on (a raised read, by contrast, it treats as "we do not know"). A
+    whole page of cents-priced orders, or of orders under a renamed id
+    key, would otherwise report every live order as gone.
+
+    Args:
+        entries: The raw entries the venue returned.
+        kept: How many parsed successfully.
+        unusable: How many failed to parse (entries legitimately skipped
+            for a non-parse reason — a flat position — are in neither).
+        context: Endpoint name, for the error message.
+
+    Raises:
+        VenuePayloadError: If `entries` is non-empty, nothing was kept,
+            and every entry was unusable.
+    """
+    if entries and kept == 0 and unusable == len(entries):
+        raise VenuePayloadError(
+            f"{context}: the venue returned {len(entries)} entr"
+            f"{'y' if len(entries) == 1 else 'ies'} and NONE parsed — reporting "
+            "an empty result would be indistinguishable from the venue holding "
+            "nothing",
+            raw=entries,
+        )
+
+
+def _require_envelope_list(
+    body: dict[str, Any], keys: tuple[str, ...], *, context: str
+) -> list[dict[str, Any]]:
+    """Return the list under the first present key in `keys`.
+
+    WHY THE KEY MUST BE PRESENT (T44). Every one of these endpoints used
+    to read `body.get("<key>", [])`, so a RENAMED key produced an empty
+    list and no error — indistinguishable from "you have no positions /
+    no resting orders / no fills / no markets". That difference is
+    load-bearing downstream: `app.execution.reconcile` treats a read that
+    RAISED as "we do not know" and refuses to conclude anything, but
+    treats a successful empty read as "the venue has nothing" and acts on
+    it. So a renamed key would have quietly told reconciliation that
+    every open order was gone. An empty list under a PRESENT key still
+    means exactly what it says and is passed through untouched.
+
+    Args:
+        body: The decoded response object.
+        keys: Accepted spellings, in precedence order.
+        context: Endpoint name, for the error message.
+
+    Returns:
+        list[dict[str, Any]]: The entries, possibly empty.
+
+    Raises:
+        VenuePayloadError: If none of `keys` is present, or the value
+            under the one that is present is not a list of objects.
+    """
+    for key in keys:
+        if key in body:
+            return _require_list_of_dicts(body[key], context=f"{context} ({key})")
+    raise VenuePayloadError(
+        f"{context}: response carries none of {keys} — an absent key is not an "
+        "empty result, and must not be read as one",
+        raw=body,
+    )
+
+
 def _try_float(value: object) -> float | None:
     """Best-effort finite `float(value)`, `None` on failure/`None`/non-finite."""
     if value is None or isinstance(value, bool):
@@ -830,7 +1026,7 @@ def _to_float(value: object, *, default: float) -> float:
     return default if parsed is None else parsed
 
 
-def _to_dollars(value: object, *, is_dollars: bool) -> float | None:
+def _to_dollars(value: object, *, is_dollars: bool, field: str) -> float | None:
     """THE single cents/dollars funnel for this venue (module docstring).
 
     Args:
@@ -842,6 +1038,7 @@ def _to_dollars(value: object, *, is_dollars: bool) -> float | None:
             guessed from the value's magnitude — a legacy `1` cent and a
             dollar-string `"1"` are both valid and mean 100x different
             things.
+        field: The payload key `value` came from, for the error message.
 
     Returns:
         float | None: A probability in `[0,1]`, or `None` if `value` is
@@ -849,7 +1046,36 @@ def _to_dollars(value: object, *, is_dollars: bool) -> float | None:
             so the caller's `BookLevel`/`Fill` construction rejects them
             loudly rather than being silently clamped into a plausible
             price.
+
+    Raises:
+        VenuePayloadError: If a BARE (legacy integer-cents) key carries a
+            fixed-point dollar STRING — `{"yes": [["0.42", 120]]}`,
+            `{"balance": "1234.56"}`. That is the ONE cents/dollars
+            divergence nothing downstream can catch (T44): dividing
+            `"0.42"` by 100 yields `0.0042`, still a perfectly valid
+            probability and a perfectly valid dollar amount, just 100x
+            too small — a 42c market quoted at 0.42c fabricates an
+            enormous edge against Polymarket, and `$1234.56` of capital
+            read as `$12.34` silently under-sizes every order. The
+            discriminator is the venue's own convention (module
+            docstring): the `_dollars` fields are STRINGS, the legacy
+            cents fields are NUMBERS. A string that IS a whole number
+            (`"42"`) is still read as cents, because on that value the
+            two readings agree about the digits and only the type drifted.
+            NOT detectable, and deliberately not guessed at: a bare key
+            carrying the NUMBER `0.40`, which is a legal 0.4-cent price
+            on a market whose tick is a tenth of a cent.
     """
+    if not is_dollars and isinstance(value, str):
+        parsed_text = _try_float(value)
+        if parsed_text is not None and not float(parsed_text).is_integer():
+            raise VenuePayloadError(
+                f"kalshi {field}: a bare (legacy) key must carry INTEGER CENTS as a "
+                f"number, got the fixed-point dollar string {value!r} — read as "
+                f"cents that is {parsed_text / 100.0!r}, 100x too small. Send it "
+                f"as {field}_dollars if it is dollars.",
+                raw=value,
+            )
     parsed = _try_float(value)
     if parsed is None:
         return None
@@ -863,6 +1089,14 @@ def _usd_from(payload: dict[str, Any], base_key: str) -> float | None:
     `_dollars` suffix means a fixed-point dollar string; the bare key is
     legacy integer cents. `{base}_dollars` wins when both are present.
 
+    A `*_dollars` key carrying something OTHER than a string is logged at
+    WARNING and still read as dollars (T44). It cannot be rejected: for a
+    price the `[0,1]` validators catch a cents value anyway, and for an
+    account amount (`balance`, `market_exposure`) `123456` is equally
+    plausible as `$123,456.00` and as `1234.56` in cents, so guessing
+    would be exactly the fabrication this module exists to prevent. The
+    log line is what makes the ambiguity visible instead of silent.
+
     Args:
         payload: The object to read from.
         base_key: Field name WITHOUT the `_dollars` suffix, e.g.
@@ -872,11 +1106,27 @@ def _usd_from(payload: dict[str, Any], base_key: str) -> float | None:
         float | None: The amount in USD (or, for a price field, a
             probability — the two are the same number on a venue whose
             contracts pay $1.00), or `None` if neither key is present.
+
+    Raises:
+        VenuePayloadError: If a bare key carries a dollar string — see
+            `_to_dollars`.
     """
-    if f"{base_key}_dollars" in payload:
-        return _to_dollars(payload[f"{base_key}_dollars"], is_dollars=True)
+    dollars_key = f"{base_key}_dollars"
+    if dollars_key in payload:
+        value = payload[dollars_key]
+        if value is not None and not isinstance(value, str):
+            logger.warning(
+                "venue",
+                extra={
+                    "event": "kalshi_dollars_field_not_a_string",
+                    "venue": "kalshi",
+                    "field": dollars_key,
+                    "python_type": type(value).__name__,
+                },
+            )
+        return _to_dollars(value, is_dollars=True, field=dollars_key)
     if base_key in payload:
-        return _to_dollars(payload[base_key], is_dollars=False)
+        return _to_dollars(payload[base_key], is_dollars=False, field=base_key)
     return None
 
 
@@ -983,9 +1233,21 @@ def _tick_size_at(structure: object, price: float) -> float:
 
 
 def _first_usd(payload: dict[str, Any], base_keys: tuple[str, ...]) -> float | None:
-    """Return the first present `_usd_from` value among `base_keys`."""
+    """Return the first present `_usd_from` value among `base_keys`.
+
+    A `VenuePayloadError` from the cents/dollars funnel is swallowed HERE
+    and only here (T44), because this helper serves ONLY `_tick_size_at`,
+    whose shape is UNVERIFIED and whose documented contract is to fall
+    back to `_DEFAULT_TICK_SIZE` on anything it does not recognize. A
+    tick size is not money: getting it wrong makes an order off-tick and
+    the venue rejects it, which is loud. Every money field goes through
+    `_usd_from` directly and stays loud.
+    """
     for base_key in base_keys:
-        value = _usd_from(payload, base_key)
+        try:
+            value = _usd_from(payload, base_key)
+        except VenuePayloadError:
+            continue
         if value is not None:
             return value
     return None
@@ -1027,7 +1289,9 @@ def _levels(raw: object, *, is_dollars: bool, context: str) -> list[BookLevel]:
                 f"kalshi book side {context} level was not a [price, size] pair",
                 raw=raw,
             )
-        price = _to_dollars(pair[0], is_dollars=is_dollars)
+        price = _to_dollars(
+            pair[0], is_dollars=is_dollars, field=f"book side {context} price"
+        )
         size = _try_float(pair[1])
         if price is None or size is None:
             raise VenuePayloadError(
@@ -1170,12 +1434,28 @@ def parse_order_ack(raw: dict[str, Any]) -> OrderAck:
         body.get("remaining_count", body.get("resting_count")), default=0.0
     )
     status_raw = str(body.get("status") or "resting").strip().lower()
+    mapped_status = _ORDER_STATUS.get(status_raw)
+    if mapped_status is None:
+        # Falling back to "open" is the conservative reading (the venue
+        # may still be holding the order), and refusing to parse an ack
+        # over a new status word would be worse. Logged so the operator
+        # can see WHICH word we did not know (T44).
+        logger.warning(
+            "order",
+            extra={
+                "event": "kalshi_unknown_order_status",
+                "venue": "kalshi",
+                "order_id": order_id,
+                "status": status_raw,
+                "assumed": "open",
+            },
+        )
     try:
         return OrderAck(
             venue="kalshi",
             order_id=order_id,
             client_order_id=str(body.get("client_order_id") or order_id),
-            status=_ORDER_STATUS.get(status_raw, "open"),
+            status=mapped_status if mapped_status is not None else "open",
             filled_size=filled,
             remaining_size=remaining,
             avg_fill_price=_usd_from(body, "average_fill_price"),

@@ -24,6 +24,7 @@ fixtures under `tests/fixtures/polymarket/` (GUARDRAILS.md §1.4: no
 network to venues, ever, from a test).
 """
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -469,3 +470,653 @@ async def test_get_fills_raises_venue_auth_error_without_key() -> None:
 
     with pytest.raises(VenueAuthError):
         await adapter.get_fills(datetime(2026, 1, 1, tzinfo=UTC))
+
+
+# ---------------------------------------------------------------------------
+# T44. Divergence: what happens when a real payload disagrees with the pin.
+#
+# Every case below was CHARACTERIZED against the shipped adapter first
+# (through `httpx.MockTransport` and a stubbed CLOB client -- never a
+# venue, GUARDRAILS.md §1.4) and then split in two: the ones that
+# produced a plausible-looking WRONG number in silence, which now raise,
+# and the ones that were already correct or already loud, which are
+# pinned so a later "hardening" pass cannot turn tolerance into
+# brittleness.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClobClient:
+    """The three `py_clob_client` reads this adapter makes, canned.
+
+    Lets the credentialed methods be exercised with divergent payloads
+    without a network call, a real client, or a real credential
+    (GUARDRAILS.md §1.3/§1.4).
+    """
+
+    def __init__(
+        self,
+        *,
+        balance: Any = None,
+        orders: Any = None,
+        trades: Any = None,
+    ) -> None:
+        self._balance = {} if balance is None else balance
+        self._orders = [] if orders is None else orders
+        self._trades = [] if trades is None else trades
+
+    def get_balance_allowance(self, params: Any) -> Any:  # noqa: ARG002
+        return self._balance
+
+    def get_orders(self, params: Any) -> Any:  # noqa: ARG002
+        return self._orders
+
+    def get_trades(self, params: Any) -> Any:  # noqa: ARG002
+        return self._trades
+
+
+class _FakeWrapper:
+    """Stands in for `ClobClientWrapper`, exposing only `.client`."""
+
+    def __init__(self, client: _FakeClobClient) -> None:
+        self.client = client
+
+
+def credentialed_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    balance: Any = None,
+    orders: Any = None,
+    trades: Any = None,
+) -> PolymarketAdapter:
+    """Build an adapter whose credentialed reads answer from `_FakeClobClient`.
+
+    The private key is an all-zeros placeholder (GUARDRAILS.md §1.3:
+    fixtures use `0x` + zeros, never a real key) and exists only so
+    `_ensure_clob_wrapper`'s credential gate passes; the wrapper it would
+    otherwise build is replaced outright, so `py_clob_client` is never
+    constructed and nothing is signed or sent. The HTTP transport is the
+    refusing one -- if any of these paths ever reaches the network, the
+    test fails rather than escaping.
+    """
+    from pydantic import SecretStr
+
+    from app.config import settings
+
+    monkeypatch.setattr(
+        settings, "polymarket_private_key", SecretStr("0x" + "0" * 64)
+    )
+    adapter = PolymarketAdapter(transport=_refusing_transport())
+    monkeypatch.setattr(
+        adapter,
+        "_clob_wrapper",
+        _FakeWrapper(_FakeClobClient(balance=balance, orders=orders, trades=trades)),
+    )
+    return adapter
+
+
+def _gamma_with(**overrides: Any) -> list[dict[str, Any]]:
+    """The Gamma fixture list with market a001's payload overridden.
+
+    A key whose value is `_ABSENT` is DELETED rather than overridden, so
+    "the venue stopped sending this field" can be expressed.
+    """
+    market = dict(GAMMA_MARKETS[0])
+    for key, value in overrides.items():
+        if value is _ABSENT:
+            market.pop(key, None)
+        else:
+            market[key] = value
+    return [market, *GAMMA_MARKETS[1:]]
+
+
+#: Sentinel for `_gamma_with`: delete this key instead of setting it.
+_ABSENT = object()
+
+
+# -- Market metadata --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_market_with_no_outcomes_is_refused() -> None:
+    """A renamed/absent `outcomes` must not list a market with none.
+
+    It used to default to `[]`, producing a `VenueMarket` with
+    `outcomes=()` and `outcome_ids={}` -- a market the scanner would
+    happily rank and the matcher would happily read, that cannot be
+    quoted or traded, with nothing raised. The shared contract suite
+    already asserts every listed market HAS outcomes; this stops the
+    adapter manufacturing one that does not.
+    """
+    adapter = _adapter(gamma_markets=_gamma_with(outcomes=_ABSENT))
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_market(MARKET_A001)
+
+    assert "outcomes" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_string_boolean_does_not_mark_a_live_market_resolved() -> None:
+    """`"resolved": "false"` is FALSE, not `bool("false") is True`.
+
+    This is the whole "a string where a bool was assumed" class, and its
+    old behaviour was maximally quiet: every live market would have come
+    back `status="resolved"`, been filtered out of every `status="open"`
+    scan, and produced an empty opportunity list that looks exactly like
+    a quiet market.
+    """
+    adapter = _adapter(gamma_markets=_gamma_with(resolved="false", closed="false"))
+
+    market = await adapter.get_market(MARKET_A001)
+
+    assert market.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_a_boolean_flag_that_is_not_a_boolean_is_refused() -> None:
+    """A flag we cannot read is an error, not a guess."""
+    adapter = _adapter(gamma_markets=_gamma_with(resolved="maybe"))
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_market(MARKET_A001)
+
+    assert "resolved" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_null_question_does_not_become_the_string_none() -> None:
+    """`str(payload.get("question", ""))` on a null returned "None".
+
+    A market titled `"None"` is displayed, matched and scored as if that
+    were its question -- untrusted venue text (GUARDRAILS.md §6) that the
+    venue never sent.
+    """
+    adapter = _adapter(gamma_markets=_gamma_with(question=None))
+
+    market = await adapter.get_market(MARKET_A001)
+
+    assert market.question == ""
+
+
+@pytest.mark.asyncio
+async def test_a_market_the_domain_type_rejects_is_a_venue_error() -> None:
+    """A CLOB `tick_size: 0` raises `VenuePayloadError`, not a bare `ValueError`.
+
+    `VenueMarket`'s validator names the field but raises a plain
+    `ValueError`, which is not a `VenueError` and so is outside
+    `app.services.scanner.VENUE_READ_FAULTS`: one such market would abort
+    a whole scan pass instead of being skipped.
+    """
+    adapter = _adapter(clob_market=dict(CLOB_MARKET, tick_size=0))
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_market(MARKET_A001)
+
+    assert "tick_size" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_fee_rate_where_basis_points_were_expected_is_refused() -> None:
+    """`taker_base_fee: 0.02` is a RATE; /10_000 would make it 0.000002.
+
+    A fee of two parts per million is not a plausible fee, it is a unit
+    change -- and it is the input that makes every marginal edge look
+    profitable. Polymarket's analogue of the Kalshi cents/dollars slip.
+    """
+    adapter = _adapter(clob_market=dict(CLOB_MARKET, taker_base_fee=0.02))
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_market(MARKET_A001)
+
+    assert "taker_base_fee" in str(excinfo.value)
+    assert "BASIS POINTS" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_zero_fee_is_still_a_waiver_not_an_error() -> None:
+    """TOLERANCE PIN. `taker_base_fee: 0` is a real, declared fee waiver.
+
+    The unit guard fires on `(0, 1)` EXCLUSIVE precisely so that a whole
+    zero -- which the adapter has always treated as an authoritative
+    waiver, `is not None` rather than truthiness -- keeps working.
+    """
+    adapter = _adapter(clob_market=dict(CLOB_MARKET, taker_base_fee=0))
+
+    market = await adapter.get_market(MARKET_A001)
+
+    assert market.fee.source == "clob_market"
+    assert market.fee.taker_rate == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_a_string_encoded_basis_point_fee_is_still_accepted() -> None:
+    """TOLERANCE PIN. `"200"` is 200 bps -- a type change, not a unit change."""
+    adapter = _adapter(clob_market=dict(CLOB_MARKET, taker_base_fee="200"))
+
+    market = await adapter.get_market(MARKET_A001)
+
+    assert market.fee.taker_rate == pytest.approx(0.02)  # 200 bps / 10_000
+
+
+@pytest.mark.asyncio
+async def test_extra_unknown_keys_are_tolerated_everywhere() -> None:
+    """TOLERANCE PIN. Venues ADD fields; that must never be an outage."""
+    adapter = _adapter(
+        gamma_markets=_gamma_with(brand_new_field={"nested": [1, 2]}),
+        clob_book=dict(CLOB_BOOK, unknown_top_level="hello"),
+    )
+
+    market = await adapter.get_market(MARKET_A001)
+    book = await adapter.get_book(MARKET_A001, "Yes")
+
+    assert market.market_id == MARKET_A001
+    assert book.bids[0].price == pytest.approx(0.40)
+
+
+# -- The book ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_book_timestamp_in_seconds_is_not_dated_to_1970() -> None:
+    """`1767225600` (seconds) must not be divided by 1000 a second time.
+
+    PLAN.md §3 pins milliseconds, and the old parser hard-divided by
+    1000: a seconds-valued epoch produced 1970-01-21, a 56-year-old
+    "snapshot" with nothing raised. Both `_try_epoch` here and Kalshi's
+    `_parse_timestamp` already distinguish the two by magnitude; the book
+    parser now does too, so the divergence produces the CORRECT time
+    rather than an error.
+    """
+    adapter = _adapter(clob_book=dict(CLOB_BOOK, timestamp=1767225600))
+
+    book = await adapter.get_book(MARKET_A001, "Yes")
+
+    assert book.ts == datetime(2026, 1, 1, tzinfo=UTC)
+
+
+@pytest.mark.asyncio
+async def test_a_book_with_no_parseable_timestamp_is_refused() -> None:
+    """A book with no read time cannot be aged, and `now()` would lie."""
+    adapter = _adapter(clob_book={k: v for k, v in CLOB_BOOK.items() if k != "timestamp"})
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_book(MARKET_A001, "Yes")
+
+    assert "timestamp" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_book_side_is_tolerated() -> None:
+    """TOLERANCE PIN. A one-sided book is a real, common venue state."""
+    adapter = _adapter(clob_book=dict(CLOB_BOOK, bids=[]))
+
+    book = await adapter.get_book(MARKET_A001, "Yes")
+
+    assert book.bids == ()
+    assert book.asks[0].price == pytest.approx(0.42)
+
+
+@pytest.mark.asyncio
+async def test_a_market_without_token_ids_names_the_field_it_is_missing() -> None:
+    """The error must point at `clobTokenIds`, not at the caller's outcome.
+
+    Without token ids the book endpoint (keyed by `token_id`) cannot be
+    addressed at all, and the old message -- "unknown outcome 'Yes'" --
+    sent the reader looking for a typo in their own call.
+    """
+    adapter = _adapter(gamma_markets=_gamma_with(clobTokenIds=_ABSENT))
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_book(MARKET_A001, "Yes")
+
+    assert "clobTokenIds" in str(excinfo.value)
+
+
+# -- Credentialed reads -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_balance_payload_without_an_amount_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing `balance` used to report a funded account as $0.00.
+
+    `_to_float(..., default=0.0)` produced a number no caller can tell
+    from a real zero balance, on the one field that decides how much
+    capital exists. Kalshi's `get_balance` has always raised here.
+    """
+    adapter = credentialed_adapter(monkeypatch, balance={"asset_type": "COLLATERAL"})
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_balance()
+
+    assert "balance" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_string_balance_is_still_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TOLERANCE PIN. The CLOB sends numbers as decimal strings."""
+    adapter = credentialed_adapter(monkeypatch, balance={"balance": "1234.56"})
+
+    balance = await adapter.get_balance()
+
+    assert balance.available == pytest.approx(1234.56)
+
+
+@pytest.mark.asyncio
+async def test_a_cents_priced_trade_history_does_not_become_a_dollar_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trade priced `42` must not net to a position at `avg_price=1.0`.
+
+    The old derivation CLAMPED (`min(max(x, 0.0), 1.0)`), so an
+    out-of-domain price -- a cents-encoded payload, the exact failure
+    NOTES.md records as a -$17,150 fee -- produced a real-looking cost
+    basis of $1.00 per contract on a position used for sizing, silently.
+    """
+    adapter = credentialed_adapter(
+        monkeypatch,
+        trades=[
+            {"market": "m1", "asset_id": "t1", "side": "BUY", "price": 42, "size": 10}
+        ],
+    )
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_positions()
+
+    assert "polymarket" in str(excinfo.value)
+    assert "42.0" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_trade_history_that_never_parses_is_not_reported_as_flat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two trades in, zero positions out, no error -- that was the answer."""
+    adapter = credentialed_adapter(
+        monkeypatch,
+        trades=[{"market": "m1"}, {"asset_id": "t1"}],
+    )
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_positions()
+
+    assert "NONE parsed" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_closed_out_position_is_still_reported_as_no_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TOLERANCE PIN. Trades that NET to zero are not a parse failure.
+
+    The drop-everything guard must fire on a schema disagreement, not on
+    an account that simply closed what it opened.
+    """
+    adapter = credentialed_adapter(
+        monkeypatch,
+        trades=[
+            {"market": "m1", "asset_id": "t1", "side": "BUY", "price": 0.4, "size": 10},
+            {"market": "m1", "asset_id": "t1", "side": "SELL", "price": 0.5, "size": 10},
+        ],
+    )
+
+    assert await adapter.get_positions() == []
+
+
+@pytest.mark.asyncio
+async def test_a_trade_with_an_unreadable_side_is_not_netted_as_a_sell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`side` was `"BUY"` or ELSE-A-SELL, so an unknown word erased a buy."""
+    adapter = credentialed_adapter(
+        monkeypatch,
+        trades=[
+            {
+                "market": "m1",
+                "asset_id": "t1",
+                "side": "buy_yes",
+                "price": 0.4,
+                "size": 10,
+            }
+        ],
+    )
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_positions()
+
+    assert "NONE parsed" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_an_order_entry_without_an_id_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ack with an empty `order_id` is indexed under "" by reconcile.
+
+    Kalshi's `parse_order_ack` has always refused this; Polymarket's
+    built the ack anyway, with `order_id=""` and
+    `client_order_id="unknown"`.
+    """
+    adapter = credentialed_adapter(monkeypatch, orders=[{"status": "open"}])
+
+    with pytest.raises(VenuePayloadError):
+        await adapter.get_open_orders()
+
+
+@pytest.mark.asyncio
+async def test_a_present_but_unreadable_size_is_not_read_as_unfilled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`size_matched: "abc"` used to become `0.0` -- a filled order, untouched.
+
+    `_try_float(...) or 0.0` could not tell "the venue did not send this"
+    from "the venue sent something I cannot read", so a partly-filled
+    order came back as `filled_size=0.0`: a number reconciliation acts
+    on. The entry is now refused, naming the field, which `get_open_orders`
+    logs and skips (a second, well-formed order still parses -- one bad
+    row is not an outage).
+    """
+    adapter = credentialed_adapter(
+        monkeypatch,
+        orders=[
+            {"id": "o1", "original_size": "10", "size_matched": "abc"},
+            {"id": "o2", "original_size": "10", "size_matched": "4"},
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.venues.polymarket.adapter"):
+        acks = await adapter.get_open_orders()
+
+    assert [a.order_id for a in acks] == ["o2"]
+    assert acks[0].filled_size == pytest.approx(4.0)
+    assert any(
+        "size_matched" in str(record.__dict__.get("reason", ""))
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_absent_optional_size_still_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TOLERANCE PIN. ABSENT keeps its fallback; only PRESENT-and-unreadable raises.
+
+    `py_clob_client.get_orders` has no pinned schema, so an order that
+    simply does not carry `size_matched` must still parse.
+    """
+    adapter = credentialed_adapter(
+        monkeypatch, orders=[{"id": "o1", "original_size": "10", "price": "0.4"}]
+    )
+
+    acks = await adapter.get_open_orders()
+
+    assert acks[0].filled_size == pytest.approx(0.0)
+    assert acks[0].remaining_size == pytest.approx(10.0)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_order_status_stays_open_and_is_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """TOLERANCE PIN + a signal, matching Kalshi's handling of the same case."""
+    adapter = credentialed_adapter(
+        monkeypatch, orders=[{"id": "o1", "status": "expired", "original_size": "10"}]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.venues.polymarket.adapter"):
+        acks = await adapter.get_open_orders()
+
+    assert acks[0].status == "open"
+    assert any(
+        record.__dict__.get("event") == "polymarket_unknown_order_status"
+        and record.__dict__.get("status") == "expired"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_fill_with_no_fee_rate_is_estimated_not_zeroed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No `fee_rate_bps` used to mean `$0.00` of fee, silently.
+
+    Kalshi's fills already refuse to do this -- "a fabricated zero fee is
+    exactly the input that makes a marginal edge look profitable" -- and
+    label the estimate in `metadata["fee_source"]`. Polymarket now
+    matches, using the conservative category-table rate.
+
+    By hand, at the 0.05 fallback rate:
+    10 x 0.05 x 0.40 x (1 - 0.40) = 0.12
+    """
+    adapter = credentialed_adapter(
+        monkeypatch,
+        trades=[
+            {
+                "id": "t1",
+                "market": "m1",
+                "asset_id": "a1",
+                "price": "0.40",
+                "size": "10",
+                "match_time": 1767225600,
+            }
+        ],
+    )
+
+    fills = await adapter.get_fills(datetime(2026, 1, 1, tzinfo=UTC))
+
+    assert fills[0].fee == pytest.approx(0.12)
+    assert fills[0].metadata["fee_source"] == "category_estimate"
+
+
+@pytest.mark.asyncio
+async def test_a_fill_with_a_venue_fee_rate_is_labelled_as_such(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TOLERANCE PIN. A trade carrying its own bps still uses them.
+
+    By hand, 200 bps = 0.02: 10 x 0.02 x 0.40 x (1 - 0.40) = 0.048
+    """
+    adapter = credentialed_adapter(
+        monkeypatch,
+        trades=[
+            {
+                "id": "t1",
+                "market": "m1",
+                "asset_id": "a1",
+                "price": "0.40",
+                "size": "10",
+                "fee_rate_bps": 200,
+                "match_time": 1767225600,
+            }
+        ],
+    )
+
+    fills = await adapter.get_fills(datetime(2026, 1, 1, tzinfo=UTC))
+
+    assert fills[0].fee == pytest.approx(0.048)
+    assert fills[0].metadata["fee_source"] == "venue_rate"
+
+
+@pytest.mark.asyncio
+async def test_a_fill_with_no_timestamp_is_dropped_not_stamped_now(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invented `utcnow()` makes an OLD fill pass a `since` filter.
+
+    Kalshi drops these ("it cannot be placed on either side of `since`").
+    Here the whole payload is unparseable, so the drop-everything guard
+    turns it into an error rather than an empty fill list.
+    """
+    adapter = credentialed_adapter(
+        monkeypatch,
+        trades=[{"id": "t1", "market": "m1", "price": "0.40", "size": "10"}],
+    )
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_fills(datetime(2026, 1, 1, tzinfo=UTC))
+
+    assert "NONE parsed" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_one_unparseable_trade_among_good_ones_is_skipped_not_fatal(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """TOLERANCE PIN. One bad row must not cost the whole read -- but it is logged."""
+    adapter = credentialed_adapter(
+        monkeypatch,
+        trades=[
+            {"id": "bad"},
+            {
+                "id": "t1",
+                "market": "m1",
+                "asset_id": "a1",
+                "price": "0.40",
+                "size": "10",
+                "fee_rate_bps": 200,
+                "match_time": 1767225600,
+            },
+        ],
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.venues.polymarket.adapter"):
+        fills = await adapter.get_fills(datetime(2026, 1, 1, tzinfo=UTC))
+
+    assert [f.order_id for f in fills] == ["t1"]
+    assert any(
+        record.__dict__.get("event") == "polymarket_fill_entry_skipped"
+        for record in caplog.records
+    )
+
+
+# -- Builders the shared contract suite reuses (T44) ------------------------
+
+
+def adapter_with_a_market_the_domain_type_rejects() -> PolymarketAdapter:
+    """A Polymarket adapter whose CLOB enrichment carries `tick_size: 0`."""
+    return _adapter(clob_market=dict(CLOB_MARKET, tick_size=0))
+
+
+def adapter_with_a_balance_payload_missing_its_amount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> PolymarketAdapter:
+    """A Polymarket adapter whose balance payload carries no amount field."""
+    return credentialed_adapter(monkeypatch, balance={"asset_type": "COLLATERAL"})
+
+
+def adapter_with_orders_that_never_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> PolymarketAdapter:
+    """A Polymarket adapter whose open orders all lack an id."""
+    return credentialed_adapter(
+        monkeypatch, orders=[{"status": "open"}, {"status": "open"}]
+    )
+
+
+def adapter_with_extra_unknown_keys() -> PolymarketAdapter:
+    """A Polymarket adapter whose market and book payloads carry unknown fields."""
+    return _adapter(
+        gamma_markets=_gamma_with(brand_new_field={"nested": [1, 2]}),
+        clob_book=dict(CLOB_BOOK, unknown_top_level="hello"),
+    )

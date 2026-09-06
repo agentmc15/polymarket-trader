@@ -38,6 +38,7 @@ to `kalshi.com`/`kalshi.co`, ever, from a test).
 """
 import base64
 import json
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1157,3 +1158,479 @@ def test_registry_registers_kalshi_live_behind_the_fence() -> None:
 
     with pytest.raises(LiveTradingDisabled):
         get_adapter("kalshi", "live")
+
+
+# ---------------------------------------------------------------------------
+# T44. Divergence: what happens when a real payload disagrees with the pin.
+#
+# Every case below was CHARACTERIZED against the shipped adapter first
+# (through `httpx.MockTransport`, never a venue -- GUARDRAILS.md §1.4)
+# and then split in two: the ones that produced a plausible-looking WRONG
+# number in silence, which now raise, and the ones that were already
+# correct or already loud, which are pinned here so a later "hardening"
+# pass cannot turn tolerance into brittleness.
+# ---------------------------------------------------------------------------
+
+
+# -- The cents/dollars funnel: the divergence nothing downstream catches ----
+
+
+@pytest.mark.asyncio
+async def test_a_dollar_string_under_the_legacy_cents_key_is_refused_in_a_book() -> None:
+    """`{"yes": [["0.40", 120]]}` must NOT quote a 40c market at 0.4c.
+
+    The legacy `yes`/`no` keys carry INTEGER CENTS; `"0.40"` is the
+    fixed-point DOLLAR spelling under a legacy name. Read as cents it is
+    `0.40 / 100 = 0.004` -- still a valid probability, still a valid
+    price, and 100x too small, which fabricates an enormous edge against
+    Polymarket. Nothing downstream can catch it: `[0,1]` accepts 0.004.
+    """
+    adapter = make_adapter(
+        orderbook={"orderbook": {"yes": [["0.40", 120]], "no": [["0.58", 80]]}}
+    )
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_book(ALPHA, "YES")
+
+    message = str(excinfo.value)
+    assert "kalshi" in message
+    assert "yes" in message  # names the field
+    assert "0.40" in message
+
+
+@pytest.mark.asyncio
+async def test_a_dollar_string_balance_under_the_cents_key_is_refused() -> None:
+    """`{"balance": "1234.56"}` must not become $12.34 of deployable capital."""
+    adapter = make_adapter(balance={"balance": "1234.56"})
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_balance()
+
+    assert "balance" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_dollar_string_fill_price_under_the_cents_key_is_refused() -> None:
+    """A fill priced `"0.42"` under `yes_price` would be booked at 0.42c."""
+    adapter = make_adapter(
+        portfolio={
+            "fills": {
+                "fills": [
+                    {
+                        "order_id": "o1",
+                        "ticker": ALPHA,
+                        "side": "yes",
+                        "count": 10,
+                        "yes_price": "0.42",
+                        "created_time": "2026-06-01T12:00:00Z",
+                    }
+                ]
+            }
+        }
+    )
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_fills(datetime(2026, 1, 1, tzinfo=UTC))
+
+    assert "yes_price" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_dollar_string_exposure_under_the_cents_key_is_refused() -> None:
+    """Cost basis `"4.20"` under `market_exposure` would imply avg 0.0042."""
+    adapter = make_adapter(
+        portfolio={
+            "positions": {
+                "market_positions": [
+                    {"ticker": ALPHA, "position": 10, "market_exposure": "4.20"}
+                ]
+            }
+        }
+    )
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_positions()
+
+    assert "market_exposure" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_whole_number_string_under_a_legacy_key_is_still_read_as_cents() -> None:
+    """TOLERANCE PIN. `"42"` is refused by nothing -- it IS 42 cents.
+
+    The guard above keys on the venue's own convention (`*_dollars` are
+    strings, legacy cents are numbers) but only fires when the string
+    carries a FRACTIONAL part, because that is the only spelling where
+    the two readings disagree about the digits. A string that is a whole
+    number reads identically either way, so tightening this into "no
+    strings at all under a legacy key" would reject a payload that is
+    not in fact ambiguous. 42 cents -> 0.42.
+    """
+    adapter = make_adapter(balance={"balance": "123456"})
+
+    balance = await adapter.get_balance()
+
+    assert balance.available == pytest.approx(1234.56)
+
+
+@pytest.mark.asyncio
+async def test_a_sub_cent_number_under_a_legacy_key_is_still_accepted() -> None:
+    """TOLERANCE PIN, AND A DOCUMENTED LIMIT.
+
+    `{"yes": [[0.40, 120]]}` -- a dollar value as a NUMBER under a legacy
+    key -- is NOT rejected, and produces 0.004. That is deliberate, not
+    an oversight: 0.4 cents is a legal price on a market whose tick is a
+    tenth of a cent (`price_level_structure` bands the fixture markets
+    down to 0.1c), so a magnitude threshold here would reject real deep-
+    tail quotes. Only the type is a reliable discriminator, and this
+    payload's type says "cents". Recorded so the gap is visible rather
+    than assumed closed.
+    """
+    adapter = make_adapter(
+        orderbook={"orderbook": {"yes": [[0.40, 120]], "no": [[58, 80]]}}
+    )
+
+    book = await adapter.get_book(ALPHA, "YES")
+
+    assert book.bids[0].price == pytest.approx(0.004)
+
+
+@pytest.mark.asyncio
+async def test_a_non_string_dollars_field_is_flagged_in_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The reverse drift -- integer cents under `balance_dollars` -- is LOGGED.
+
+    `{"balance_dollars": 123456}` reads as $123,456.00, 100x too BIG,
+    which is the dangerous direction for sizing. It cannot be refused:
+    a six-figure balance is perfectly legal, and so is `$123456.00`, so
+    there is no way to tell the two apart without inventing a bound. The
+    adapter says so out loud instead of choosing in silence.
+    """
+    adapter = make_adapter(balance={"balance_dollars": 123456})
+
+    with caplog.at_level(logging.WARNING, logger="app.venues.kalshi.adapter"):
+        balance = await adapter.get_balance()
+
+    assert balance.available == pytest.approx(123456.0)
+    assert any(
+        record.__dict__.get("field") == "balance_dollars"
+        and record.__dict__.get("event") == "kalshi_dollars_field_not_a_string"
+        for record in caplog.records
+    )
+
+
+# -- An absent key is not an empty result ----------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("suffix", "renamed_body"),
+    [
+        ("positions", {"rows": [{"ticker": ALPHA, "position": 10}]}),
+        ("orders", {"resting_orders": [{"order_id": "o1"}]}),
+        ("fills", {"trades": [{"order_id": "o1"}]}),
+    ],
+)
+async def test_a_renamed_portfolio_key_is_not_read_as_an_empty_portfolio(
+    suffix: str, renamed_body: dict[str, Any]
+) -> None:
+    """A renamed envelope key must raise, not report "you hold nothing".
+
+    `app.execution.reconcile` distinguishes the two deliberately: a read
+    that RAISED means "we do not know" and it refuses to conclude
+    anything, while a successful empty read means "the venue has
+    nothing" and it acts on that. Reading `body.get("orders", [])` made a
+    renamed key indistinguishable from an empty account -- every live
+    order would have been reported gone.
+    """
+    method = {
+        "positions": "get_positions",
+        "orders": "get_open_orders",
+        "fills": "get_fills",
+    }[suffix]
+    adapter = make_adapter(portfolio={suffix: renamed_body})
+    call = getattr(adapter, method)
+
+    with pytest.raises(VenuePayloadError):
+        await (
+            call(datetime(2026, 1, 1, tzinfo=UTC)) if suffix == "fills" else call()
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_renamed_markets_key_is_not_read_as_an_empty_catalog() -> None:
+    """Same rule on the public listing: no `markets` key is an error."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": MARKETS, "cursor": ""})
+
+    adapter = KalshiAdapter(
+        transport=httpx.MockTransport(handler), settings_obj=make_settings()
+    )
+
+    with pytest.raises(VenuePayloadError):
+        await adapter.list_markets()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("suffix", "empty_body"),
+    [
+        ("positions", {"market_positions": []}),
+        ("orders", {"orders": []}),
+        ("fills", {"fills": []}),
+    ],
+)
+async def test_an_empty_list_under_a_present_key_still_means_empty(
+    suffix: str, empty_body: dict[str, Any]
+) -> None:
+    """TOLERANCE PIN. A present-but-empty list is a real, ordinary answer."""
+    method = {
+        "positions": "get_positions",
+        "orders": "get_open_orders",
+        "fills": "get_fills",
+    }[suffix]
+    adapter = make_adapter(portfolio={suffix: empty_body})
+    call = getattr(adapter, method)
+
+    result = await (
+        call(datetime(2026, 1, 1, tzinfo=UTC)) if suffix == "fills" else call()
+    )
+
+    assert result == []
+
+
+# -- Every row failed is a schema change, not a bad row --------------------
+
+
+@pytest.mark.asyncio
+async def test_a_page_of_orders_that_none_parse_is_not_reported_as_none_resting() -> None:
+    """Two orders in, zero out, no error -- that used to be the answer."""
+    adapter = make_adapter(
+        portfolio={"orders": {"orders": [{"status": "resting"}, {"status": "resting"}]}}
+    )
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_open_orders()
+
+    assert "NONE parsed" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_one_unparseable_order_among_good_ones_is_skipped_not_fatal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """TOLERANCE PIN. One bad row must not cost the whole read -- but it is logged."""
+    adapter = make_adapter(
+        portfolio={
+            "orders": {"orders": [{"no_id_here": True}, dict(ORDER_ACK["order"])]}
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.venues.kalshi.adapter"):
+        orders = await adapter.get_open_orders()
+
+    assert [o.order_id for o in orders] == ["b0000000-0000-4000-8000-000000000001"]
+    assert any(
+        record.__dict__.get("event") == "kalshi_order_entry_skipped"
+        for record in caplog.records
+    )
+
+
+# -- Unexpected enum values -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_fill_side_is_refused_rather_than_priced_as_yes() -> None:
+    """`side: "ask"` (the ORDER vocabulary) must not be read as a YES fill.
+
+    The side decides which price field is read AND which outcome the
+    fill lands in, so guessing YES gets both wrong: a NO fill at 0.58
+    would be booked as a YES fill at 0.42.
+    """
+    adapter = make_adapter(
+        portfolio={
+            "fills": {
+                "fills": [
+                    {
+                        "order_id": "o1",
+                        "ticker": ALPHA,
+                        "side": "ask",
+                        "count": 10,
+                        "yes_price": 42,
+                        "no_price": 58,
+                        "created_time": "2026-06-01T12:00:00Z",
+                    }
+                ]
+            }
+        }
+    )
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.get_fills(datetime(2026, 1, 1, tzinfo=UTC))
+
+    assert "side" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_fill_with_no_side_at_all_still_defaults_to_yes() -> None:
+    """TOLERANCE PIN. An ABSENT side keeps its documented fallback.
+
+    Only a side spelled in an unknown vocabulary is refused. The
+    difference matters: absent has always meant "the common case", while
+    a value we do not recognize means the venue is telling us something
+    we cannot read.
+    """
+    adapter = make_adapter(
+        portfolio={
+            "fills": {
+                "fills": [
+                    {
+                        "order_id": "o1",
+                        "ticker": ALPHA,
+                        "count": 10,
+                        "yes_price": 42,
+                        "fee_paid": 5,
+                        "created_time": "2026-06-01T12:00:00Z",
+                    }
+                ]
+            }
+        }
+    )
+
+    fills = await adapter.get_fills(datetime(2026, 1, 1, tzinfo=UTC))
+
+    assert fills[0].metadata["outcome"] == "YES"
+    assert fills[0].price == pytest.approx(0.42)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_market_status_stays_open_and_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """TOLERANCE PIN + a signal. A new lifecycle word must not break the catalog.
+
+    Refusing to parse a whole listing over one unrecognized status would
+    be its own outage -- venues add states. Defaulting to `"open"` does
+    make an unknown state look tradable, though, so the value we did not
+    know is logged with the market it came from.
+    """
+    markets = [dict(MARKETS[0], status="paused")]
+    adapter = make_adapter(markets=markets)
+
+    with caplog.at_level(logging.WARNING, logger="app.venues.kalshi.adapter"):
+        listed = await adapter.list_markets()
+
+    assert [m.status for m in listed] == ["open"]
+    assert any(
+        record.__dict__.get("event") == "kalshi_unknown_market_status"
+        and record.__dict__.get("status") == "paused"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_order_status_stays_open_and_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """TOLERANCE PIN + a signal, same reasoning, on the order enum."""
+    raw = dict(ORDER_ACK["order"], status="triggered")
+    adapter = make_adapter(portfolio={"orders": {"orders": [raw]}})
+
+    with caplog.at_level(logging.WARNING, logger="app.venues.kalshi.adapter"):
+        orders = await adapter.get_open_orders()
+
+    assert orders[0].status == "open"
+    assert any(
+        record.__dict__.get("event") == "kalshi_unknown_order_status"
+        and record.__dict__.get("status") == "triggered"
+        for record in caplog.records
+    )
+
+
+# -- Values the domain types reject, and keys venues add -------------------
+
+
+@pytest.mark.asyncio
+async def test_a_market_the_domain_type_rejects_is_a_venue_error() -> None:
+    """A negative `minimum_order_size` raises `VenuePayloadError`, not `ValueError`.
+
+    `VenueMarket`'s own validator names the field but raises a BARE
+    `ValueError`, which is not a `VenueError` and therefore not in
+    `app.services.scanner.VENUE_READ_FAULTS` -- one bad market would have
+    aborted a whole scan pass instead of skipping this venue's listing.
+    """
+    adapter = make_adapter(markets=[dict(MARKETS[0], minimum_order_size=-1)])
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await adapter.list_markets()
+
+    assert "min_size" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_extra_unknown_keys_are_tolerated_everywhere() -> None:
+    """TOLERANCE PIN. Venues ADD fields; that must never be an outage."""
+    markets = [dict(MARKETS[0], brand_new_field={"nested": [1, 2]})]
+    orderbook = {
+        "orderbook_fp": dict(ORDERBOOK_FP["orderbook_fp"], extra_side=[[1, 2]]),
+        "unknown_top_level": "hello",
+    }
+    adapter = make_adapter(
+        markets=markets,
+        orderbook=orderbook,
+        balance={"balance": 123456, "pending_settlement": 42},
+    )
+
+    listed = await adapter.list_markets()
+    book = await adapter.get_book(ALPHA, "YES")
+    balance = await adapter.get_balance()
+
+    assert [m.market_id for m in listed] == [ALPHA]
+    assert book.bids[0].price == pytest.approx(0.40)
+    assert balance.available == pytest.approx(1234.56)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_book_side_is_tolerated() -> None:
+    """TOLERANCE PIN. A one-sided book is a real, common venue state."""
+    adapter = make_adapter(
+        orderbook={"orderbook_fp": {"yes_dollars": [], "no_dollars": [["0.58", 80]]}}
+    )
+
+    book = await adapter.get_book(ALPHA, "YES")
+
+    assert book.bids == ()
+    assert book.asks[0].price == pytest.approx(0.42)
+
+
+# -- Builders the shared contract suite reuses (T44) ------------------------
+
+
+def adapter_with_a_market_the_domain_type_rejects() -> KalshiAdapter:
+    """A Kalshi adapter whose catalog carries a negative `minimum_order_size`."""
+    return make_adapter(markets=[dict(MARKETS[0], minimum_order_size=-1)])
+
+
+def adapter_with_a_balance_payload_missing_its_amount() -> KalshiAdapter:
+    """A Kalshi adapter whose balance payload carries no amount field."""
+    return make_adapter(balance={"settled_at": "2026-01-01T00:00:00Z"})
+
+
+def adapter_with_orders_that_never_parse() -> KalshiAdapter:
+    """A Kalshi adapter whose resting orders all lack an `order_id`."""
+    return make_adapter(
+        portfolio={"orders": {"orders": [{"status": "resting"}, {"status": "resting"}]}}
+    )
+
+
+def adapter_with_extra_unknown_keys() -> KalshiAdapter:
+    """A Kalshi adapter whose market and book payloads carry unknown fields."""
+    return make_adapter(
+        markets=[dict(MARKETS[0], brand_new_field={"nested": [1, 2]})],
+        orderbook={
+            "orderbook_fp": dict(ORDERBOOK_FP["orderbook_fp"], extra_side=[[1, 2]]),
+            "unknown_top_level": "hello",
+        },
+    )
