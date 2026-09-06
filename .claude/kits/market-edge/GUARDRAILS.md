@@ -8,8 +8,10 @@ Section 1 is absolute. Sections 2–6 are conventions with the signal to read.
 
 1. **Never place, modify, or cancel a real venue order** — not from a test, a verify command, a
    red-team probe, a "quick check", or CI. The only modules allowed to contain order-placement
-   calls are `backend/app/venues/polymarket/live.py` and `backend/app/venues/kalshi/live.py`, and
-   `backend/tests/test_fences.py` enforces that by AST walk. If you find yourself needing a real
+   calls are `backend/app/venues/polymarket/live.py`, `backend/app/venues/kalshi/live.py`, and the
+   sanctioned wrapper `backend/app/services/polymarket/client.py`, and
+   `backend/tests/test_fences.py` enforces that by AST walk (`LIVE_MODULES` plus `WRAPPER_MODULE`
+   -- three modules, not two; the wrapper is where the synchronous `py_clob_client` calls live). If you find yourself needing a real
    adapter in a test, use `httpx.MockTransport` or the `FixtureAdapter` in `tests/venues/`.
 2. **`TRADING_MODE` defaults to `paper` and stays `paper` in every test process.** Never set
    `TRADING_MODE=live` or `LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_REAL_MONEY` in the shell, in

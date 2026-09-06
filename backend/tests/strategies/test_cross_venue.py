@@ -750,3 +750,267 @@ async def test_the_same_intent_without_the_downsize_flag_is_still_rejected(
     async with sessions() as session:
         rows = (await session.execute(select(OrderRow))).scalars().all()
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# 9. T29 — each leg's fee is priced ONCE PER FILL, not once per probe
+# ---------------------------------------------------------------------------
+
+
+def fragmentation_strategy(
+    *,
+    pm_yes_levels: list[tuple[float, float]],
+    kx_no_levels: list[tuple[float, float]],
+    confidence: float = 1.0,
+    available: dict[str, float] | None = None,
+) -> CrossVenueArbitrageStrategy:
+    """Like `seeded_strategy`, but the two TRADED sides' books are spelled out.
+
+    `seeded_strategy` always builds one 500-contract ask level a side, so
+    a 50-contract probe there always consumes exactly one level and the
+    per-fill and aggregate fee bases coincide. These tests need the case
+    where they do not, so the two sides the winning direction actually
+    buys (Polymarket YES and Kalshi NO) take explicit `(price, size)`
+    level lists.
+
+    Several levels at the SAME price is a faithful model of several
+    separate resting counterparties at one price, which is how a
+    marketable order comes back as several fills — and Kalshi charges
+    its whole-cent ceiling per FILL, not per order.
+
+    Args:
+        pm_yes_levels: Polymarket YES ask levels, best price first.
+        kx_no_levels: Kalshi NO ask levels, best price first.
+        confidence: The link's `p_same_resolution`.
+        available: If given, the per-venue free capital to
+            `observe_capital()`.
+
+    Returns:
+        CrossVenueArbitrageStrategy: Both snapshots already fed through
+            `on_market_data`; the two UNTRADED sides sit at 0.60/500 so
+            the reverse direction can never win.
+    """
+    strategy = CrossVenueArbitrageStrategy(links=[approved_link(confidence)])
+    if available is not None:
+        strategy.observe_capital(available)
+
+    pm_yes_top = pm_yes_levels[0][0]
+    kx_no_top = kx_no_levels[0][0]
+    end_date = utcnow() + timedelta(days=30.0)
+    for outcome, venue, market, levels in (
+        ("YES", "polymarket", PM_MARKET, pm_yes_levels),
+        ("NO", "polymarket", PM_MARKET, [(0.60, 500.0)]),
+        ("YES", "kalshi", KX_MARKET, [(0.60, 500.0)]),
+        ("NO", "kalshi", KX_MARKET, kx_no_levels),
+    ):
+        strategy.observe_book(
+            make_book(
+                bids=[(max(0.0, levels[0][0] - 0.02), 500.0)],
+                asks=list(levels),
+                venue=venue,  # type: ignore[arg-type]
+                market_id=market,
+                outcome=outcome,
+            )
+        )
+
+    strategy.on_market_data(
+        make_snapshot(
+            market_id=PM_MARKET,
+            yes=pm_yes_top,
+            venue="polymarket",
+            category="Politics",
+            end_date=end_date,
+        )
+    )
+    strategy.on_market_data(
+        make_snapshot(
+            market_id=KX_MARKET,
+            yes=1.0 - kx_no_top,
+            venue="kalshi",
+            category=None,
+            end_date=end_date,
+        )
+    )
+    return strategy
+
+
+def test_the_kalshi_leg_is_priced_once_per_fill_not_once_per_probe() -> None:
+    """Same 50 contracts, same 0.20 price, two fill shapes, two fees.
+
+    Kalshi ceilings each FILL to 6dp and then to whole cents
+    (`app/venues/fees.py`, whose own docstring says "callers that need an
+    order-level total must call `fee()` once per `Fill` and sum the
+    results, never call it once with an order's aggregate size"). So the
+    number of fills is part of the cost, and the two books below — 50
+    contracts offered at 0.20 as ONE level, and the identical 50
+    contracts at the identical 0.20 offered as fifty 1-contract levels —
+    must NOT cost the same.
+
+    By hand, at Kalshi's `Settings` taker rate 0.07 and `probe_size` 50:
+
+        ONE 50-contract fill:
+            model_fee = 50 * 0.07 * 0.20 * 0.80 = 0.56
+            ceil to 6dp                         = 0.56
+            ceil to whole cents                 = 0.56  (already whole)
+            per contract = 0.56 / 50            = 0.0112
+
+        FIFTY 1-contract fills:
+            model_fee = 1 * 0.07 * 0.20 * 0.80  = 0.0112   (per fill)
+            ceil to 6dp                         = 0.0112
+            ceil to whole cents                 = 0.02     <- the floor bites
+            total = 50 * 0.02                   = 1.00
+            per contract = 1.00 / 50            = 0.02
+
+        divergence = 0.02 - 0.0112 = 0.0088 per contract (0.88 pp),
+        against this strategy's own `min_net_edge` gate of 0.015.
+
+    The blended ask is 0.20 in BOTH cases (every level is at 0.20), so
+    the fee difference cannot be a price difference — it is the fill
+    count and nothing else. Pricing the probe as one aggregate fill, as
+    this strategy did before T29, reported 0.0112 for both books and so
+    UNDERSTATED the fragmented one by 0.0088.
+    """
+    deep = fragmentation_strategy(
+        pm_yes_levels=[(0.76, 50.0)], kx_no_levels=[(0.20, 50.0)]
+    )
+    fragmented = fragmentation_strategy(
+        pm_yes_levels=[(0.76, 50.0)], kx_no_levels=[(0.20, 1.0)] * 50
+    )
+
+    one_fill = deep.evaluate(deep.links.links[0], "YES")
+    fifty_fills = fragmented.evaluate(fragmented.links.links[0], "YES")
+    assert one_fill is not None
+    assert fifty_fills is not None
+
+    # Same total depth consumed, same price paid for it.
+    assert one_fill.probe_size == pytest.approx(50.0, abs=1e-9)
+    assert fifty_fills.probe_size == pytest.approx(50.0, abs=1e-9)
+    assert one_fill.ask_b == pytest.approx(0.20, abs=1e-12)
+    assert fifty_fills.ask_b == pytest.approx(0.20, abs=1e-12)
+
+    # Different fee, because Kalshi charges its floor per fill.
+    assert one_fill.fee_b == pytest.approx(0.0112, abs=1e-12)
+    assert fifty_fills.fee_b == pytest.approx(0.02, abs=1e-12)
+    assert fifty_fills.fee_b - one_fill.fee_b == pytest.approx(0.0088, abs=1e-12)
+    # The one-directional part that matters: fragmentation only ever
+    # costs MORE. A strategy that priced it as one fill was optimistic.
+    assert fifty_fills.fee_b > one_fill.fee_b
+    assert fifty_fills.cost > one_fill.cost
+    assert fifty_fills.net_edge < one_fill.net_edge
+
+
+def test_the_polymarket_leg_is_identical_however_the_probe_fragments() -> None:
+    """The control: on Polymarket, per-fill and aggregate are the SAME number.
+
+    This is the half that proves T29's change is Kalshi-specific rather
+    than a blanket recalculation of every fee in the module.
+    `PolymarketFeeModel.fee` is `size * rate * price * (1 - price)` with
+    NO per-fill rounding of any kind, so it is linear in size and flat in
+    fill count: summing it over any number of fills that add to the same
+    total size gives the identical total.
+
+    By hand, Polymarket YES at 0.76 in Politics (published category taker
+    rate 0.04), `probe_size` 50:
+
+        ONE 50-contract fill:
+            50 * 0.04 * 0.76 * 0.24  = 0.3648
+            per contract = 0.3648/50 = 0.007296
+
+        FIFTY 1-contract fills:
+            1 * 0.04 * 0.76 * 0.24   = 0.007296   (per fill)
+            total = 50 * 0.007296    = 0.3648     (the SAME total)
+            per contract             = 0.007296
+
+    Both books also leave the Kalshi leg untouched (one 50-contract level
+    at 0.20 in both), so anything that moved `fee_a` here would have to
+    be the Polymarket fee basis itself.
+    """
+    deep = fragmentation_strategy(
+        pm_yes_levels=[(0.76, 50.0)], kx_no_levels=[(0.20, 50.0)]
+    )
+    fragmented = fragmentation_strategy(
+        pm_yes_levels=[(0.76, 1.0)] * 50, kx_no_levels=[(0.20, 50.0)]
+    )
+
+    one_fill = deep.evaluate(deep.links.links[0], "YES")
+    fifty_fills = fragmented.evaluate(fragmented.links.links[0], "YES")
+    assert one_fill is not None
+    assert fifty_fills is not None
+
+    assert one_fill.ask_a == pytest.approx(0.76, abs=1e-12)
+    assert fifty_fills.ask_a == pytest.approx(0.76, abs=1e-12)
+
+    # The hand-computed number, and the fact that fragmentation does not
+    # move it. Both assertions matter: the first pins the Polymarket fee
+    # basis, the second pins its flatness in fill count.
+    assert one_fill.fee_a == pytest.approx(0.007296, abs=1e-12)
+    assert fifty_fills.fee_a == pytest.approx(0.007296, abs=1e-12)
+    assert fifty_fills.fee_a == pytest.approx(one_fill.fee_a, abs=1e-15)
+    # Kalshi held constant across the pair, so `cost` moves only if
+    # `fee_a` did.
+    assert fifty_fills.fee_b == pytest.approx(one_fill.fee_b, abs=1e-15)
+    assert fifty_fills.cost == pytest.approx(one_fill.cost, abs=1e-15)
+
+
+def test_kalshi_fragmentation_alone_drops_the_pair_below_min_net_edge() -> None:
+    """The understatement is worth an EMISSION, not just a prettier number.
+
+    Identical prices, identical probe, identical link, identical
+    confidence — the only difference is that the 50 Kalshi contracts come
+    from fifty 1-contract counterparties instead of one. By hand, at
+    `redemption_gas_usd` 0.05 (two redemptions, amortized over the
+    50-contract probe = 0.002/contract) and `p_same_resolution = 1.0` (so
+    `net_edge == gross_edge` and the haircut term is exactly zero):
+
+        fee_A  = 50 * 0.04 * 0.76 * 0.24 = 0.3648 -> 0.007296 / contract
+                 (identical in both books — Polymarket is flat in fill
+                  count; only the Kalshi book changes below)
+
+        ONE Kalshi fill:
+            fee_B = ceil_cents(50 * 0.07 * 0.20 * 0.80 = 0.56) = 0.56
+                                                      -> 0.0112 / contract
+            cost  = 0.76 + 0.20 + 0.007296 + 0.0112 + 0.002 = 0.980496
+            net_edge = 1 - 0.980496                         = 0.019504
+                       >= 0.015  -> INTENT
+
+        FIFTY Kalshi fills:
+            fee_B = 50 * ceil_cents(1 * 0.07 * 0.20 * 0.80 = 0.0112)
+                  = 50 * 0.02 = 1.00                -> 0.02   / contract
+            cost  = 0.76 + 0.20 + 0.007296 + 0.02 + 0.002   = 0.989296
+            net_edge = 1 - 0.989296                         = 0.010704
+                       <  0.015  -> NO INTENT
+
+    Before T29 both books priced at 0.0112 and BOTH emitted, on a
+    `net_edge` of 0.019504 that the fragmented book could never have
+    earned. That is the direction that matters: this is the one scored
+    strategy that also carries cross-venue settlement risk, so an
+    optimistic fee estimate here admits exactly the marginal pairs the
+    gate exists to refuse.
+    """
+    funded = {"polymarket": 5000.0, "kalshi": 5000.0}
+    deep = fragmentation_strategy(
+        pm_yes_levels=[(0.76, 50.0)],
+        kx_no_levels=[(0.20, 50.0)],
+        available=funded,
+    )
+    fragmented = fragmentation_strategy(
+        pm_yes_levels=[(0.76, 50.0)],
+        kx_no_levels=[(0.20, 1.0)] * 50,
+        available=funded,
+    )
+
+    one_fill = deep.evaluate(deep.links.links[0], "YES")
+    fifty_fills = fragmented.evaluate(fragmented.links.links[0], "YES")
+    assert one_fill is not None
+    assert fifty_fills is not None
+
+    assert one_fill.gas_per_contract == pytest.approx(0.002, abs=1e-12)
+    assert one_fill.cost == pytest.approx(0.980496, abs=1e-12)
+    assert one_fill.net_edge == pytest.approx(0.019504, abs=1e-12)
+    assert fifty_fills.cost == pytest.approx(0.989296, abs=1e-12)
+    assert fifty_fills.net_edge == pytest.approx(0.010704, abs=1e-12)
+
+    # 0.019504 clears the 0.015 gate; 0.010704 does not.
+    assert one_fill.net_edge >= 0.015 > fifty_fills.net_edge
+    assert deep.on_market_data(kalshi_snapshot()) is not None
+    assert fragmented.on_market_data(kalshi_snapshot()) is None

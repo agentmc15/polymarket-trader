@@ -4100,3 +4100,203 @@ Work committed as 8 scoped commits on `feat/market-edge`, merged `--no-ff` into 
 hook fix.
 
 session: cbc400f8-2c7e-492a-9c9a-2f3550d6aae5
+
+## Resume session — T25/T28 verification and the R4 adjudication
+
+Verifier copied `backend/` to `$TMPDIR`, reverted each production fix there, and confirmed the
+targeted test FAILED before restoring. Repo tree never edited. **All six fixes CONFIRMED
+load-bearing, none vacuous:**
+
+- T25 beat wiring: removing the `"scan-near-resolution"` entry from `tasks/__init__.py` fails
+  `test_the_celery_beat_schedules_the_near_resolution_pass_on_its_own_interval`. Reachability traced
+  by READING the chain, not inferring from the test: beat -> `scan_near_resolution()` ->
+  `run_near_resolution_scan()` -> `near_resolution_pass()` -> `SettlementEdgeStrategy.evaluate()`
+  stamps `metadata["bucket"]` -> `_persist()` copies it to `IntentRecord.extra_data` -> at submit,
+  `_bucket_tag()` reads it and `check_order_limits(bucket=...)` enforces the cap. Exercised end to end
+  through the REAL `OrderRouter.submit()`, not a mock. Genuinely wired.
+- T25 scan-id filter and reconcile fold: both fail on revert with the exact described symptom. The
+  paired SELL test correctly still passes under revert -- SELLs were never part of the fix, so its
+  passing is right, not a gap.
+- T28's three characterization tests: reverting the counting logic in `engine._execute_intent` fails
+  all three with `1.0` expected vs `0.0` got.
+
+**ADJUDICATION -- PLAN R4's tripwire is REPOINTED, and R4's wording is an architect defect.**
+
+R4 reads: "the sweep's `pct_intents_downsized` must be > 0 at the top capital level on the synthetic
+fixture or the fixture is too deep." Measured on the shipped demo:
+
+    capital  | pct_intents_downsized | pct_intents_depth_limited | depth_blocked
+        500  |                 16.7% |                      0.0% |             0
+     50,000  |                  0.0% |                     10.9% |           314
+    250,000  |                  0.0% |                     10.9% |           314
+
+The named field is 0.0% at the top -- but the fixture is NOT too deep, which is the only conclusion
+R4 offers. Depth genuinely binds: 314 intents are depth-blocked at scale. The union metric is
+TRADE-DERIVED, and at high capital the dominant depth failure stops being a partial fill and becomes
+an outright `fok_insufficient_depth` rejection that produces NO `TradeRecord`, so the metric is
+structurally blind to it. **The field R4 names goes to zero precisely when depth binds hardest.** A
+tripwire that reads clean exactly when the risk it monitors is greatest is inverted, and satisfying
+it as literally worded would require making the fixture WORSE at the thing it tests.
+
+Resolution: `pct_intents_depth_limited` satisfies R4. It is >0 at the top level and rises
+monotonically with capital (0.0% -> 5.1% -> 10.9%), which is the behavior R4's prose actually
+describes. `pct_intents_downsized` is retained unchanged for continuity, correctly NOT redefined
+(`sweep.py`'s docstring says so outright).
+
+ARCHITECT DEFECT, for the brief-defect floor: R4 pinned a tripwire to a specific metric NAME whose
+derivation could not observe the failure mode the tripwire exists to catch. Same family as the nine
+directory-scoped lint gates -- the check's mechanism and the check's intent were not the same thing.
+A tripwire should name the PROPERTY ("a depth-exhaustion signal must be >0 at the top level"), and
+leave the field that carries it to the implementation.
+
+defect: T22 kind=underivable-requirement
+
+Verifier also correctly flagged live working-tree drift in `cross_venue_arbitrage.py`,
+`tasks/backtesting.py` and two test files as ANOTHER PROCESS's concurrent work rather than damage
+from its own run -- it checked mtimes across two `git status` calls and matched the content to the
+tracked remediation queue. That is the T29 agent, still running. Correct attribution under exactly
+the condition that produced a misattribution earlier in this kit.
+
+agent: T25-T28 id=a11e76a86feaf48ca role=verifier model=sonnet findings=1 confirmed=1 result=accepted
+
+### T29
+
+Two defects from the final review's remediation queue, in one task because both were named as one-file
+changes and neither touched the other's blast radius.
+
+**Defect 1 — `unmarked_positions` never reached the API.** One line added to `build_report()`
+(`backend/app/tasks/backtesting.py`): `"unmarked_positions": list(result.unmarked_positions)`. A `list`,
+not the result's `tuple`, because `report` is written straight into a JSON/JSONB column — the same
+coercion `undeclared_zero_fee_markets` already does two keys above. The key is written unconditionally,
+so a clean run persists `[]`: an ABSENT key means "this run predates the field" (which is how
+`frontend/src/types/index.ts` already documents an empty `{}` report), and that is a different claim
+from "every position in this run had a real mark price". A clean run is entitled to make the second
+claim, so it does.
+
+The brief said the frontend already renders this defensively and told me to verify rather than assume.
+Verified by reading: `frontend/src/components/backtesting/BacktestResults.tsx:150` renders the
+"N position(s) unmarked — equity curve partly fictional" badge on
+`Array.isArray(report.unmarked_positions) && length > 0`, inside an outer gate of
+`report.depth_source !== undefined || report.fill_at !== undefined`. `build_report()` always writes both
+of those, so the container always renders on a completed run and the badge genuinely lights up now.
+Four tests cover it, and they go all the way out through `GET /api/v1/backtests/{id}` rather than
+stopping at the dict `build_report()` returns — the defect lived at the persistence boundary, so a test
+that never crosses it would not have caught it.
+
+**One stale comment I deliberately did NOT fix, because it is outside this task's file scope.**
+`frontend/src/types/index.ts` (around line 428) carries a doc comment saying "`unmarked_positions` is
+NOT currently written to a single run's top-level report by `build_report()`". That sentence is now
+false. The optional typing it justifies is still correct and should stay optional (a pre-migration run
+still has no such key), but the paragraph explaining WHY needs a rewrite. My files were
+`app/tasks/backtesting.py`, `app/strategies/cross_venue_arbitrage.py` and tests under `backend/tests/`,
+and a stray frontend edit in `git status` is exactly what the brief told me would read as my defect, so
+it is flagged here instead of fixed.
+
+**Defect 2 — the Kalshi leg was priced as one aggregate fill.** `cross_venue_arbitrage.evaluate()` did
+`model.fee(ask, size, "taker", schedule) / size`, charging the fee once for the blended ask as though
+the whole 50-contract probe were a single fill. It now calls `fee()` once per fill the walk actually
+consumed and sums, then divides by `probe_size` — the pattern `settlement_edge._priced_fills` /
+`evaluate()` already proved in this repo, and the basis `app/execution/fill_engine.py` really charges at
+execution time.
+
+`_marginal_ask` was renamed `_probe_fills` and now returns the `(price, qty)` breakdown instead of
+throwing it away; the size-weighted blend it used to return moved to a module-level `_weighted_ask()`.
+That split is the whole point and the docstring says so: the ASK genuinely is a blend (paying 0.20 for
+30 and 0.21 for 20 does cost the same as 0.204 for 50), the FEE genuinely is not (Kalshi's whole-cent
+ceiling is charged once per fill, so two fills cost more than one fill of the same total size).
+`_probe_fills` still returns `None` unless the walk covers the full probe, so the fills always sum to
+`size` and the divisor is a filled size rather than an assumed one.
+
+Measured on this repo's own fee models, not assumed: 50 contracts at `p = 0.20` and Kalshi's `Settings`
+taker rate 0.07 cost `ceil_cents(50 * 0.07 * 0.20 * 0.80) = 0.56` as one fill (0.0112/contract) and
+`50 * ceil_cents(1 * 0.07 * 0.20 * 0.80 = 0.0112) = 1.00` as fifty (0.0200/contract). The aggregate
+basis understated that book by 0.0088/contract — 59% of this strategy's own `min_net_edge` gate of
+0.015. The same pair at `p = 0.30` diverges by 0.0052, matching the ~0.53 pp the review quoted. On
+Polymarket the two bases agree to within one ulp (1.7e-18 measured), because
+`PolymarketFeeModel.fee` has no per-fill rounding at all.
+
+**The comment that had already been corrected once stayed true.** The old block claimed the fee was
+priced "as ONE aggregate fill ... It is NOT 'the fill it is actually charged on'" and cited an
+understatement of up to 0.86 pp as a known, deliberately-unfixed approximation. All of that describes
+code that no longer exists, so it was replaced with a description of what the code now does, carrying
+the 0.88 pp number I actually measured rather than the inherited 0.86. The module docstring's "PER
+CONTRACT UNITS" fee bullet and `DEFAULT_CONFIG`'s `probe_size` comment both said the fee is "priced for
+the WHOLE `probe_size` fill and divided" — also now false, also rewritten. The docstring keeps the
+explanation of why `probe_size` is 50 and not 1, because that reason survives the change: it is still
+simultaneously the depth walked and the divisor, and they still must be one number.
+
+`binary_complement_arbitrage` and `multi_outcome_bundle_arbitrage` were left alone as instructed. Their
+size-1.0 basis OVERSTATES Kalshi's fee and so refuses genuine edges — the safe direction, and a
+different task.
+
+**No existing test expectation moved.** Every book `seeded_strategy` builds is a single 500-contract ask
+level, so a 50-contract probe consumes exactly one level and the per-fill and aggregate bases coincide
+to the float. The suite went 740 -> 747 with zero edits to an existing assertion; nothing was
+"recomputed to match what the new code prints" because nothing needed to be.
+
+**Red-green, run in a `$TMPDIR` copy, both directions.** With both fixes reverted, six of the seven new
+tests fail: all four `unmarked_positions` tests on `KeyError`, and the two Kalshi fee tests on
+`0.0112 != 0.02` and `0.980496 != 0.989296`. The seventh — the Polymarket control — passes under BOTH
+the old and new code, and that is exactly what makes it a control: if it had gone red on the revert, the
+change would have been a blanket recalculation rather than a Kalshi-specific one. It is not vacuous, and
+that was proved separately rather than asserted: mutating `_fee_inputs` to hand Polymarket the
+`KalshiFeeModel` (a literal blanket recalculation) turns the control red on `0.0074 != 0.007296` while
+leaving both Kalshi tests green. Only the control catches that mutation.
+
+**Not mine, found at the final `git status`, flagged rather than touched.** `GUARDRAILS.md` §1.1 —
+an ABSOLUTE money rule — is modified in the working tree. I read that file at the start of this task and
+it was the original two-module text; `git status --porcelain` was clean on my first command. The edit
+widens the order-placement allowlist from two modules to three by adding
+`backend/app/services/polymarket/client.py`. The claim is factually consistent with the code
+(`tests/test_fences.py:127` does define `WRAPPER_MODULE` and line 294 does allow it), so it reads as a
+docs-to-reality reconciliation rather than a fence being weakened — but it arrived from a concurrent
+agent, into §1, during a task declared read-only over a different file set. I did not revert it and did
+not touch it. It needs an orchestrator's adjudication, not an implementer's.
+
+### T29 adjudication (orchestrator)
+
+Verified independently through `_fee_inputs` rather than on report -- 50 contracts, Kalshi 0.07:
+
+    kalshi     p=0.20  1 fill=0.011200/ct  50 fills=0.020000/ct  gap=0.008800  (59% of min_net_edge)
+    kalshi     p=0.30  1 fill=0.014800/ct  50 fills=0.020000/ct  gap=0.005200  (35%)
+    polymarket p=0.20  1 fill=0.008000/ct  50 fills=0.008000/ct  gap=0.000000  (0%)
+    polymarket p=0.30  1 fill=0.010500/ct  50 fills=0.010500/ct  gap=0.000000  (0%)
+
+The worst case is 59%, not the ~35% I carried forward from the review -- that figure was the p=0.30
+case. Polymarket is EXACTLY zero at both prices, which is what proves the change is Kalshi-specific
+rather than a blanket recalculation. Suite **747**, `alembic heads` `007`, fence tests 31 passing.
+
+BEST METHODOLOGY OF THE RUN, worth copying: the Polymarket control test PASSES under both old and new
+code -- which is exactly what makes it a control, and also what makes it look vacuous. The implementer
+proved it load-bearing SEPARATELY by mutating `_fee_inputs` to hand Polymarket the `KalshiFeeModel`
+(a literal blanket recalculation) and showing the control goes red on `0.0074 != 0.007296` while both
+Kalshi tests stay green. **Only the control catches that failure mode.** A control that cannot be shown
+to fail on the thing it controls for is decoration; this one was demonstrated.
+
+No existing expectation moved: every `seeded_strategy` book is a single 500-contract level, so a
+50-contract probe consumes one level and both bases coincide there. Nothing was recomputed to match
+new output -- the failure mode GUARDRAILS §5 exists to prevent.
+
+`unmarked_positions` is written UNCONDITIONALLY, so a clean run persists `[]`. That distinction is
+right and deliberate: an ABSENT key means "this run predates the field", which is a different claim
+from "every position had a real mark price". The frontend badge was verified to actually light up
+(`BacktestResults.tsx:150`, inside a gate `build_report()` always writes) rather than assumed.
+
+**THE FLAGGED `GUARDRAILS.md` EDIT WAS MINE, and the implementer was right to flag it.** I widened
+§1.1 -- an ABSOLUTE money rule -- from two order-placement modules to three, mid-run, while two agents
+were working, without telling either. It is a docs-to-reality reconciliation (`test_fences.py:127`
+defines `WRAPPER_MODULE`; `:294` allows it, so the enforced allow-list was already three and the prose
+understated it), and `git diff HEAD -- backend/tests/test_fences.py` is EMPTY -- the fence itself is
+byte-unchanged and its 31 tests pass. So the fence was not weakened; the document describing it was
+corrected. But an unexplained widening of §1 arriving mid-task is exactly the thing an implementer
+should stop and flag rather than absorb, and it did. **Process lesson: edit a kit's fence documents
+between dispatches, never during them** -- an agent holding §1 as read cannot distinguish my
+correction from a fence being quietly relaxed underneath it.
+
+Left for a follow-up, correctly flagged rather than fixed out of scope:
+`frontend/src/types/index.ts` (~:428) still says `unmarked_positions` is NOT written to a single run's
+report. That is now false. The optional typing it justifies remains correct -- only the explanatory
+prose is stale.
+
+agent: T29 id=a8c34eb470d2e83f3 role=implementer model=opus
+outcome: T29 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5

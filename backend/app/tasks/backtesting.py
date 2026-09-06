@@ -66,6 +66,18 @@ def build_report(result: BacktestResult) -> dict[str, Any]:
         "positions_settled": result.positions_settled,
         "unrealized_at_end": len(result.unrealized_at_end),
         "unrealized_notional_at_end": result.unrealized_notional_at_end,
+        # A position the engine could never find a mark price for is
+        # carried at its ENTRY price by `Portfolio.total_equity`, which
+        # is indistinguishable from a position that simply has not moved
+        # — so a non-empty list here means part of `equity_curve` /
+        # `final_value` is not a market number at all. The engine already
+        # logs each id once at WARNING and publishes them on
+        # `BacktestResult.unmarked_positions`; persisting them is what
+        # lets `GET /backtests/{id}` (and the `BacktestResults` badge
+        # that already reads `report.unmarked_positions`) qualify the
+        # number after the in-process result is gone. A `tuple` would not
+        # survive the JSON column, hence `list`.
+        "unmarked_positions": list(result.unmarked_positions),
         # Survivorship census.
         "coverage": {
             "markets_seen": coverage.markets_seen,

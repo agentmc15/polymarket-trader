@@ -92,17 +92,27 @@ Two of the inputs are not naturally per-contract and are converted here:
   Kalshi additionally ceilings each FILL to whole cents for non-direct
   members (`app/venues/fees.py`). That floor is a fixed $0.01 minimum per
   fill, so its per-contract weight depends entirely on how many contracts
-  the fill carries. Measured on this repo's own fee models: at `p = 0.995`
-  a 1-contract fill costs 0.025% of notional on Polymarket and 1.005% on
-  Kalshi — a 40x difference that exists only because of the cent floor,
-  while Polymarket's `p(1-p)` term collapses at the tails. This module
-  therefore prices each leg's fee for the WHOLE `probe_size` fill and
-  divides, rather than calling `fee(price, 1.0, ...)` — which would
-  charge the cent floor once per contract and overstate Kalshi's cost by
-  ~14% at these prices. **That is why `probe_size` defaults to 50 and not
-  to 1**: it is simultaneously the depth the book is walked for and the
-  fill the cent floor is amortized over, and the two must be the same
-  number or the quoted ask and the quoted fee describe different trades.
+  each fill carries — which is decided by the BOOK, not by the order.
+  This module therefore calls `fee()` ONCE PER FILL the probe's walk
+  actually consumes and sums the results, then divides by `probe_size`,
+  exactly as `settlement_edge.evaluate()` does and exactly as
+  `app/execution/fill_engine.py` charges at execution time. It does NOT
+  price the probe as one aggregate fill (which understates Kalshi's cost
+  whenever the walk spans more than one level: at Kalshi's 0.07 rate a
+  50-contract probe at `p = 0.20` costs $0.0112/contract as one fill and
+  $0.0200/contract when the same 50 contracts fill one at a time — a
+  0.88 pp gap against a `min_net_edge` gate of 0.015), and it does NOT
+  price it at `fee(price, 1.0, ...)` (which charges the cent floor once
+  per contract and so assumes the WORST fragmentation regardless of what
+  the book offers — `binary_complement_arbitrage` and
+  `multi_outcome_bundle_arbitrage` still do that, erring toward refusing
+  edges rather than admitting them). On Polymarket the three bases agree
+  to the float, because its fee is linear in size and flat in fill count;
+  the whole divergence lives on Kalshi. **That is why `probe_size`
+  defaults to 50 and not to 1**: it is simultaneously the depth the book
+  is walked for and the size the summed per-fill fee is divided back
+  over, and the two must be the same number or the quoted ask and the
+  quoted fee describe different trades.
 * **Redemption gas.** `settings.redemption_gas_usd` is a Polygon cost
   charged PER POSITION redeemed, not per contract, and there are two
   positions (one per leg). It is amortized over `probe_size` exactly as
@@ -193,8 +203,8 @@ _EPSILON = 1e-12
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # CONTRACTS. The depth each leg's book is walked for to obtain the
-    # marginal ask, AND the fill size each leg's fee is priced at before
-    # being divided back to a per-contract number, AND the divisor that
+    # marginal ask, AND the divisor that turns that leg's summed
+    # per-fill fee back into a per-contract number, AND the divisor that
     # amortizes the fixed `2 * redemption_gas_usd`. These MUST be one
     # number (see the module docstring): a marginal ask quoted for 50
     # contracts and a fee quoted for 1 describe different trades. 50 is
@@ -237,6 +247,28 @@ def _fee_inputs(venue: VenueId, category: str | None) -> tuple[FeeModel, FeeSche
     if venue == "kalshi":
         return KalshiFeeModel(), default_kalshi_schedule()
     return PolymarketFeeModel(), category_fee_schedule(category)
+
+
+def _weighted_ask(fills: Sequence[tuple[float, float]]) -> float:
+    """Return the size-weighted average price of `fills`.
+
+    The ask half of `_probe_fills`'s output. Split out from the fee half
+    on purpose: the ASK is a blend (paying 0.20 for 30 contracts and 0.21
+    for 20 really does cost the same as paying 0.204 for 50), while the
+    FEE is not (Kalshi charges its whole-cent ceiling once per fill, so
+    two fills cost more than one fill of the same total size). Collapsing
+    the walk to this number before pricing the fee is exactly the mistake
+    this module used to make.
+
+    Args:
+        fills: `(price, qty)` levels, `qty > 0` in total. Prices are
+            probabilities in [0, 1]; quantities are contracts.
+
+    Returns:
+        float: Size-weighted average price, a probability in [0, 1].
+    """
+    filled = math.fsum(qty for _, qty in fills)
+    return math.fsum(price * qty for price, qty in fills) / filled
 
 
 def _complement(outcome: str) -> str | None:
@@ -654,31 +686,52 @@ class CrossVenueArbitrageStrategy(BaseStrategy):
             return None
 
         size = float(self.config["probe_size"])
-        ask_a = self._marginal_ask(venue_a, link.market_a, outcome_a, size)
-        ask_b = self._marginal_ask(venue_b, link.market_b, outcome_b, size)
-        if ask_a is None or ask_b is None:
+        fills_a = self._probe_fills(venue_a, link.market_a, outcome_a, size)
+        fills_b = self._probe_fills(venue_b, link.market_b, outcome_b, size)
+        if fills_a is None or fills_b is None:
             return None
+        ask_a = _weighted_ask(fills_a)
+        ask_b = _weighted_ask(fills_b)
 
         model_a, schedule_a = _fee_inputs(venue_a, snapshot_a.category)
         model_b, schedule_b = _fee_inputs(venue_b, snapshot_b.category)
-        # Priced as ONE aggregate fill of the whole probe and divided
-        # back (module docstring) -- `ask_a`/`ask_b` are `_marginal_ask`'s
-        # size-weighted blend across however many book levels `walk`
-        # actually consumed, and this call charges the fee for that
-        # blended price once, as if it were a single fill. It is NOT "the
-        # fill it is actually charged on": on Kalshi the whole-cent
-        # per-fill floor is charged PER FILL, so a probe that walks
-        # multiple levels is charged that floor multiple times in
-        # reality, once here. The error is one-directional -- this always
-        # UNDERSTATES Kalshi's true cost when the walk spans more than
-        # one level, never overstates it -- and measured on a fragmented
-        # tail book it has understated edge by up to 0.86 percentage
-        # points, against this strategy's own `min_net_edge` gate of
-        # 0.015 (1.5%). Left as a known approximation (not fixed here):
-        # unifying the fee basis across all four scored strategies is a
-        # separate change with its own blast radius.
-        fee_a = model_a.fee(ask_a, size, "taker", schedule_a) / size
-        fee_b = model_b.fee(ask_b, size, "taker", schedule_b) / size
+        # ONE `fee()` call PER FILL, summed, then divided by the probe
+        # size -- the same basis `settlement_edge.evaluate()` prices on
+        # and the same basis `app/execution/fill_engine.py` actually
+        # charges at execution time (one `fee()` call per consumed book
+        # level). `_probe_fills` returns `None` unless the walk covered
+        # the whole probe, so the fills below sum to exactly `size` and
+        # the divisor is the size that was really filled, not one merely
+        # assumed.
+        #
+        # This is NOT the same number as pricing the probe as a single
+        # aggregate fill of `size` at the blended `ask`. On Polymarket it
+        # is (its fee is linear in size and flat in fill count, so the
+        # two agree to the float) -- but Kalshi ceilings each FILL to
+        # 6dp and then to whole cents (`app/venues/fees.py`: "callers
+        # that need an order-level total must call `fee()` once per
+        # `Fill` and sum the results, never call it once with an order's
+        # aggregate size"), so a probe that fills across N levels pays
+        # that floor N times. The aggregate basis therefore UNDERSTATED
+        # Kalshi's cost by up to 0.88 cents per contract at `p = 0.20`
+        # (0.0112 aggregate vs 0.0200 fully fragmented, 50 contracts at
+        # the 0.07 rate) -- more than half of this strategy's own
+        # `min_net_edge` gate of 0.015 -- and it understated it on the
+        # one strategy that also carries cross-venue settlement risk,
+        # i.e. the leg where an optimistic cost estimate is most
+        # expensive to be wrong about.
+        fee_a = (
+            math.fsum(
+                model_a.fee(price, qty, "taker", schedule_a) for price, qty in fills_a
+            )
+            / size
+        )
+        fee_b = (
+            math.fsum(
+                model_b.fee(price, qty, "taker", schedule_b) for price, qty in fills_b
+            )
+            / size
+        )
         gas_per_contract = (2.0 * settings.redemption_gas_usd) / size
 
         cost = ask_a + ask_b + fee_a + fee_b + gas_per_contract
@@ -824,15 +877,25 @@ class CrossVenueArbitrageStrategy(BaseStrategy):
 
     # -- internals --------------------------------------------------------
 
-    def _marginal_ask(
+    def _probe_fills(
         self, venue: str, market_id: str, outcome: str, size: float
-    ) -> float | None:
-        """Return the size-weighted ask for `size` contracts, or `None`.
+    ) -> list[tuple[float, float]] | None:
+        """Return the `(price, qty)` fills buying `size` contracts would take.
 
         Uses `OrderBook.walk("buy", size)` — the repo's single depth
-        primitive (best-first, never over-fills, order-independent). A
-        book that runs dry before `size` returns `None`: the average of a
-        partial fill is not the price of the whole order, and reporting
+        primitive (best-first, never over-fills, order-independent) — and
+        returns the LEVEL BREAKDOWN rather than collapsing it to the
+        size-weighted average `evaluate()` quotes as the ask. Keeping the
+        breakdown is what lets `evaluate()` price the fee ONE FILL AT A
+        TIME: Kalshi's whole-cent ceiling is charged per fill, so how
+        many levels the probe consumes is part of what it costs and is
+        not something a blended average can carry.
+        `settlement_edge._priced_fills` keeps its walk for the same
+        reason, and `app/execution/fill_engine.py` charges per consumed
+        level for the same reason again.
+
+        A book that runs dry before `size` returns `None`: the average of
+        a partial fill is not the price of the whole order, and reporting
         it as one is how a paper arb survives a book that could never
         have filled it (PLAN.md R4).
 
@@ -843,8 +906,10 @@ class CrossVenueArbitrageStrategy(BaseStrategy):
             size: Contracts to price, `> 0`.
 
         Returns:
-            float | None: Size-weighted ask in [0, 1], or `None` if no
-                book is cached for this key or it cannot supply `size`.
+            list[tuple[float, float]] | None: The levels consumed, best
+                price first, summing to `size` (within `walk`'s own
+                epsilon). `None` if no book is cached for this key or it
+                cannot supply `size`.
         """
         book = self._books.get((venue, market_id, outcome))
         if book is None:
@@ -866,7 +931,7 @@ class CrossVenueArbitrageStrategy(BaseStrategy):
                 },
             )
             return None
-        return math.fsum(price * qty for price, qty in fills) / filled
+        return fills
 
     def _build_intent(self, evaluation: CrossVenueEvaluation) -> Intent | None:
         """Size `evaluation` against per-venue capital and build the `Intent`.
