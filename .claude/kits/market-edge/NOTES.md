@@ -5853,3 +5853,554 @@ L3 closed with the right vocabulary: malformed metadata now raises `UnscorableIn
 
 agent: T39 id=a87877b8fe17dbd9a role=implementer model=sonnet
 outcome: T39 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+## Deployment coherence audit — adjudication
+
+Static only, per §1.4: no stack started, no `alembic upgrade head`, `.env` never read (it does not exist
+in this checkout), `docker compose config` render-only. The auditor cross-checked its findings against
+this kit's own NOTES.md and flagged which were already known versus fresh -- and independently
+re-verified the known ones against current source rather than trusting the notes. That is the right
+posture toward a 5,800-line audit trail.
+
+**NOTHING WOULD STOP THE STACK COMING UP.** `import app.main` clean, all routers mounted,
+`alembic upgrade head --sql` emits 589 lines exit 0 through a single linear `001 -> 007` chain, all 14
+mapped tables present in the offline DDL (the three extra `CREATE TABLE`s are the trader-mimicry tables
+created in `001` and dropped in `002` -- historical artifact, not orphans), `docker compose config`
+parses, service dependencies sane.
+
+**FINDING 1, VERIFIED MYSELF, AND THE MOST CONSEQUENTIAL: 44 of 56 settings never reach the
+container.** The `backend` service forwards exactly 12 env vars in dict form; there is NO `env_file:`
+directive anywhere in `docker-compose.yml`, and the volume mount is `./backend:/app`, which does not
+include the repo-root `.env`. `.env.example` instructs "copy this file to `.env`" -- an instruction
+that is FALSE for 44 of the file's settings under `docker compose up`, with pydantic silently falling
+back to compiled-in defaults and no error anywhere.
+
+Two consequences, different in kind and worth separating:
+  - `TRADING_MODE`/`LIVE_TRADING_CONFIRMATION` do not forward -> fails SAFE. Live mode is simply
+    unreachable via Docker. Not a money bug; an operator gets silence instead of either behavior.
+  - **`KALSHI_API_KEY_ID` and `KALSHI_PRIVATE_KEY_PEM` do not forward either -> the dockerized
+    deployment cannot authenticate to Kalshi AT ALL.** That is functional, and cross-venue arbitrage --
+    the repo's stated purpose -- needs both venues. `KILL_SWITCH_PATH` and the four risk limits are the
+    same: settable in `.env`, inert in Docker.
+
+This is the `extra="ignore"` family again, one layer out: the SETTINGS binding is correct (the auditor
+checked that direction first and found it clean -- every `.env.example` name resolves to a real alias),
+but the DEPLOYMENT PATH is what silently drops the value. Same failure shape, different layer.
+Dispatched T40.
+
+**FINDING 2: the one-worker money rule is enforced for uvicorn and not for Celery.** The Dockerfile
+pins `--workers 1` with a money-safety comment (T26's fix); `celery-worker`'s command has no
+`--concurrency`/`--pool` flag and nothing sets `worker_concurrency`, so the default prefork pool spawns
+`os.cpu_count()` SEPARATE OS PROCESSES -- precisely what `router.py`'s class docstring names as
+unguarded. **Not a live violation, verified:** none of the four registered tasks calls
+`OrderRouter.submit()` and each says so in its docstring. Structural gap, dispatched T40 with the
+instruction to justify rather than pin blindly -- the property that matters is "no second process
+routes orders", not "no second process exists", and the discovery beats are I/O-bound and harmless in
+parallel.
+
+**FINDING 3: three beats report success while doing nothing.** `sync-markets-every-5-minutes`,
+`sync-prices-every-minute`, `reset-daily-stats-at-midnight` all resolve to real callables that are
+`# TODO` stubs returning `{"status": "success", ...: 0}`. They fire, do nothing, and REPORT HEALTH --
+worse than erroring, because a dashboard shows three green beats and the repo DOES have real market
+collection (`data_collector.py` via `scripts/collect_prices.py`), so green reads as "sync is working".
+Dispatched T41.
+
+**FINDING 4: the `/markets` envelope will silently render empty when implemented.** The stub returns
+`{"markets": [...]}`; the frontend's `PaginatedResponse<T>` expects `{data: [...]}` and `useMarkets`
+reads `response.data || []`. Masked today because the stub returns nothing either way -- but Markets is
+the DEFAULT tab, so the day listing is implemented to the shape its own stub declares, the UI shows
+empty with no error anywhere. A working backend and a blank screen is among the hardest bugs to trace.
+Free to fix now; dispatched T41.
+
+**FINDING 5: nine live settings absent from `.env.example`** (`SCAN_TOP_N`,
+`SCAN_BOOK_FETCH_CONCURRENCY`, `SCAN_INTERVAL_S`, `NEAR_RESOLUTION_SCAN_INTERVAL_S`, `MAX_SLIPPAGE_BPS`,
+`LINK_PROPOSAL_INTERVAL_S`, `BOOK_MATCH_WINDOW_S`, `BOOK_COLLECTION_TOP_N`,
+`POLYMARKET_MARKET_CACHE_TTL_S`) -- every one a knob for the three beats this audit was asked to check.
+NOTES.md records this exact class being fixed ONCE for `MIN_TRADE_USD`, and every field added since
+reopened it. T40's brief asks for a structural test (enumerate `Settings.model_fields` aliases, assert
+each appears in `.env.example`) rather than nine more lines that will rot the same way.
+
+**FINDING 6: README stale in three places, two of which now understate the system** -- it claims 738
+tests (826), and lists as open two limitations that are FIXED (cross-venue having no scheduled job;
+the Results tab not activating). Dispatched T41 with instructions to verify each against code and to
+NOT delete the limitations section, whose remaining entries are still true and load-bearing honesty.
+
+**WHAT IS GENUINELY CLEAN, worth stating:** every `.env.example` name binds to a real `Settings` alias
+(the incident-shaped check came back clean); all three target beats are registered, resolve to real
+importable callables, and take their intervals from `Settings` rather than literals, with relative
+sizing (120s / 300s / 3600s) deliberately justified in the module docstrings; the migration chain is
+linear with one head; the actively-rendered API surfaces (`/arbitrage/*`, `/links/*`,
+`/trading/mode`, all of `/backtests/*`) match their TypeScript consumers field for field; secrets
+hygiene holds; and no hardcoded author-machine paths exist in `backend/app/`.
+
+agent: deploy id=a2da84901781206cc role=verifier model=sonnet findings=6 confirmed=6 result=accepted
+
+### T40
+
+Implemented the deployment-coherence fixes for findings 1, 2 and 5 above. Files touched:
+`docker-compose.yml`, `.env.example`, and a new `backend/tests/test_env_example_coverage.py` (the
+brief's own text invites this test explicitly; `docker/backend/Dockerfile` needed no change).
+
+**Defect 1.** Added `env_file: [{path: .env, required: false}]` to `backend`, `celery-worker` and
+`celery-beat`. `required: false` matters on this Compose version (v2.35.1-desktop.1, confirmed with a
+throwaway `services: {foo: {env_file: [{path: ./nope.env, required: false}]}}` test file): a fresh
+clone with no `.env` yet still renders and starts, falling back to `Settings` defaults exactly as
+before, rather than `docker compose` refusing to run. Classified the 12 previously-forwarded vars into
+two groups per the brief's instruction:
+  - DERIVED FROM COMPOSE TOPOLOGY, kept as explicit `environment:` entries (which win over `env_file:`
+    for the same key, so this is what keeps them pinned): `DATABASE_URL` (composed from the `postgres`
+    container's own `POSTGRES_USER`/`PASSWORD`/`DB`, `${VAR:-default}` interpolation left untouched),
+    `REDIS_URL`, `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND` (all three hardcoded to the compose
+    network's own `redis` hostname, never using `${VAR}` at all).
+  - PLAIN PASS-THROUGHS, removed from the explicit block now that `env_file:` covers them: `SECRET_KEY`,
+    `DEBUG`, `LOG_LEVEL`, and the five `POLYMARKET_*` credential vars on `backend`; `SECRET_KEY` alone
+    on `celery-worker`/`celery-beat` (celery-worker's five Polymarket vars removed the same way). Their
+    old `${VAR:-default}` compose-level defaults were redundant with `Settings`'s own defaults in every
+    case (verified by inspection, e.g. compose's `change-me-in-production` == `Settings.secret_key`'s
+    default), so dropping them changes nothing when `.env` is absent and fixes everything when it is
+    present. Verified with a disposable, placeholder-only `.env` (`KALSHI_API_KEY_ID=test-key-id`,
+    `TRADING_MODE=paper`, `SCAN_TOP_N=5` -- no real key, deleted immediately after) that
+    `docker compose config backend celery-worker` now actually surfaces `KALSHI_API_KEY_ID`,
+    `TRADING_MODE` and `SCAN_TOP_N` in the rendered environment, which it did not before this task.
+    Never read the real `.env` (none exists in this checkout).
+
+**Defect 2.** `celery-worker`'s command gained `--concurrency=1`, with a comment explaining why in the
+same register as the Dockerfile's `--workers 1` comment: at concurrency 1 exactly one task executes at
+a time regardless of which pool implementation is in effect, which is the actual property
+`OrderRouter`'s docstring needs ("no second process routes orders") -- concluded pinning is the right
+trade, not the wrong one, because the four current beats are cheap enough that serializing them costs a
+queuing delay, not correctness, and the alternative (`worker_concurrency` in `app/tasks/__init__.py`)
+is out of scope here since that file is another agent's (T41). Left `celery-beat` alone: it only
+schedules, it never executes a task body, so it has no pool/concurrency knob to bound in the first
+place.
+
+**Defect 3.** Added the nine named settings to `.env.example`, plus `APP_NAME` and `APP_VERSION` --
+both are real `Settings` fields, both are read by production code (`app/main.py`'s `title=`/`version=`),
+and both were absent from the brief's list of nine as well as from the file itself.
+
+defect: T40 kind=incomplete-enumeration -- brief's Defect 3 named nine missing settings; a full
+`Settings.model_fields` sweep found eleven (`APP_NAME`, `APP_VERSION` additionally). Added all eleven
+rather than stopping at nine, since leaving two known instances of the exact bug class unfixed would
+have made the new drift test fail on its first run.
+
+Wrote `backend/tests/test_env_example_coverage.py`: enumerates `Settings.model_fields` (alias, or
+field name upper-cased when no alias -- matches how `case_sensitive=False` actually resolves env names),
+extracts every `^#?\s*NAME=` at line-start in `.env.example`, and asserts set equality up to an explicit
+`_NON_SETTINGS_NAMES` exemption (`POSTGRES_USER`/`PASSWORD`/`DB`, `VITE_API_URL` -- the same four the
+brief names). Checks both directions: a `Settings` alias missing from the file, and a name in the file
+that is neither a real alias nor an exemption (catches a stray/typo'd name too). Proved red before
+green: copied `.env.example`, deleted the `# SCAN_TOP_N=200` line, swapped it in, reran
+`pytest tests/test_env_example_coverage.py` (failed with `['SCAN_TOP_N'] are real Settings aliases with
+no line in .env.example`, the other two tests still passing), then restored the real file from a backup
+copy and diffed to confirm byte-identical restoration before moving on.
+
+**Verification.** `docker compose config` renders successfully (only a pre-existing, unrelated warning
+that the top-level `version: '3.8'` key is obsolete -- present before this task, left alone as out of
+scope). `cd backend && python3 -m pytest -q` -> 831 passed, 0 failed (826 baseline + 3 from
+`test_env_example_coverage.py` + 2 from a concurrent agent's new `tests/api/test_markets.py`, T41).
+`git status --porcelain` shows exactly `docker-compose.yml`, `.env.example` and the new test file as
+mine; `README.md`, `backend/app/api/routes/markets.py`, `backend/app/tasks/__init__.py`,
+`backend/app/tasks/bot_execution.py`, `backend/app/tasks/market_sync.py`, `backend/tests/api/test_markets.py`
+and this NOTES.md file's own earlier content belong to the concurrent T41 agent and were left untouched.
+Never ran `docker compose up`, never contacted a venue, never read or printed a real secret.
+
+### T41
+
+Implemented all three findings from the deployment coherence audit. Suite started at 826 passed on
+main, tree clean.
+
+**Defect 1 (three beats reporting success while doing nothing).** Chose to unregister
+`sync-markets-every-5-minutes`, `sync-prices-every-minute` and `reset-daily-stats-at-midnight` from
+`celery_app.conf.beat_schedule` in `app/tasks/__init__.py`, rather than keep them scheduled and change
+their return value to a status monitoring would not read as success. Every OTHER entry in that same
+dict carries a comment justifying why it is safe and useful to fire on a clock (T14, T19, T25, T30) --
+an unimplemented stub with no such justification was the actual anomaly, and removing it makes the
+file internally consistent with its own convention rather than introducing a new one. It also matches
+how `sync_orderbooks`, `check_stop_loss` and `check_take_profit` (same kind of stub, in the same two
+files) were already being treated -- none of those three was ever on the beat schedule either. The
+alternative (fire every 60s, always report failure) would generate a recurring alert/log signal that
+reads as "something regressed" rather than "this was never built", which is its own flavor of
+misleading, and noisy besides. The task callables themselves are untouched and still importable (so
+`include=[...]` and any manual/`celery call` invocation keep working); each stub's `# TODO` comment now
+points at the beat-schedule comment explaining the omission, and at the real, already-working data path
+(`app.services.data_collector.DataCollector` via `app.scripts.sync_markets` / `collect_prices.py`) so a
+future implementer knows where the real logic already lives before writing new code. `reset_daily_stats`
+also turned up a second latent issue worth recording though it is not part of this defect: even if
+implemented, calling `Bot.reset_daily_stats()` (`app/bots/base.py`) from a Celery worker would not do
+anything real, because `BotManager` holds bots in the API process's own memory -- a Celery worker is a
+separate process with no access to it. Left as a comment pointing this out; not fixed here (would need
+DB-backed bot state, well beyond this task).
+
+**Defect 2 (`/markets` envelope mismatch).** Picked `data` (matching the frontend's generic
+`PaginatedResponse<T>`) over `markets` (the sibling convention `BacktestListResponse`/
+`OpportunitiesResponse`/`LinkListResponse`/`OrderListResponse`/`PositionListResponse` all use). Checked
+all five of those: every one pairs with a BESPOKE frontend interface of the same resource name, mirrored
+field-by-field -- `PaginatedResponse<T>` is the only GENERIC envelope type in the frontend, and
+`getMarkets()` is its only real caller anywhere in `frontend/src`. That reads as a deliberate contract
+for this one endpoint, not an accident. Practically: matching `data` fixes the mismatch entirely inside
+`backend/app/api/routes/markets.py`, which is the only file in scope for this defect -- the `markets`
+side would leave the actual bug (working backend, blank default tab, no error) unfixed, since curing it
+would require a frontend edit that is out of this task's file set. Added
+`backend/tests/api/test_markets.py::test_list_markets_envelope_shape` (asserts the key set is exactly
+`{data, total, skip, limit}`) plus a pagination-roundtrip test, so the shape cannot drift back silently.
+Left a long comment at the route's `return` spelling out the reasoning for whoever implements real
+listing next, since the whole point of this fix was to be legible without re-deriving it from git blame.
+
+**Defect 3 (README stale in three places).** Verified both README claims against code rather than
+trusting the brief's summary: `propose-event-links` IS registered in `celery_app.conf.beat_schedule`
+at `settings.link_proposal_interval_s` (default 3600.0s, i.e. hourly) -- limitation #4 confirmed fixed.
+`POST /backtests` returns `BacktestResponse.id` (backend) and `frontend/src/components/backtesting/
+Backtesting.tsx` reads `result.id` via `BacktestResponse.id: number` (frontend) -- limitation #6
+confirmed fixed. Removed both from the numbered list and renumbered the remaining four (multi-outcome
+bundle backtesting, complement NO-leg synthesized depth, `PriceHistory` missing an outcome column,
+non-uniform fee basis across strategies) -- spot-checked all four against current code
+(`MarketSnapshot.book` in `app/strategies/base.py` is still a single field;
+`app/models/price_history.py` still has no outcome column) and all four are still true, so the section
+was corrected, not gutted. Updated the test count (738 -> 826, matching the count at the start of this
+task). Went looking for other stale numbers per the brief's instruction and checked two candidates:
+PLAN.md's decision range (README says "D1-D13"; PLAN.md now also has a D14) -- left alone, because D14
+("Roster and model pins") is a kit-execution/model-routing decision, not a trading-system architecture
+decision, so "Architecture decisions D1-D13" is still an accurate description of what's actually in that
+range. The "~139 ruff findings" baseline the README borrows from GUARDRAILS.md/PLAN.md's own pinned,
+approximate figure now measures closer to 69 (`ruff check .`) / 29 (`ruff check app/`) -- left
+untouched, since PLAN.md/GUARDRAILS.md are out of this task's file set and treat that number as a
+kit-inception snapshot rather than a live count (same treatment as the pinned venue API facts in
+PLAN.md SS3); editing only the README's copy would just create a new inconsistency between documents I
+can and cannot touch. Also noticed nine `app/strategies/*.py` files (`catalyst_momentum`,
+`correlation_hedging`, `term_structure_spreads`, `favorite_compounder`, `no_bias_exploit`) beyond the
+four the README's "Inefficiency detection" table describes -- these are real, registered, backtestable
+via `POST /backtests`/`GET /backtests/strategies` (`STRATEGIES`/`STRATEGY_CATEGORIES` in
+`app/strategies/__init__.py`), just outside `ARBITRAGE_STRATEGIES`/the near-resolution pass, so they
+never reach the live scanner. Not a regression and not one of the three named findings, so left alone
+here, but flagging it since a table titled "Inefficiency detection: four strategies" reads as
+exhaustive to someone who has not read `app/strategies/`.
+
+Neither README claim contradicted repo reality, so no `defect:` line for this task. Suite finished at
+831 passed (826 baseline + 2 new markets-envelope tests + 3 from a concurrent agent's
+`test_env_example_coverage.py`, unrelated to this task). `ruff check`/`mypy` scoped to the five backend
+files touched here reproduce identical finding counts against the pre-existing versions of those files
+(5 ruff `ARG001` in `markets.py`, 6 mypy `misc` "untyped decorator" in the two task files) -- confirmed
+via `git stash` that none of it is new. `git status --porcelain` showed only this task's five files plus
+`README.md`, this NOTES.md entry, and the concurrent agent's `.env.example`/`docker-compose.yml`/its own
+test file -- nothing unexpected.
+
+### T42
+
+Both fence gaps confirmed against repo reality before touching anything. F1 (`_lifecycle_findings`'s
+`_writes_a_link` branch, `tests/matching/test_link_proposal_beat.py`): the branch iterated
+`node.keywords` and never `node.args`, so `Update.values()`'s mapping passed as its first positional
+argument -- `.values({"status": _CLEARED, ...})`, ordinary SQLAlchemy and the real shape
+`app/services/matching/persist.py`'s own `update_proposal` calls `.values(...)` with, just via keywords
+instead -- went unseen (form 8a). `dict(status=_CLEARED, ...)` in place of a `{...}` literal also went
+unseen wherever it reached the existing `**`-unpack branch (forms 8b/8c, the same shape as T39's form 7
+with call syntax instead of dict-literal syntax). Fixed by adding a `for arg in node.args` loop applying
+the existing dict-literal key extractor to positional arguments, and teaching that extractor
+(`_dict_literal_lifecycle_keys`) a second branch for `ast.Call` to `dict(...)`, reading its keywords.
+Verified against the real tree first: grepped every `EventLink(`/`.values(`/`dict(` call in
+`app/services/matching/*.py` and confirmed none of the existing `dict(x)`-with-positional-arg calls
+(`dict(proposal.evidence)`, `dict(WEIGHTS)`, etc.) carry keyword arguments, so the widened rule adds zero
+new findings against real code -- `test_the_matching_package_cannot_write_a_lifecycle_value` still passes
+with `findings == []`. Test added: `_pre_t42_dict_literal_lifecycle_keys` and `_pre_t42_findings` are
+frozen, non-derived duplicates of the pre-fix rule set (same pattern as T39's `_pre_t39_findings`, and
+for the same reason -- sharing code with the live rules would let the "old" rules silently regain new
+coverage the next time someone touches a shared helper), and
+`test_the_extended_fence_catches_the_form_8_spellings_the_t39_fence_missed` proves red (frozen rules find
+nothing against a tmp-path copy of `persist.py` carrying the three appended forms) then green (current
+rules flag all three by line). Re-checked `_lifecycle_findings`'s docstring claim ("closes every spelling
+that names its target lifecycle column as source-level text and stops there") against what the fixed
+code actually does, per the brief's instruction to correct rather than restate an overstated claim: it
+is still not literally true. A mapping built on an earlier line and passed by name --
+`payload = {"status": _CLEARED}` followed by `.values(**payload)` -- carries the literal `"status"` key
+as genuine source-level text, yet is invisible to a rule that only inspects the shape of the argument
+expression AT the write call itself, not any assignment feeding it. Unlike form 5 this is not
+undecidable in principle (a dataflow-aware fence could resolve a same-module local binding), it is just
+not attempted, because chasing it risks the opposite failure -- misreading an unrelated variable's own
+`"status"` key as an `EventLink` write. Documented this as a second, narrower admitted gap alongside form
+5 rather than leave the docstring's blanket claim standing; no test added for it since the brief's ask
+was the three form-8 spellings specifically and adding an unrequested test for a newly-named gap risked
+scope creep beyond what was asked, but a future task should treat it the same way form 5 was treated here
+if it ever needs closing.
+
+F5 (`_request_body_models`/`_response_models`, `tests/api/test_request_models_forbid_extras.py`): both
+walked `application.routes` and skipped anything that was not already an `APIRoute`, so a sub-application
+attached with `app.mount(path, sub_app)` -- which appears in the parent's `.routes` as a single
+`starlette.routing.Mount`, never an `APIRoute` -- had its entire route table skipped, body models and
+all. Confirmed latent rather than live first: `app/main.py` calls `app.include_router(...)` only, no
+`.mount(...)` anywhere in the app it builds, so `EXPECTED_REQUEST_MODELS`'s six real models were never at
+risk and the real-tree fence tests were unaffected either way. Fixed with `_api_routes`, a small generator
+that yields every `APIRoute` reachable from a route list, recursing into `Mount.routes` (a `Mount`'s own
+property, already resolving to `[]` for an ASGI app with no `.routes`) so nesting -- a mount inside a
+mount -- is handled the same way `_reachable_models`'s cycle guard already handles recursive model
+nesting. Both `_request_body_models` and `_response_models` now iterate `_api_routes(application.routes)`
+instead of `application.routes` directly. Test added:
+`test_the_walker_sees_a_permissive_model_behind_a_mounted_sub_application`, same red/green shape as the
+two existing T39 F4 controls (Depends, ForwardRef) -- a throwaway parent app mounts a throwaway FastAPI
+sub-app carrying one permissive body model at `/sub/probe`; red is the pre-T42 walker (inline, not
+calling `_request_body_models`, for the same non-derivation reason as everywhere else in this file) finding
+nothing, green is the current walker finding it, and the closing assertion reproduces the module's
+founding bug end-to-end through the mount: `TestClient` posts `{"slippage_bps": 50}` and gets back
+`{"slippage_value": 0.001}` with a 200, silently discarding the caller's real value, exactly as
+`BacktestRequest` once did directly. Ran the full existing fence suite (all nine tests in the file, now
+ten) against the real `app.main.app` afterward and `test_the_walker_finds_the_request_models_it_is_
+supposed_to_check`/`test_every_request_body_model_forbids_unknown_fields` still find exactly the same six
+models with the same `extra="forbid"` verdicts -- the widened walker changes nothing about what it sees
+in the app that exists today, only what it would see if a mount were added later.
+
+Both fixes verified against the real tree only, never against a mutated tracked file -- every red/green
+proof runs against either a `tmp_path` copy of `persist.py` (F1) or a throwaway in-memory `FastAPI()`
+instance built inside the test (F5). Full suite: 833 passed (831 at task start + 2 new tests, one per
+fence). `ruff check`/`mypy` scoped to the two touched test files: ruff clean on both; mypy clean on
+`test_request_models_forbid_extras.py`, and one pre-existing `Unused "type: ignore" comment` finding in
+`test_link_proposal_beat.py` (on the `Unreadable.list_markets` stub, unrelated to either fence) --
+confirmed via `git stash` that this finding is already present on `main` before this task's edits, just
+at a different line number after this task appended content below it; left untouched as out of scope.
+`git status --porcelain` at the end showed only this task's two files plus this NOTES.md entry and the
+concurrent agent's `app/api/routes/links.py`/`app/venues/polymarket/adapter.py` -- nothing unexpected.
+No `defect:` line for this task: both findings matched repo reality exactly as described in the brief.
+
+## Red-team, concurrency and memo surfaces — adjudication
+
+Read-only, zero repo writes (every probe under `$TMPDIR`, every bypass appended to COPIES of
+`persist.py` in a `TemporaryDirectory`). It scoped-confirmed its three targets untouched with a
+path-filtered `git status` and ran `pytest tests/matching/ tests/api/... tests/venues/` -> 306 passed.
+The amplifier for its thread-race repro was `sys.setswitchinterval` -- a scheduler knob, NOT a
+weakened guard, which is the distinction §1 asks for.
+
+**F1 CONFIRMED, and it is the worst SHAPE of fence gap: the fence missed the most IDIOMATIC way to
+write the thing it guards.** `Update.values()` takes a mapping as its FIRST POSITIONAL ARGUMENT --
+`update(EventLink).values({"status": "approved", ...})` -- and `_writes_a_link` iterated
+`node.keywords` and never `node.args`. It already special-cased `.values(...)`, already closed
+`.values(**{...})`, and simply never looked at positional args. All three form-8 spellings were
+EXECUTED against a real `EventLink` on SQLite and confirmed to persist `approved`. Meanwhile the
+fence's docstring claimed it "closes every spelling that names its target lifecycle column as
+source-level text and stops there."
+
+**F2 CONFIRMED (dispatched T43): `reject_link` destroys the prior reviewer's notes with a 200 OK.** A
+bare reject with no notes blanks a previous reviewer's reasoning, and a reject following an approve
+blanks that too. The module docstring calls `notes` "the most valuable text in this table ... knowledge
+no score can rediscover" and `reject_link`'s own docstring calls it "the durable output". **The
+deliberate no-precondition design was justified for the LIFECYCLE column and silently extended to the
+notes** -- a scope creep in a design decision, which is harder to spot than a coding error because the
+reasoning is sound right up to the point it stops applying.
+
+**F3/F4 CONFIRMED (T43):** the memo's hard entry cap does not bound the LOCK table (pruning sits below
+`_store`'s early return, and the over-cap path is driven by `_values`, which a failed factory never
+grows -- 10,000 failing keys left `_locks` at 10,000 against a 4,096 cap); and `_lock_for`'s
+check-then-mutate is not thread-safe across two concurrent loops. **Reachability stated honestly by
+red-team itself:** zero errors at Python's default 5ms switch interval over 3 x (4 threads x 3000
+rounds), and the shipped prefork pool gives one loop per process, so neither is live today.
+
+**F5 CONFIRMED (T42):** the request-model walker skipped anything that was not already an `APIRoute`,
+so an `app.mount()` sub-application's ENTIRE route table was invisible -- the module's founding bug
+reproduced through a shape its own docstring promises to cover ("re-derived from the LIVE ROUTE TABLE
+... rather than a hand-maintained list that the 38th model would quietly fall outside of"). A `Mount`
+is exactly that quiet fall-outside. Latent: `app/main.py` mounts nothing today.
+
+**WHAT SURVIVED, and the list is long and specific:** `rowcount` is trustworthy on both engines for
+this statement shape and is read from the just-executed cursor before any other statement;
+`synchronize_session=False` does leave a stale identity-mapped object, but no path trusts it (the
+guarded UPDATE re-checks in the DB and `propose` refreshes before rendering); no beat path clobbers
+outside `update_proposal` (no bulk insert, no `ON CONFLICT`, no `merge()`); all four approve/reject
+interleavings resolve fail-safe on both Postgres READ COMMITTED and SQLite; the memo's single-flight
+holds (8 concurrent gets -> exactly 1 factory call), its TTL is double-checked under the lock, a
+raising factory poisons nothing, and the cap boundary costs one extra fetch rather than degrading;
+sequential two-loop use over 400 `asyncio.run` rounds is clean. It also chased a suspected
+`reviewed_at` timezone divergence to a dead end and SAID so rather than reporting it as a finding.
+
+### T42 adjudication (orchestrator)
+
+Verified: `_api_routes` recurses into `Mount.routes` (and nested mounts), `node.args` is now inspected,
+`dict(...)` is treated as a dict literal, 21 fence tests pass, suite **839**.
+
+**IT FOUND A NINTH GAP WHILE FIXING THE EIGHTH, AND ADMITTED IT RATHER THAN RESTATING THE CLAIM.** A
+mapping built on an EARLIER LINE and passed by name (`payload = {"status": ...}; .values(**payload)`)
+is genuine source-level text but invisible to any call-site-only check. Rather than re-asserting
+"closes every spelling", the docstring now documents TWO admitted gaps -- form 5 (undecidable dynamic
+`setattr`) and this one -- at `:592` and `:712`. That is the behavior I asked for on the boundary and
+the second time this fence has been made more honest rather than more confident.
+
+It also grepped every `.values(`/`EventLink(`/`dict(` call in the real matching package BEFORE widening,
+to confirm the broader rule adds zero findings on real code. A widened fence that starts flagging
+legitimate code is worse than the gap it closed, and that check is what makes the widening safe.
+
+agent: T37-T39 id=a4fb2995e9cde4921 role=red-team model=opus findings=9 confirmed=8 result=accepted
+agent: T42 id=a54bd387a4194d895 role=implementer model=sonnet
+outcome: T42 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T43
+
+Four red-team findings, all four matching repo reality beyond a shifted line number, so no `defect:`
+line for this task. Files touched: `app/api/routes/links.py`, `app/venues/polymarket/adapter.py`,
+`tests/venues/test_polymarket_request_amplification.py`, and a new `tests/api/test_link_review_notes.py`.
+
+**F2, the one that mattered.** Reproduced exactly as briefed before touching anything: alice rejects
+link 1 with "Kalshi settles on the AP call, Polymarket on state certification", bob rejects it bare,
+and bob's absent `notes` -- the pydantic default `""` -- lands in the column with a 200. Same across a
+revocation: alice approves with "verified identical rules", mallory rejects bare, note gone. This is
+D9's whole product being deleted. The matcher can recompute `confidence` from the two markets forever;
+the sentence explaining WHY two contracts that score alike settle differently exists in exactly one
+place and came out of a person reading two rules texts.
+
+I picked APPEND over refuse-blank-over-non-blank, and the reason is that refusing only the empty
+overwrite closes half the finding. The reproduction has two shapes: the bare rejection, and a
+rejection carrying its own note. Refuse-empty stops the first and leaves the second exactly as it was
+-- bob types one word, alice's paragraph is deleted, 200, no trace. That is the same loss for the same
+reason, one reviewer later, and I did not want to ship a fix whose failure mode is the finding itself.
+Appending closes both and costs nothing structurally: `EventLink.notes` is `Text`, so accumulated
+history has no column bound (`RejectRequest.notes`' 4000 chars is per REQUEST), and -- the property
+that actually had to survive -- rejection still carries no precondition of any kind and still cannot
+fail on account of what a previous reviewer wrote. T37's asymmetry argument is untouched, because it
+was always an argument about the lifecycle column and never about `notes`.
+
+Two details of the merge I want on the record. The FIRST note on a row is stored byte-for-byte as the
+reviewer typed it, no header, because a row reaches its first rejection with `notes = None` (nothing
+in `app/services/matching/` writes that column), so there is nothing to preserve and nothing to
+disambiguate -- and that keeps the ordinary one-reviewer row identical in shape to what `approve_link`
+writes, which is also what `tests/matching/test_link_proposal_beat.py:325` asserts by equality (not
+my file; I checked before choosing the format rather than after breaking it). Headers appear only on
+APPENDED blocks, `[reviewer @ iso8601]`, and they carry a name and a time because `reviewed_by` and
+`reviewed_at` hold only the LATEST decision -- the moment a third rejection lands, that header is the
+only surviving record of who wrote the second note and when. I also kept `""` rather than `None` on
+the nothing-to-preserve path, so a bare first rejection stores what it stored before; the fix changes
+behaviour only where something would have been destroyed.
+
+One honest limitation I am not fixing here: two rejections committing concurrently still last-write-
+wins on the merged text, so a genuinely simultaneous pair can lose one note. That is the ORM-assignment
+shape `reject_link` has always had, and the alternatives (a guarded UPDATE, or SQL-side concatenation)
+would either put a failure mode on the fail-safe direction or move the merge into the database where
+it is much harder to read. Sequential rejections -- which is what a review queue actually produces --
+are safe, and that is the case the finding is about.
+
+**The terminal-rejection message.** The 409 said "Re-read the link before deciding it again", which
+reads as an instruction to retry and names an action the API does not have: `approve_link` requires
+`status = 'proposed' AND reviewed_at IS NULL`, `reject_link` only ever writes `"rejected"`, and
+`persist_proposals` skips decided rows, so nothing returns a link to `"proposed"` and a rejection filed
+against a mistyped `link_id` bans that pair permanently. I chose to make the message honest rather than
+to build a path back. Building one means loosening approve's precondition, which is the exact guard
+T37 added and `test_approving_a_link_another_reviewer_already_rejected_is_a_conflict` pins -- I was not
+going to weaken the only lifecycle guard in the subsystem to fix a sentence. The detail now says a
+decision is terminal on this API and that a link decided in error has to be corrected in the database
+directly, which is where the recourse actually is. The `already 'rejected'`/`already 'approved'`
+phrasing is unchanged so the existing race tests still read the same substring.
+
+**Symmetric logging.** `persist_proposals` logs `link_rescore_declined_decided_row` when the BEAT loses
+a race to a human; the mirror case -- a reviewer's approval declined because someone already decided
+the link -- logged nothing, so the rarer and more interesting conflict was the one with no server-side
+record, and "my approval did not stick" was unreconstructable. `approve_link`'s 409 now emits
+`link_approval_declined_decided_row` under a `link_review` family with the link id, who attempted it,
+and who had already decided it and to what.
+
+**F3.** Reproduced first: 10,000 keys with a factory that always raises left `_values` at 0 and
+`_locks` at 10,000 against a cap of 4096. The sweep could not have worked where it was -- it sat below
+`_store`'s under-cap early return, and a failing factory never reaches `_store` at all, so no amount of
+reordering INSIDE `_store` fixes it. Moved it to `_lock_for`, which is the only thing that grows that
+table and runs on every miss including the failing ones. Same repro after the fix: 1,808 locks, under
+cap. Only unheld locks are dropped and there is no `await` between `_lock_for` returning and `get`
+acquiring, so single-flight is unaffected -- the worst case remains the one the original comment
+described, a newcomer building a fresh lock and doing one redundant fetch.
+
+**F4, and I chose to fix rather than document.** The finding is honest that it is latent: prefork gives
+one `asyncio.run` per process, so there is no second loop over the singleton today, and at the default
+switch interval it does not reproduce. I confirmed that cost myself -- at `setswitchinterval(1e-7)` the
+red team's own workload takes minutes, which is why there is no race test in the suite. What decided
+it was the shape of the trigger: it goes live on `--pool=threads` or `gevent` in the celery-worker
+command, one word in `docker-compose.yml`, and nobody making that change would connect it to
+`_AsyncTtlMemo`. Documenting a precondition that a config change silently violates is not a rail; it is
+a note somebody reads afterwards. The critical sections are a handful of dict operations with no
+`await` in them, so a `threading.Lock` costs one uncontended acquisition against work whose next step
+is an HTTP request. `_cached` stays outside the guard on purpose -- it only reads, and both the
+`dict.get` and the rebinding it can race are individually atomic under the GIL, so it sees one table or
+the other, never a half-built one.
+
+I did confirm the mechanism deterministically rather than trusting the reproduction: with a stall
+forced into the window between the loop check and the `_locks.get`, the pre-fix body hands thread A
+(loop A) the very lock object thread B created for loop B; the guarded body hands each thread its own.
+That is the `bound to a different event loop` path, shown without waiting on luck. The suite test that
+ships is the deterministic half of it -- every mutation of both tables happens inside `_guard`,
+recorded around one `get`, which pins `_lock_for` and `_store` at once and goes red if a later edit
+drops either.
+
+**The documentation-grade one.** `get_market()` is partially memoized and the comment claimed it "stays
+UNMEMOIZED". Its `/events` leg goes through `_event_id_by_market_id` and so through the shared events
+memo; only the two per-market legs are re-issued. Corrected to what the code does, naming the one field
+affected (`VenueMarket.event_id`, which nothing in `app/` reads) and the staleness bound. The existing
+test asserting this was named `test_get_market_itself_is_not_memoized` and asserted only the two
+per-market counts, so it was true and misleadingly named; renamed, and it now also asserts `/events ==
+1` with a memo-disabled adapter alongside showing 2, so the assertion is about the MEMO rather than
+about `/events` happening to be called once.
+
+**Red-green.** Reverted both source files to HEAD in place (originals held in `$TMPDIR`, restored
+after) and ran the new tests. Red: `test_a_bare_rejection_does_not_blank_the_previous_note`
+(`'' == 'Kalshi settles...'`), `test_rejecting_an_approved_link_keeps_the_approver_s_note`
+(`'' == 'verified identical rules'`), `test_two_rejections_with_notes_keep_both` (alice's text absent
+from a column holding only bob's), `test_the_approve_conflict_does_not_promise_a_path_back` (the detail
+still read "Re-read the link before deciding it again"),
+`test_a_contested_human_decision_leaves_a_server_side_trace` (0 records),
+`test_a_failing_factory_does_not_grow_the_lock_table` (200 locks against a cap of 4), and
+`test_both_tables_are_mutated_only_under_the_thread_guard` (no `_guard` attribute at all). All seven
+green after restoring. Two of the nine new/changed tests are green before AND after, and deliberately
+so, which I would rather state than bury: `test_a_first_note_is_stored_exactly_as_typed` is the
+anti-freeze guard the brief asked for -- its job is to fail if a future fix makes `notes` immutable,
+which the buggy code obviously does not do -- and
+`test_get_market_refetches_its_market_legs_and_shares_the_events_memo` pins a corrected COMMENT against
+unchanged behaviour, so there was never a red state to show. Neither is vacuous: both would fail on a
+plausible wrong implementation, which is the property that matters.
+
+Suite 841 passed, zero failures (831 at task start, +7 mine, +2 from the concurrent agent's
+`test_link_proposal_beat.py`/`test_request_models_forbid_extras.py`). `ruff check` and `mypy` scoped to
+exactly the four files changed: clean on both, no directory-wide run. No venue network anywhere -- the
+links tests reach only the database and read back through `GET /links` rather than `GET /links/{id}`
+precisely so nothing constructs a venue adapter, and the adapter tests use the existing
+`CountingTransport` (`httpx.MockTransport`) and a bare `_AsyncTtlMemo`. `git status --porcelain` shows
+my four files plus this NOTES.md entry and the concurrent agent's two test files; nothing unexpected.
+
+### T43 adjudication (orchestrator)
+
+Verified: `_appended_notes` merges rather than overwrites, the 409 now says the decision is "terminal
+on this API -- no route returns a link to 'proposed'", `link_approval_declined_decided_row` is emitted,
+`_guard` is a real `threading.Lock` on the memo. Suite **841**.
+
+**IT REJECTED BOTH OPTIONS I OFFERED AND FOUND THE BETTER ONE.** My brief said refuse-blank-over-
+non-blank and append were "both defensible". They are not equivalent: **refusing only the EMPTY
+overwrite closes half the finding**, because a reject carrying a one-word note would still delete a
+paragraph, silently, with the same 200 -- the same loss one reviewer later. Append closes both shapes,
+costs nothing structurally (`notes` is `Text`; the 4000-char cap is per REQUEST), and critically adds
+NO precondition, so rejection stays unconditionally permitted and cannot fail. T37's fail-safe
+asymmetry is untouched, because that argument was always about the lifecycle column.
+
+Two details that show the work was traced rather than assumed: it checked
+`test_link_proposal_beat.py:325`'s equality assertion BEFORE choosing the merge format, and stores a
+first note byte-for-byte so that assertion stays valid (a row reaches its first rejection with
+`notes=None`, so there is nothing to preserve). And the `[reviewer @ iso8601]` header on appended
+blocks exists because `reviewed_by`/`reviewed_at` hold only the LATEST decision -- after a third
+rejection that header is the only surviving record of who wrote the second note.
+
+**F4 FIXED RATHER THAN DOCUMENTED, and the reason generalizes:** "the trigger is `--pool=threads` or
+`gevent` in the celery-worker command -- one word in `docker-compose.yml` that nobody would connect to
+this file; **a documented precondition that a config change silently violates isn't a rail.**" That is
+the right test for when a latent race deserves code rather than a comment, and I had left the choice
+open. Cost is one uncontended lock acquisition against work whose next step is HTTP. `_cached` stays
+unguarded deliberately (read-only; both the `dict.get` and the rebinding it races are atomic under the
+GIL).
+
+F3's sweep was moved to `_lock_for` rather than fixed in place -- correct, because a FAILING factory
+never reaches `_store` at all, so no fix inside `_store` could ever have bounded the table the failure
+grows. 10,000 failing lookups: 10,000 locks before, 1,808 after. Only unheld locks are dropped, and
+there is no `await` between `_lock_for` returning and `get` acquiring, so single-flight is unaffected.
+
+**NO RACE TEST SHIPS, and that was the right call:** at `setswitchinterval(1e-7)` red-team's workload
+takes MINUTES (two runs killed at 120s and 300s). That is a flaky test, not a unit test. The
+deterministic half ships instead -- a forced stall in the check-then-mutate window, showing the pre-fix
+body hands thread A a lock created by thread B for loop B and the guarded body does not. Reproducing a
+race deterministically beats reproducing it probabilistically and slowly.
+
+Two tests are green before AND after, flagged rather than buried: the anti-freeze guard (fails if a
+future change makes notes immutable, which the buggy code does not do) and one pinning a corrected
+COMMENT against unchanged behavior. Neither is vacuous; both fail on a plausible wrong implementation.
+
+One limitation recorded rather than fixed: two rejections committing CONCURRENTLY still last-write-wins
+on the merged text. The alternatives put a failure mode on the fail-safe direction or move the merge
+into SQL. Sequential rejections -- what a review queue actually produces -- are safe.
+
+agent: T43 id=a879286350e15cc03 role=implementer model=opus
+outcome: T43 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
