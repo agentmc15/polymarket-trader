@@ -1254,3 +1254,184 @@ suite green.
 **Verify.** `cd backend && python3 -m pytest -q tests/execution/test_fill_engine.py && python3 -m pytest -q`
 
 ---
+
+## Phase 4R — Post-review remediation (added during execution, not by the architect)
+
+These tasks were dispatched by the execute loop in response to a Phase 4 review, two red-team passes,
+and a verification pass. Recorded here so the routing ledger scores them.
+
+### T26 — Docs and deployment: one-process rule, kill-switch name, venue API errors
+- status: done
+- model: sonnet
+- independent: no
+
+**Brief.** The production Dockerfile shipped `--workers 4` against a documented one-process rule; CLAUDE.md documented `TRADING_KILL_SWITCH_PATH` while the setting binds `KILL_SWITCH_PATH` (silently ignored); the Kalshi skill inverted the order-book encoding (100x price error) and the Polymarket skill omitted a basis-points division (10,000x fee error).
+
+**Acceptance.** Dockerfile pins one worker with the reason at the CMD; CLAUDE.md matches `.env.example`; both skill files match their adapters.
+
+**Verify.**
+```bash
+cd /Users/michaelcave/Developer/reposV2/polymarket-trader && grep -q 'KILL_SWITCH_PATH' CLAUDE.md && grep -q 'workers., .1' docker/backend/Dockerfile
+```
+
+---
+
+### T27 — Frontend: label an ordinary backtest result, guard the edge-decay payload
+- status: done
+- model: sonnet
+- independent: no
+
+**Brief.** A non-sweep backtest rendered with `depth_source`/`fill_at` shown nowhere, violating GUARDRAILS 1.7. An unguarded `report.rows.map` white-screened the app on a malformed payload.
+
+**Acceptance.** Badges visible without hover on the results view; a malformed payload degrades to a readable message; `tsc` and `npm run lint` exit 0.
+
+**Verify.**
+```bash
+cd frontend && npx tsc -p tsconfig.app.json --noEmit && npm run lint
+```
+
+---
+
+### T29 — Cross-venue fee basis per fill; persist `unmarked_positions`
+- status: done
+- model: opus
+- independent: no
+
+**Brief.** `cross_venue_arbitrage` priced its Kalshi leg as one aggregate fill, understating cost by up to 59% of its own `min_net_edge` gate. `build_report()` dropped `unmarked_positions`, so a partly fictional equity curve could never announce itself downstream.
+
+**Acceptance.** Fee summed per walked level with a Polymarket control proving the change is Kalshi-specific; the field survives into the persisted report.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q
+```
+
+---
+
+### T30 — Schedule link proposal, still human-gated
+- status: done
+- model: opus
+- independent: no
+
+**Brief.** `propose_links` had one caller (a manual endpoint), so `event_links` stayed empty and cross-venue arbitrage was built over an empty list forever.
+
+**Acceptance.** An hourly beat on its own interval; no path writes `approved`; a rejected link is never resurrected.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/matching/
+```
+
+---
+
+### T31 — Price every risk haircut exactly once across strategies
+- status: done
+- model: opus
+- independent: no
+
+**Brief.** `composite` ranked four differently-defined quantities in one sorted list, and discounted cross-venue twice (inside its own `net_edge` and again via a +0.25 resolution-risk penalty).
+
+**Acceptance.** Strategies publish a pre-risk edge; scoring applies each haircut once; two intents with equal economics score equal composite.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/services/test_scoring.py
+```
+
+---
+
+### T32 — Reconcile the client with the API; sweep and link surfaces
+- status: done
+- model: sonnet
+- independent: no
+
+**Brief.** Twelve client/backend mismatches including a silent slippage no-op (`slippage_bps` discarded by `extra=ignore`). No UI producer for the sweep route and no link-review surface.
+
+**Acceptance.** Results tab activates; sweep runnable from the form; link review shows both venues' rules text with no bulk approve; gates exit 0.
+
+**Verify.**
+```bash
+cd frontend && npx tsc -p tsconfig.app.json --noEmit && npm run lint
+```
+
+---
+
+### T33 — Reject unknown request fields; promote `edge_basis`; populate metrics
+- status: done
+- model: opus
+- independent: no
+
+**Brief.** All 37 request models inherited `extra=ignore`, so a caller could be wrong without being told — including a body naming `exchange` that routed an order to the wrong venue. `edge_basis` reached the API only inside a metadata blob. 11 of 15 metrics fields were never populated.
+
+**Acceptance.** Six request models forbid extras with a structural test re-deriving the set from the route table; `edge_basis` is a typed field with no fallback label; metrics populate or stay null.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/api/
+```
+
+---
+
+### T34 — Refuse to score a directional edge as arbitrage
+- status: done
+- model: sonnet
+- independent: no
+
+**Brief.** `favorite_compounder`/`no_bias_exploit` publish an `edge` that is a directional mispricing, and `POST /arbitrage/scan?strategies=` already reached `score()` with them.
+
+**Acceptance.** An allowlist of scorable bases, checked before the edge is read; the four legitimate strategies score unchanged.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/services/test_scoring.py
+```
+
+---
+
+### T35 — Bounded concurrent book fetch, interleaved across venues
+- status: done
+- model: sonnet
+- independent: no
+
+**Brief.** 800 sequential `get_book` calls per pass — a rate-limit risk and, worse, snapshot skew: a cross-venue signal claims two prices are inconsistent at the same moment.
+
+**Acceptance.** One shared bounded semaphore, round-robined across venues; a failing venue does not abort the pass; the bound is a setting.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/services/test_scanner_concurrency.py
+```
+
+---
+
+### T36 — Report an uncomputed metric as null and render it as such
+- status: done
+- model: sonnet
+- independent: no
+
+**Brief.** Eleven metrics fields can be legitimately absent, but the client typed all fifteen as `number` and the API coerced three nullable columns to 0.0.
+
+**Acceptance.** Frontend handles null first, then the backend stops coercing; a genuine zero still renders as zero.
+
+**Verify.**
+```bash
+cd frontend && npx tsc -p tsconfig.app.json --noEmit && cd ../backend && python3 -m pytest -q
+```
+
+---
+
+### T37 — Hold the human-approval gate under concurrency
+- status: done
+- model: opus
+- independent: no
+
+**Brief.** The link-proposal beat read, checked decidedness, mutated and committed once per pass, so a human approving inside that window was silently clobbered — confidence and the hand-built outcome map both overwritten on an approved row.
+
+**Acceptance.** Decidedness is enforced in the same statement as the write; a concurrent approval survives; an uncontested pass still rescores undecided rows.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/matching/test_link_write_races.py
+```
+
+---

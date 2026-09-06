@@ -5293,3 +5293,563 @@ explicitly rather than silently expanding scope.
 
 agent: T36 id=a308f5b2cd009ce8e role=implementer model=sonnet
 outcome: T36 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+## Red-team, four newest subsystems — adjudication
+
+Read-only confirmed: tree was clean at start; the six modified files at the end are all the concurrent
+T36 agent's (the NOTES.md diff is headed `### T36`). Every probe file in `$TMPDIR`, every probe DB a
+fresh `mkdtemp()`, and the fence-bypass mutation appended to a COPY of `persist.py`. Suite after the
+run: 783. **This is the strongest red-team pass of the kit: two severe live defects on code that had
+just been written, reviewed and tested.**
+
+**F1 CONFIRMED SEVERE (dispatched T37) -- the beat clobbers a link a human APPROVED.**
+`persist_proposals` reads, checks `is_decided`, mutates, and commits ONCE after a loop carrying ~221
+proposals -- so the decidedness check and the write sit in different transactions separated by hundreds
+of awaited SELECTs. Reproduced 6/6 across interleavings: a pair a human approved at `confidence=0.60`
+comes back `confidence=0.97, status='approved', reviewed_by='alice'`. And the `outcome_map` variant on
+a multi-outcome pair the reviewer had to map BY HAND: `{'TRUMP':'REPUBLICAN','HARRIS':'DEMOCRAT'}`
+overwritten with `{'YES':'YES','NO':'NO'}`.
+
+This is money, not bookkeeping: `cross_venue_arbitrage.py:788` reads `p_same = float(link.confidence)`
+into `net_edge = gross_edge*p - (1-p)*worst_case_loss`, so 0.60 -> 0.97 strips ~37 points of identity
+haircut off a link a human accepted AT 0.60. And `:693` picks the B leg via
+`link.outcome_map.get(outcome_a)` -- replacing the reviewer's map is exactly the long-the-same-side-of-
+two-different-events failure the human gate exists to prevent.
+
+**What makes it quiet is the detail I would have missed:** SQLAlchemy emits only columns whose value
+actually CHANGED against what the session loaded. So the clobber fires precisely when the re-score
+differs -- i.e. when the markets moved, which is when the reviewer's decision most needs preserving.
+`test_the_beat_leaves_an_approved_link_exactly_as_the_reviewer_left_it` passes because it exercises
+only the fully-sequential ordering. A guarantee tested sequentially is not a guarantee.
+
+**F2 CONFIRMED SEVERE (dispatched T38) -- one 404 kills the whole scan pass.** `_fetch_book` catches
+only `VenueError`; the adapters DELIBERATELY do not flatten 404/5xx/timeouts into it (kalshi's own
+docstring: "deliberately NOT flattened"). With `gather(return_exceptions=False)`, one book's
+`HTTPStatusError` or `ReadTimeout` cancels every sibling: **39/800 books survived, `scan()` raised.**
+On a 120s beat, one delisted ticker answering 404 means every pass yields zero opportunities and never
+commits -- indefinitely, signalled only by opportunities drying up. Not a regression (the pre-T35
+serial loop did the same); what is new is `_fetch_book`'s docstring CLAIMING it prevents exactly this.
+
+**F3 (fence gap, no live exploit -- T39):** the AST fence over the matching package misses SEVEN
+lifecycle-write spellings -- `setattr`, tuple-target assign, `AnnAssign`, `__dict__.update`, a
+`setattr` loop, executemany bulk `update()`, and `EventLink(**{...})` (keyword `arg=None`, so the
+`kw.arg in LIFECYCLE_COLUMNS` test never matches). All seven source the value from
+`get_args(EventLinkStatus)[1]` so the literal `"approved"` never appears either. Forms (1) and (7)
+were confirmed to really persist `status='approved'`. Form (7) is precisely the mass-assignment
+`event_link.py:24-31` warns about.
+
+**F4 (fence gap, confirmed NOT live -- T39):** the request-model walker reads
+`route.dependant.body_params` rather than `get_flat_dependant(...)`, so a body model behind a
+`Depends` is invisible -- demonstrated with a permissive `HiddenBody` accepting `slippage_bps=50` and
+silently discarding it, the ORIGINAL bug reproduced through a shape the fence cannot see. Forward refs
+likewise stay `ForwardRef` in pydantic v2. Confirmed not live: a stronger walker finds the same 6
+models, zero permissive.
+
+**F5 (measurement, my claim was overstated -- T38 to correct):** I recorded that the interleave means
+"both venues' books land throughout the whole window". Measured, it buys ~17 points of mean pair skew
+when venues are balanced, **~5 points when they are not**, and NEVER improves the worst case -- two
+legs of one link can still be the entire fetch window apart in every shape tested. In the uneven case
+(200 vs 20) the smaller venue's books are a block in the first 18%. The genuine win is shrinking the
+WINDOW (800 serial RTT -> ~40), which holds. The mechanism helps; the claim I recorded for it was too
+strong.
+
+**F6 (suspicious, unconfirmed -- T38 to verify first):** `get_book` on Polymarket may issue three HTTP
+requests (`get_market` -> `/markets` plus `_event_id_by_market_id` -> the full `/events` list) with no
+caching anywhere in the module, making a 400-book pass ~1200 requests at ~3x the intended in-flight
+rate -- while `config.py:409-432` justifies the bound explicitly as a rate-limit budget. Read from
+source only, correctly flagged as unconfirmed rather than asserted.
+
+**L1/L2/L3 (minor):** a manual propose racing the beat 500s (T37); `{EDGE_BASIS_KEY: None}` and a
+misspelled `"edge_basis "` key are admitted by the edge-basis guard, neither reachable today (T39);
+non-Mapping metadata raises `TypeError`/`AttributeError` rather than `UnscorableIntent`, which `scan()`
+does not catch, aborting a pass instead of skipping one intent (T39).
+
+**WHAT SURVIVED, and it is substantial:** nothing reaches `approved` without a human through any
+non-concurrent path; `is_decided`'s belt-and-braces `reviewed_at is not None` treats even a
+hand-reset row as decided; a rejected pair could not be re-filed or reset; per-venue isolation genuinely
+isolates and deletes nothing; venue mislabeling is unreachable; **the semaphore bound held at exactly
+20 in every scenario including the raising ones** (no leak on the exception path); `VenueError` truly
+cannot escape `_fetch_book` (799/800 survived); `_published_edge` is the only reader of the published
+edge anywhere in `app/`; and the T33 negative control genuinely fails when it should, with
+`Union`/`Annotated`/`list[...]`/nesting all walked correctly.
+
+agent: T30-T35 id=afb6d0144c2103101 role=red-team model=opus findings=11 confirmed=9 result=accepted
+
+### T37
+
+F1 fixed, and it was exactly as reported. The decidedness test and the write lived in different
+transactions: `is_decided(existing)` asks a question about a Python object loaded by an earlier
+SELECT, while the write was an attribute assignment that did not reach the database until
+`persist_proposals`'s single `commit()` at the end of the pass. Production's session factory sets
+`autoflush=False`, so nothing intervening flushed it either -- the gap really is the whole pass,
+hundreds of awaited SELECTs wide, and a reviewer approving anywhere inside it was silently
+overwritten.
+
+Of the three shapes the red-team named I took the precondition on the UPDATE, and the environment is
+why. Tests run on SQLite via aiosqlite; production is Postgres. `SELECT ... FOR UPDATE` parses on
+SQLite and then does nothing, so a lock-based fix would be exercised in CI in a form that cannot
+fail -- the guarantee would be asserted where it is free and unasserted where it costs something. A
+`version_id_col` would work on both but needs a column, a migration, and a `StaleDataError` handler
+at every writer, and it would make the beat's ordinary no-op passes contend with each other on rows
+nobody is deciding. A `WHERE status = 'proposed' AND reviewed_at IS NULL` carried in the UPDATE
+behaves identically on both engines, needs no schema change (so no migration; `alembic heads` is
+still `007 (head)` and I added nothing to the chain), and is checkable by reading `rowcount` -- which
+is what the new tests read. `app/models/event_link.py` is therefore unchanged, deliberately.
+
+`update_proposal` now RETURNS the guarded statement instead of mutating the row, which keeps the
+exported name and its two-argument shape (`app/services/matching/__init__.py` is untouched) while
+moving the predicate into the place the database evaluates it. `persist_proposals` executes it with
+`synchronize_session=False` and counts a `rowcount` of 0 as `skipped_reviewed` -- the same bucket a
+row already decided at read time lands in, because it is the same fact learned later. It also logs
+`link_rescore_declined_decided_row` at INFO: a human deciding mid-pass is normal, not an error, but
+an operator comparing `updated` against the queue should be able to see why a row did not move.
+
+Two costs worth naming rather than burying. The row lock is now taken when the UPDATE executes
+rather than at commit, so a reviewer approving a row this pass has already rescored blocks until the
+pass commits; the pass does no venue I/O once it starts filing, so that wait is short, and blocking
+is the correct behaviour anyway -- the alternative is the two writes racing. And the UPDATE is now
+issued unconditionally for every undecided row rather than only for rows whose values actually
+changed, so `updated_at` moves every pass. That is ~221 single-row UPDATEs an hour, and it removes
+the codebase's dependence on ORM change-detection for a correctness property, which was the thing
+that made the original defect quiet: SQLAlchemy emitted the clobbering column only when the re-score
+differed, i.e. only when the markets had moved.
+
+I also guarded `approve_link`, which had the same read-modify-commit shape with no status
+precondition -- two reviewers on the same queue entry, and the second one's approval silently
+replaced the first one's rejection along with the note explaining why the pair is not the same bet.
+It now carries the identical predicate in its own UPDATE and answers 409 with the current status and
+reviewer. `reject_link` deliberately keeps NO precondition: it is the revocation path, the result of
+winning that race is a link nothing may trade, and requiring someone to undo an approval before they
+could withdraw it is backwards for the transition that stops capital moving. The asymmetry is
+written into both docstrings so it does not read as an oversight.
+
+L1: `POST /links/propose` now catches `IntegrityError`, rolls back, logs the same
+`link_proposal_conflict` event `app/tasks/matching.py` logs, and answers 409 saying nothing was
+written. Same reading of the race as the beat's -- the matcher is deterministic, so the row the
+winner just filed is the row the loser would have filed -- expressed in the status code rather than
+in a summary field, since the route has to answer with something and a 200 carrying zero counters
+would read as "there was nothing to file".
+
+The tests are in `backend/tests/matching/test_link_write_races.py` (a new file, so the module
+docstring carries the money argument and the reason the ordering is what it is). The interleaving is
+placed exactly, not raced: a shim around `persist._find_existing` delegates to the real function,
+returns its result unchanged, and only decides WHEN the reviewer's `POST /approve` happens -- after
+the pass has read the row and judged it undecided, before it writes. No threads, no sleeps, no
+`gather`. They also need a FILE-backed SQLite engine in `tmp_path` rather than `conftest.py`'s
+engine, because that one is a `StaticPool` holding a single connection: two sessions over it are one
+transaction, so a "concurrent" reviewer would be committing inside the pass's own transaction and
+the race could not exist at all. That is worth remembering for any future concurrency test in this
+repo.
+
+Red-green, in a `$TMPDIR` copy with the shipped files restored from HEAD. Both money variants
+reproduce the red-team's exact output: `assert 0.97 == 0.6` on a link approved at 0.60, and
+`{'YES': 'YES', 'NO': 'NO'} == {'HARRIS': 'DEMOCRAT', 'TRUMP': 'REPUBLICAN'}` on the hand-built map.
+Reverting only `persist.py` reddens exactly the three concurrency tests; reverting only `links.py`
+reddens exactly the three route tests; both reverted is 6 failed, 2 passed, identical across five
+consecutive runs, and 8 passed across five consecutive runs with the fix in. The two that pass on
+both sides are the ones that exist to catch an overcorrection -- an uncontested pass still rescores
+an undecided row in place, and rejecting an approved link is still allowed -- plus a third test
+proves the guard is per row rather than a freeze: one pass, two pairs, a reviewer approves one of
+them mid-pass, and the other is still refreshed to today's score.
+
+Full suite 804 passed, zero failures (783 at task start; +8 mine, the remainder from the two
+concurrent tasks). `ruff check` clean on all three files. `mypy` clean on both app files; the test
+file reports two `ASGITransport(app=app)` arg-type errors, which are the repo's existing baseline for
+test files -- `tests/conftest.py:99` reports the identical error against the shipped fixture, so I
+matched the surrounding file rather than adding an ignore the conftest does not have.
+
+### T37 adjudication (orchestrator)
+
+Verified: guarded UPDATE carries `EventLink.status == PROPOSED, EventLink.reviewed_at.is_(None)` with
+`rowcount` read as the outcome; `approve_link` carries the same precondition and answers 409;
+`app/models/event_link.py` diff is ZERO lines and `alembic heads` is still `007` -- no schema change.
+Suite **811**.
+
+**THE FIX CHOICE IS THE BEST-REASONED OF THE RUN.** Of the three shapes red-team named, the `WHERE`
+precondition was taken over `SELECT ... FOR UPDATE` for a reason that generalizes: **`FOR UPDATE`
+parses on SQLite and then does nothing**, so a lock-based fix would be exercised in CI in a form that
+CANNOT FAIL -- "asserted where it is free and unasserted where it costs something." That is a
+test-validity argument, not a convenience argument, and it is right. `version_id_col` was rejected for
+needing a column, a migration, a `StaleDataError` handler at every writer, and making the beat's
+ordinary no-op passes contend on rows nobody is deciding.
+
+It also found the window is WIDER than the brief said: production's session factory sets
+`autoflush=False`, so the ORM mutation did not reach the database until the single `commit()` at the
+END of the pass. Not "different transactions" -- the whole pass.
+
+**A TEST-INFRASTRUCTURE FINDING WORTH MORE THAN THE FIX, for anyone writing concurrency tests here:**
+`conftest.py`'s engine is a `StaticPool` holding ONE connection, so two sessions over it are ONE
+transaction -- a "concurrent" reviewer would commit INSIDE the pass's own transaction and **the race
+could not exist**. Every concurrency test in this repo must use a file-backed SQLite engine in
+`tmp_path` instead. A test written against the shared fixture would have passed while proving nothing,
+which is this kit's recurring failure mode in a new place.
+
+Determinism done right: the interleaving is PLACED, not raced -- a shim around `_find_existing`
+delegates to the real function and returns its result unchanged, deciding only WHEN the reviewer's
+approve lands. No threads, no sleeps, no `gather`. 5 consecutive runs identical.
+
+Two costs stated rather than buried: the row lock is now taken at UPDATE rather than at commit (a
+reviewer approving a row the pass already rescored blocks until the pass commits -- short, no venue
+I/O once filing starts, and blocking is the correct outcome); and the UPDATE is issued unconditionally
+rather than only for changed columns, so `updated_at` moves every pass. That second one is the point:
+it removes the dependence on ORM change-detection that made the original defect quiet.
+
+`reject_link` deliberately keeps NO precondition -- it is the revocation path and the fail-safe
+direction. The asymmetry is written into both docstrings rather than left for a reader to infer.
+
+Two of the eight tests pass on BOTH sides of the revert, and they are the overcorrection guards (an
+uncontested pass still rescores an undecided row; rejecting an approved link is still allowed) -- said
+plainly rather than counted as proof. A third proves the guard is per-row, not a queue freeze.
+
+agent: T37 id=afed665f87fe76309 role=implementer model=opus
+outcome: T37 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T38
+
+Three red-team findings. F2 was a real outage and is fixed. F5 was an overstated claim and is now a
+measurement. F6 was unconfirmed and turned out TRUE, and worse than the read suggested.
+
+**F2 -- reproduced exactly, including the number, and the mechanism was subtler than the brief said.**
+Against the pre-T38 source on the brief's own shape (200+200 markets, bound 20, one book raising), read
+at the instant `scan()` returned: `httpx.HTTPStatusError`, `httpx.ReadTimeout` and `httpx.ConnectError`
+each made `scan()` RAISE with 39/800 books landed; `VenueError` cost exactly one book. So the finding is
+confirmed on all three shapes.
+
+The mechanism, though, is not "gather cancels the siblings" -- `asyncio.gather` with
+`return_exceptions=False` does NOT cancel them, it ABANDONS them. Letting the event loop run on after
+the raise drains the same run to 799/800. That is worse than cancellation, not better: ~760 fetches keep
+running detached, holding the semaphore and issuing venue requests into a loop `app.tasks.scanner` is
+about to tear down with `asyncio.run`. So the fix is two things, not one: `VENUE_READ_FAULTS` as the
+explicit skip class inside `_fetch_book`, AND `return_exceptions=True` on the gather so nothing is left
+orphaned behind an abort. Without the second half the outage is fixed and the orphan leak is not.
+
+The skip class is `(VenueError, httpx.HTTPError)` and the reasoning is in the constant's own docstring.
+`httpx.HTTPError` is the exact umbrella wanted -- `HTTPStatusError` plus every `RequestError`
+(`ConnectError`, `ReadTimeout`, `RemoteProtocolError`) -- and it excludes `httpx.InvalidURL` and
+`httpx.CookieConflict`, which derive from `Exception` directly and are caller bugs. NOT bare `Exception`:
+a programming error takes the same branch for every book, so swallowing it would produce a pass that
+returns a handful of books and reads as a quiet venue rather than the defect it is. Those are re-raised
+after every sibling has settled. `asyncio.CancelledError` is a `BaseException`, so no `except Exception`
+clause could catch it anyway -- stated in the docstring because it is a property worth not losing by
+accident, not because a clause enforces it.
+
+One gap the tuple could not cover: Polymarket's `get_book` called `response.json()` bare, so a non-JSON
+body (a CDN error page) raised `json.JSONDecodeError`, a `ValueError` -- outside the skip class, and
+therefore still a whole-pass abort. Widening the tuple to `ValueError` would drag every genuine
+programming `ValueError` in with it, so it is flattened to `VenuePayloadError` AT THE ADAPTER BOUNDARY
+instead, exactly as Kalshi's `json_object` helper already did.
+
+`near_resolution_pass` had the identical too-narrow catch on both `list_markets` and `get_book`. It is
+serial, so there is no gather to cancel, but one 404 propagated out of the whole function, losing every
+market it had not reached and the `session.commit()` at the end. Fixed the same way and tested.
+
+Counting: `books_failed` plus breakdowns by venue and by error type ride on `scan_book_fetch_complete`,
+which is now WARNING when anything failed and INFO when nothing did. The per-book line stays at `debug`
+deliberately -- a dead venue would otherwise emit 800 warnings, which is not a signal. `near_resolution`
+gets its own one-per-pass failure count. Only the exception CLASS NAME is logged, never the message, so
+venue-authored error text never becomes a structured-looking log field.
+
+**F5 -- the claim was overstated, and I reproduced the numbers independently before repeating them.**
+Admission-order simulation, my own, run separately from the brief's: 200-vs-200 interleaved mean 34.1%
+of the window vs venue-grouped 51.2%; 200-vs-20 interleaved 47.8% vs 52.5%; max 100% under BOTH orders.
+Within rounding of the brief's figures, so the finding stands.
+
+The pairing model turns out to be load-bearing and is worth recording, because it is what makes the
+result honest. With INDEX-ALIGNED pairs (link k joins market k to market k) the interleave scores a
+perfect 0.0% -- the round-robin puts the two legs adjacent by construction. The numbers above come from
+pairing ARBITRARY markets across the venues, which is what the matcher actually produces (PM #7 with KX
+#143). An order-only argument looks far stronger than it is if you simulate it with aligned pairs, and
+that is the likeliest way the original claim got written.
+
+Corrected the claim in three places (module docstring, `_interleave_fetch_specs`, `scan()`) to what is
+measured: the interleave improves the MEAN and never bounds the worst case, and THE WINDOW LENGTH is
+the mechanism that makes a cross-venue signal defensible -- 800 serial round trips becoming ~40 bounded
+waves is what took "98% of the window" from minutes to milliseconds. The interleave stays: it is free
+and strictly better than venue-grouped.
+
+Reporting rather than bounding, per the brief. `_link_pair_skew` computes, for each APPROVED link whose
+two legs both landed, the gap between when they landed, and logs max/mean plus how many links were
+measurable. A link with an unmeasurable leg is DROPPED, not counted as zero -- averaging it in as 0.0
+would make a partly-broken venue look like the freshest possible snapshot, the exact inversion of the
+metric. Genuinely bounding the worst case needs a scheduling change (a link's two legs admitted as one
+adjacent unit, or a re-fetch when a partner lands too late), not an ordering one; left for a follow-up
+and said so in the docstring rather than half-built.
+
+**F6 -- CONFIRMED, and it is 4x, not the 3x the source read suggested.** Measured with a counting
+`httpx.MockTransport`: one `get_book` is FOUR requests (`gamma/markets?condition_ids`, `gamma/events`
+-- the full listing -- `clob/markets/{id}`, `clob/book`); four `get_book` calls were sixteen. A 400-book
+Polymarket pass was ~1600 requests, 400 of them full events listings. Kalshi's `get_book` is exactly one
+request, which is also the real source of F5's "one venue 4x slower" row -- Polymarket's leg of a pass
+genuinely ran several times longer.
+
+One correction to the finding's framing, in the config comment as well. The bound was NOT failing to
+bound the in-flight rate: the four requests inside one `get_book` are issued sequentially, so at most
+`scan_book_fetch_concurrency` are ever in flight and the rate-limit argument in that comment holds. What
+was wrong is that it counted `get_book` CALLS while its comment reasoned about REQUESTS, and those
+differed by 4x -- so the pass's request VOLUME was ~2000, not 800, and the fetch window was several
+times longer than the concurrency work intended.
+
+Fix is the memo the brief suggested, with two things it needs to actually work. It is SINGLE-FLIGHT, not
+just a cache: a market's YES and NO specs are adjacent in the interleaved order, so both miss an empty
+cache and both fetch -- a plain value cache would have left most of the duplication in place. And it is
+TTL'd rather than pass-scoped, because the adapter's lifetime is not the pass's: `get_read_adapter`
+builds a fresh one per call in live mode but returns the process-wide `PaperVenueAdapter` singleton in
+paper mode, so the memo is process-lifetime there. 60s (half `scan_interval_s`), `0.0` disables it, and
+there is a hard entry cap because process-lifetime plus market-id keys is otherwise a slow leak. The
+BOOK is never memoized, and `get_market()` itself is left unmemoized -- it is a public read whose
+callers (matcher, links API) are entitled to a fresh answer, and the amplification was never their
+fault. Net: 4 requests for the first book of a market, 1 for every book after it inside the TTL.
+
+**A claim of my own that I had to correct.** I first documented the memo's per-key lock table as needing
+a loop guard because "`asyncio.Lock` binds to the loop it is first awaited on and raises if reused from
+another one". Verified on CPython 3.12.7: false as stated. `Lock` only calls `_get_loop()` on the
+CONTENDED path, so an uncontended lock is portable across loops. What raises is a lock contended under
+one loop and contended again under another. The guard IS needed -- that combination is the ordinary case
+here, since `scan()` contends every market's lock (YES and NO in the same wave) and the TTL guarantees a
+miss on the next beat -- but the reason is narrower than I wrote, and the first version of the test
+passed with the guard REMOVED because it never contended anything. Corrected the docstring to the
+verified condition and rewrote the test to contend in both loops. This is the same failure mode as F5 in
+miniature: a plausible mechanism asserted rather than measured.
+
+**Red-green.** 22 new tests, every one proven both ways in a `$TMPDIR` copy. Against the pre-T38 source
+(my tests, kit's code reverted): 16 red / 40 in the three touched files. Six further targeted mutations
+on my OWN source, because four of the new tests are green against pre-T38 by design and needed their own
+proof: widening `VENUE_READ_FAULTS` to bare `Exception` reds the programming-error test; memoizing
+`get_market()` publicly reds the freshness test; memoizing the BOOK reds two request-count tests;
+dropping the `/events` call reds the amplification-characterization test; dropping only the failure
+count/level (isolation kept) reds both counting tests; stubbing `_link_pair_skew` reds both skew tests;
+dropping the entry cap reds the bound test; dropping the loop guard reds the loop test. The one test
+green in both directions is the `VenueError` row of the parametrized blast-radius test -- the documented
+control, parametrized alongside the three new shapes so they are visibly held to the same standard as
+the case that always worked.
+
+One test needed a design fix to avoid being vacuous. With no per-book delay, all 800 fixture fetches
+complete in a single scheduler pass, so `books_returned` reads 799 even against the broken code once the
+orphans drain -- the assertion would have passed for the wrong reason and only the raise would have made
+it red. A 2ms in-memory delay is what makes the count meaningful at the moment `scan()` returns. That is
+also how the 39-vs-799 distinction was found in the first place.
+
+Suite 783 -> 816 with zero failures. 22 of the +33 are mine; the other 11 are the concurrently-running
+matching agent's. `ruff check` and `mypy` clean on exactly the files changed:
+`app/services/scanner.py`, `app/venues/polymarket/adapter.py`, `app/config.py`,
+`tests/services/test_scanner_fault_isolation.py`, `tests/venues/test_polymarket_request_amplification.py`,
+`tests/venues/test_polymarket_adapter.py`. No venue network anywhere -- `FixtureAdapter` and
+`httpx.MockTransport` only; the injected `httpx` exceptions are constructed by hand from a
+`Request`/`Response` pair, never by making a request.
+
+Follow-ups left deliberately, not started: bounding worst-case pair skew needs the scheduling change
+described above; `get_book` could drop to two requests per market by resolving `clobTokenIds` from the
+Gamma payload directly and skipping the `/events` and `clob/markets/{id}` enrichment it never reads, but
+that duplicates `_build_market`'s parsing and is a restructure rather than a memo.
+
+### T38 adjudication (orchestrator)
+
+Verified: `VENUE_READ_FAULTS = (VenueError, httpx.HTTPError)` at `scanner.py:423`,
+`return_exceptions=True` on the gather, no bare `except Exception` in the fetch path (the two hits are
+pre-existing per-strategy and per-market guards carrying `noqa`), `VenuePayloadError` flattened at the
+Polymarket adapter. Suite **826**.
+
+**MY BRIEF WAS WRONG ABOUT THE MECHANISM AND THE FIX IS BIGGER BECAUSE OF IT.** I wrote that
+`gather(return_exceptions=False)` "cancels every sibling". It does not -- **it ABANDONS them.** Letting
+the loop run on drains the same run to 799/800, so the naive reading is that the bug is mild. The truth
+is worse: ~760 fetches keep running DETACHED, still holding the semaphore and still hitting venues,
+into a loop `asyncio.run` is about to tear down. So the fix needed two halves, and I had only specified
+one -- `return_exceptions=True` is what stops the orphaning. Fixing the catch alone would have closed
+the outage and left the leak.
+
+Catch scope reasoned rather than defaulted: `httpx.HTTPError` is the exact umbrella (status errors plus
+every `RequestError`) and deliberately excludes `InvalidURL`/`CookieConflict`, which are caller bugs.
+NOT bare `Exception`, and the reason is the one I asked for: a programming error takes the same branch
+for every book, so swallowing it yields a pass returning a handful of books that READS AS A QUIET
+VENUE. Those re-raise.
+
+One gap the tuple could not cover, found by the implementer: Polymarket's `get_book` called
+`response.json()` bare, so a non-JSON body raised `json.JSONDecodeError` (a `ValueError`) -- still a
+whole-pass abort. Widening the tuple to `ValueError` would drag in every real bug, so it was flattened
+to `VenuePayloadError` at the adapter boundary, matching what Kalshi already did. `near_resolution_pass`
+had the identical narrow catch and was fixed too -- a second instance neither I nor red-team named.
+
+**F6 CONFIRMED AND LARGER: four requests per `get_book`, not three** (`gamma/markets`, `gamma/events`
+full listing, `clob/markets/{id}`, `clob/book`) -- ~1600 for a 400-book pass, against Kalshi's one,
+which is the real source of F5's "one venue 4x slower" row. **And a framing correction I should record
+against myself:** the bound was NOT failing to bound in-flight rate -- the four requests are
+SEQUENTIAL, so the rate-limit argument in `config.py` holds. It counted CALLS while its comment
+reasoned about REQUESTS, differing 4x. Fixed with a TTL'd single-flight memo (a plain cache barely
+helps: YES and NO are concurrent), TTL'd rather than pass-scoped because the paper-mode adapter is a
+process-wide singleton, with a hard entry cap. The book itself is never memoized.
+
+**F5: the pairing model is load-bearing, and it explains how the overstated claim got written.** With
+INDEX-ALIGNED pairs the interleave scores a perfect 0% skew; the real numbers (34.1% vs 51.2% balanced,
+47.8% vs 52.5% uneven) come from ARBITRARY cross-venue pairs, which is what the matcher actually
+produces. Someone reasoning about the aligned case would write exactly the claim that was there.
+Corrected in three places, with `_link_pair_skew` now reporting max/mean per-link leg-to-leg skew and
+DROPPING unmeasurable links rather than averaging them in as zero.
+
+**THE IMPLEMENTER CAUGHT ITSELF IN THE SAME FAILURE MODE, IN MINIATURE.** It first documented the
+memo's lock table as needing a loop guard because "`asyncio.Lock` binds to the loop it is first awaited
+on and raises if reused" -- then verified on CPython 3.12.7 that this is **false as stated**: `Lock`
+binds only on the CONTENDED path. Its first test therefore passed with the guard REMOVED, because it
+never contended anything. Docstring corrected to the verified condition, test rewritten to contend in
+both loops. That is F5's failure -- a plausible claim about a mechanism, asserted without measuring --
+caught by the same person who had just corrected it in someone else's work.
+
+Vacuous-test catch worth keeping: with no delay, all 800 fixture fetches complete in ONE scheduler
+pass, so `books_returned` reads 799 even against broken code. A 2ms delay makes the count meaningful --
+and is how the 39-vs-799 distinction was found in the first place.
+
+agent: T38 id=adc569ba25a5f24b5 role=implementer model=opus
+outcome: T38 model=opus attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+### T39
+
+Four red-team findings against two structural fences and one scoring guard. All four matched repo
+reality at the cited line numbers (the scoring.py lines had shifted slightly from concurrent edits
+elsewhere in the file, but the described behaviour was exactly as claimed), so nothing here is a
+`defect:` line -- all four were fixed as briefed.
+
+F3 -- `tests/matching/test_link_proposal_beat.py`'s AST fence over `app/services/matching/` grew
+six new rules: `setattr(existing, "status", ...)` with a literal attribute name; a tuple/list
+assignment target (`existing.status, existing.reviewed_by = ...`), which needed the target-walk to
+recurse into `ast.Tuple`/`ast.List` elements rather than only inspecting the top-level target;
+`ast.AnnAssign` (`existing.status: str = ...`), an entirely different node type the old walk never
+visited; `<anything>.__dict__.update({...})` with a lifecycle key in the dict literal; a bulk
+`session.execute(update(EventLink), [{"status": ..., ...}])` executemany params list, matched on
+any `.execute(...)` call carrying a list/tuple of dict literals rather than trying to specifically
+recognize the SQLAlchemy `update()` construct; and `EventLink(**{"status": ..., ...})`, a keyword
+with `arg=None` the old loop's `kw.arg in LIFECYCLE_COLUMNS` skipped past silently since `None` is
+never in that frozenset. All six close on the LITERAL NAME of the lifecycle column (an attribute's
+`.attr`, a dict key's `Constant.value`) rather than on the value being written, which is why sourcing
+every bypass value from `get_args(EventLinkStatus)[1]` (never the literal string `"approved"`)
+doesn't help an attacker here the way it defeated the old rule 1.
+
+The seventh form the red-team demonstrated -- `for column, value in payload.items(): setattr(existing,
+column, value)` -- is NOT closed, on purpose, and the fence's own docstring now says so in as many
+words: the written-to name is a runtime value with no literal counterpart in the source, and no static
+walk can decide what it will be without running the loop. That is the line between "spelling this
+fence doesn't yet cover" and "case this fence cannot cover by construction," and blurring it would have
+been worse than leaving it named. The runtime guards this admission leans on -- `persist_proposals`'s
+`ValueError` refusal of any non-`PROPOSED` row, and `LinkBook` reading only reviewed links -- are
+unchanged by any of this and are what still stands between form 5 and a trade.
+
+The new test (`test_the_extended_fence_catches_the_bypass_spellings_the_old_one_missed`) appends all
+seven forms to a COPY of the real `persist.py` under `tmp_path`, never the tracked file, then runs both
+rule sets against the identical text: a verbatim snapshot of the pre-T39 rules (kept as a private
+function so a future refactor of the real rules can't accidentally make it "regain" coverage it
+shouldn't have) finds NOTHING in it -- the exact false confidence the finding described -- and the
+extended rules flag all six closable forms by line while flagging NEITHER line of form 5, which turns
+the docstring's admission from a claim into a checked fact. All 11 tests in the file pass, including
+the six pre-existing ones untouched by this change.
+
+F4 -- `tests/api/test_request_models_forbid_extras.py`'s walker had two structural blind spots, both
+confirmed live with a standalone repro before touching anything: `route.dependant.body_params` holds
+only a route's OWN body parameters, not a sub-dependency's -- a body model declared inside a
+`Depends(...)` callable parses the identical POSTed bytes a route's own body parameter would, and the
+caller cannot tell the two shapes apart, but the walker could. Swapped for
+`get_flat_dependant(route.dependant).body_params`, which merges the whole dependency tree. Second: in
+pydantic v2, `field.annotation` for a forward-referenced nested model (`nested: "Inner"`, `Inner`
+defined later in the same module, `model_rebuild()` never called) stays an unresolved
+`typing.ForwardRef` PERMANENTLY -- verified with a standalone script that the model validates a real
+nested payload correctly the whole time, while `model_fields["nested"].annotation` never updates and
+`Outer.__pydantic_complete__` stays `False`. `typing.get_type_hints()` forces the same resolution
+`model_rebuild()` would; the walker now reads field annotations through a `_field_annotations()` helper
+that tries `get_type_hints` first and falls back to `field.annotation` only on a `NameError` (a name
+local to a test function, which `get_type_hints` cannot see via module globals).
+
+Two new tests, each with its own red/green pair against a throwaway probe app (never `app.main:app`):
+`test_the_walker_sees_a_permissive_model_hidden_behind_depends` reproduces the ORIGINAL bug's exact
+shape (a `_HiddenBody` declaring `slippage_value`, the caller posting `slippage_bps`) behind a
+`Depends(...)`, shows the old extraction finds nothing (`old_found == {}`), shows the new one finds it,
+and drives an actual `TestClient` POST that returns `200` with `{"slippage_value": 0.001}` -- the
+caller's number silently gone, through the one shape the old fence couldn't see. The forward-ref test
+asserts `isinstance(field.annotation, ForwardRef)` as its own fixture invariant (so if a pydantic
+upgrade ever resolves this eagerly, the test fails loudly instead of quietly proving nothing), then
+shows the old recursion missing the nested permissive model and the new one finding it. All six
+pre-existing controls in the file -- including the two whose entire job is proving the walker looks
+somewhere -- pass unchanged, and `test_the_walker_finds_the_request_models_it_is_supposed_to_check`
+still finds exactly the same six real models on `app.main:app` with the stronger walker, zero
+permissive, matching what the red-team pass had already confirmed by hand.
+
+L2 -- `_published_edge` read the declared edge basis with `intent.metadata.get(EDGE_BASIS_KEY)` and
+treated any `None` result as "nothing declared," which is true when the key is genuinely absent and
+false when it is present with an explicit `None` value or reachable only under a key differing from
+`EDGE_BASIS_KEY` by stray whitespace (a strategy that tried to declare a basis and mis-typed the key,
+so the real key never receives a value and reads as absent). Rewrote the check to test presence
+(`EDGE_BASIS_KEY in intent.metadata`) rather than `.get(...) is not None`, which closes the `None` case
+outright, and added a narrow near-miss check in the `else` branch -- any metadata key that equals
+`EDGE_BASIS_KEY` after `.strip()` but is not exactly `EDGE_BASIS_KEY` is treated as a declaration too
+and refused, rather than silently falling through to the default. The genuinely-omitted-key path (no
+key resembling `EDGE_BASIS_KEY` at all) is untouched and still defaults to reading the plain
+fee-netted edge, per the explicit "do not change this" instruction and `scoring.py:285-298`'s own
+reasoning -- covered by a dedicated regression test, plus one proving a key that merely CONTAINS
+`edge_basis` as a substring (not a whitespace near-miss) is correctly left alone rather than swept in
+by an over-broad check.
+
+L3 -- the same function's membership test (`declared_basis not in _SCORABLE_EDGE_BASES`) raised
+`TypeError` on an unhashable declared value (e.g. a `list`), and `intent.metadata.get(...)` raised
+`AttributeError` when `metadata` was not a mapping at all (`Intent.__post_init__` never validates
+`metadata`'s type, so a buggy strategy really can hand `score()` one). Both now raise
+`UnscorableIntent` -- a `Mapping` isinstance check up front, and the frozenset membership test wrapped
+in `try/except TypeError`. This is the difference between `app.services.scanner.scan()`'s existing
+`except UnscorableIntent` skipping one bad intent and the same bug killing the whole scan pass; scoring.py
+was the only file this needed since `scan()`'s catch already existed and does not belong to any file
+this task was allowed to touch.
+
+New file `tests/services/test_edge_basis_guard_and_malformed_metadata.py` (ten tests, none of them
+touching the existing `test_scoring.py`, which is not in this task's file list): every scenario runs
+through the public `score()` against a hand-built `Intent`/`ScoreContext`, matching the surrounding
+package's convention of testing the public function rather than `_published_edge` directly. Regression
+coverage for both real bases (`EDGE_BASIS_OBSERVED` unchanged at `0.02`; `EDGE_BASIS_IDENTITY_ESTIMATED`
+hand-computed at `0.10 * 0.90 - 0.10 * 4.00 = -0.31`) and for `EDGE_BASIS_DIRECTIONAL` still refusing
+exactly as T34 left it. The red/green test reproduces the pre-T39 `_published_edge` logic verbatim (not
+derived from the fixed version) and runs it against all four scenarios: it reads the `None`-basis edge
+as `5.0` instead of refusing, reads the whitespace-mangled-key edge as `5.0` instead of refusing, raises
+bare `TypeError` on the unhashable list, and raises bare `AttributeError` on non-mapping metadata --
+then shows the real `score()` refuses all four with `UnscorableIntent`.
+
+Full suite **826** passed, zero failures (811 at task start, +13 mine across the three files plus the
+two-test file, +2 from a concurrent agent's `tests/venues/test_polymarket_request_amplification.py`
+growing while this task ran). `ruff check` clean on all four touched/created files. `mypy` clean on
+`app/services/scoring.py` and on the two new/edited test files; `test_link_proposal_beat.py` reports one
+pre-existing "Unused type: ignore comment" at the `Unreadable.list_markets` override -- confirmed via
+`git stash` that this finding exists identically in the file this task started from (previously at line
+540, now at line 797 purely from the line count this task's insertions added above it), so it is
+baseline noise, not something introduced here. `git status --porcelain` shows exactly the four files
+this task was scoped to touch (`app/services/scoring.py`, both named test files, and the one new test
+file) plus files already modified by concurrent agents before this task started; nothing outside that
+set was touched.
+
+### T39 adjudication (orchestrator)
+
+Verified: the AST fence closes six of red-team's seven spellings; `get_flat_dependant` +
+`get_type_hints` are both in the request-model walker; `scoring._published_edge` now tests key
+PRESENCE (`in intent.metadata`) rather than `.get(...) is not None`, guards `isinstance(..., Mapping)`,
+and wraps the frozenset membership in `try/except TypeError`. Suite **826**, `tsc` 0.
+
+**THE FENCE BOUNDARY IS THE PART THAT MATTERS.** Form 5 -- a fully dynamic
+`setattr(existing, column, value)` from a loop -- is left UNCAUGHT deliberately, and the fence says so
+in three places (`:483`, `:552-553`, `:651`) with the reason: a syntactic check cannot decide a write
+whose attribute name is computed at runtime. And there is a test asserting the new rules **verifiably
+still miss form 5**. That is the honest shape for a structural fence: a fence claiming completeness it
+does not have is worse than no fence, because it stops people looking. This one states its boundary and
+then proves the boundary is where it says it is.
+
+Red-green on the fence itself is the right construction: old rules miss all 7 on a `tmp_path` copy of
+`persist.py`; new rules catch the 6 closable ones. The fence is tested against a COPY, never the
+tracked file -- the mutation-testing discipline this repo has been burned by ignoring.
+
+F4 closed both shapes: `get_flat_dependant` sees a body model behind `Depends(...)`, and
+`get_type_hints()` resolves the forward refs `field.annotation` leaves as `ForwardRef` in pydantic v2.
+The `Depends` test drives a real `TestClient` POST reproducing the ORIGINAL slippage-silently-discarded
+bug through the new shape -- proving the gap was the same bug wearing a different shape, not a
+hypothetical. All four pre-existing controls still pass and still find exactly the same 6 real models.
+
+L2 closed precisely: key PRESENCE rather than `is not None` (closes `{EDGE_BASIS_KEY: None}`), plus a
+whitespace-near-miss key check (closes `"edge_basis "`) **without touching the genuinely-omitted-key
+default path**, which `scoring.py:285-298` documents as deliberate and which red-team explicitly
+declined to call a defect. The distinction between "declared wrong" and "not declared" is preserved.
+
+L3 closed with the right vocabulary: malformed metadata now raises `UnscorableIntent`, which
+`scan()` already catches, so one bad intent is skipped instead of aborting a whole pass.
+
+agent: T39 id=a87877b8fe17dbd9a role=implementer model=sonnet
+outcome: T39 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
