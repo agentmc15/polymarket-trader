@@ -42,19 +42,37 @@ services:
       dockerfile: ../docker/backend/Dockerfile
     container_name: polymarket-backend
     restart: unless-stopped
+    # T40 (deployment coherence audit): `.env.example` tells an operator to
+    # "copy this file to `.env`", but of the 56 `Settings` fields only the
+    # four DERIVED-FROM-TOPOLOGY ones below were ever forwarded into this
+    # container -- there was no `env_file:` and the bind mount
+    # (`./backend:/app`) does not reach the repo-root `.env`. Everything
+    # else, including the Kalshi credentials cross-venue arbitrage needs,
+    # the four risk limits, and KILL_SWITCH_PATH, silently fell back to
+    # compiled-in defaults with no error. `env_file:` is the self-maintaining
+    # fix: it forwards whatever `.env` holds, including settings added after
+    # this comment was written, so it cannot rot the way the enumerated list
+    # did. `required: false` because a fresh clone has no `.env` yet (compose
+    # would otherwise fail to start rather than fall back to `Settings`
+    # defaults, which is the existing, desired behaviour for a missing file).
+    env_file:
+      - path: .env
+        required: false
+    # These four are DERIVED FROM COMPOSE TOPOLOGY, not plain pass-throughs:
+    # they are composed from (or hardcoded to) this compose file's own
+    # service hostnames/credentials and must keep overriding whatever an
+    # operator has in `.env` for a local non-Docker run (e.g. `redis://
+    # localhost:6379`) or a non-Docker Postgres user/password. Explicit
+    # `environment:` entries always win over `env_file:` for the same key,
+    # which is what keeps these pinned. Every other setting (SECRET_KEY,
+    # DEBUG, LOG_LEVEL, TRADING_MODE, the Polymarket/Kalshi credentials, the
+    # risk limits, etc.) is a plain pass-through and now comes from
+    # `env_file:` above instead of being re-declared here.
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-polymarket}:${POSTGRES_PASSWORD:-polymarket}@postgres:5432/${POSTGRES_DB:-polymarket}
       REDIS_URL: redis://redis:6379
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      DEBUG: ${DEBUG:-false}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
-      POLYMARKET_FUNDER_ADDRESS: ${POLYMARKET_FUNDER_ADDRESS:-}
-      POLYMARKET_API_KEY: ${POLYMARKET_API_KEY:-}
-      POLYMARKET_API_SECRET: ${POLYMARKET_API_SECRET:-}
-      POLYMARKET_API_PASSPHRASE: ${POLYMARKET_API_PASSPHRASE:-}
     volumes:
       - ./backend:/app
     ports:
@@ -73,17 +91,18 @@ services:
       dockerfile: ../docker/backend/Dockerfile
     container_name: polymarket-celery-worker
     restart: unless-stopped
+    # T40: same gap, same fix, same classification as `backend` above --
+    # this process runs the identical `app.config.Settings` and needs the
+    # same pass-throughs (notably the Kalshi credentials and the risk
+    # limits) to behave the way `.env` says it should.
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-polymarket}:${POSTGRES_PASSWORD:-polymarket}@postgres:5432/${POSTGRES_DB:-polymarket}
       REDIS_URL: redis://redis:6379
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      POLYMARKET_PRIVATE_KEY: ${POLYMARKET_PRIVATE_KEY:-}
-      POLYMARKET_FUNDER_ADDRESS: ${POLYMARKET_FUNDER_ADDRESS:-}
-      POLYMARKET_API_KEY: ${POLYMARKET_API_KEY:-}
-      POLYMARKET_API_SECRET: ${POLYMARKET_API_SECRET:-}
-      POLYMARKET_API_PASSPHRASE: ${POLYMARKET_API_PASSPHRASE:-}
     volumes:
       - ./backend:/app
     depends_on:
@@ -91,7 +110,26 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: celery -A app.tasks worker --loglevel=info
+    # T40 (defense in depth): pinned to one task slot for the same reason
+    # `docker/backend/Dockerfile` pins uvicorn to `--workers 1` -- the
+    # money-safety invariant is "at most one process ever routes an order"
+    # (`app/execution/router.py`'s `OrderRouter` docstring: its `asyncio.Lock`
+    # submit-gate is scoped to ONE event loop in ONE process, and a second
+    # process sharing the database can breach a risk cap or lose a filled
+    # position to a concurrent-update overwrite). Celery's default prefork
+    # pool spawns `os.cpu_count()` child processes with no flag at all, and
+    # none of the four tasks currently registered here call
+    # `OrderRouter.submit()` -- so this is not fixing a live bug, it is
+    # closing the gap before a future execution task inherits unbounded
+    # concurrency by default. `--concurrency=1` means exactly one task runs
+    # at a time no matter which pool implementation is in effect, so the
+    # four discovery/reconcile beats queue instead of overlapping when their
+    # schedules coincide -- a queuing delay on I/O-bound, harmless-in-parallel
+    # work, not a correctness cost. Raise this only once the router has the
+    # database-enforced concurrency control its own docstring says it is
+    # still missing (an optimistic-concurrency version column on
+    # `positions`), not before.
+    command: celery -A app.tasks worker --loglevel=info --concurrency=1
 
   # Celery Beat (Scheduler)
   celery-beat:
@@ -100,12 +138,15 @@ services:
       dockerfile: ../docker/backend/Dockerfile
     container_name: polymarket-celery-beat
     restart: unless-stopped
+    # T40: same gap and fix as `backend`/`celery-worker` above.
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-polymarket}:${POSTGRES_PASSWORD:-polymarket}@postgres:5432/${POSTGRES_DB:-polymarket}
       REDIS_URL: redis://redis:6379
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
     volumes:
       - ./backend:/app
     depends_on:
