@@ -16,8 +16,24 @@ from app.models import Base
 # access to the values within the .ini file in use.
 config = context.config
 
-# Override sqlalchemy.url with the value from settings
-config.set_main_option("sqlalchemy.url", settings.database_url.replace("+asyncpg", ""))
+# Override sqlalchemy.url with the value from settings.
+#
+# This MUST keep the `+asyncpg` driver. `run_migrations_online` (the
+# default path, and what `alembic upgrade head` uses) hands this string
+# to `async_engine_from_config`, and SQLAlchemy's asyncio extension
+# refuses any sync driver: stripping the driver here produced a bare
+# `postgresql://`, which resolves to psycopg2 and fails with either
+# `ModuleNotFoundError: psycopg2` (it is not in requirements.txt --
+# only asyncpg is) or, once installed, `InvalidRequestError: The
+# asyncio extension requires an async driver`. Either way ONLINE
+# MIGRATIONS COULD NOT RUN AT ALL against Postgres.
+#
+# This survived because the only sanctioned way to check migrations
+# here was `alembic upgrade head --sql`, and offline mode never builds
+# an engine -- so the one command that was safe to run was also the one
+# command that could not see this. `run_migrations_offline` strips the
+# driver itself, below, where doing so is correct.
+config.set_main_option("sqlalchemy.url", settings.async_database_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -45,7 +61,11 @@ def run_migrations_offline() -> None:
     Calls to context.execute() here emit the given string to the
     script output.
     """
-    url = config.get_main_option("sqlalchemy.url")
+    # Offline mode emits SQL and never connects, so it needs no DBAPI --
+    # and the async driver would only make the rendered URL misleading.
+    # Stripping belongs HERE, not at module scope where it also broke
+    # the online path.
+    url = (config.get_main_option("sqlalchemy.url") or "").replace("+asyncpg", "")
     context.configure(
         url=url,
         target_metadata=target_metadata,
