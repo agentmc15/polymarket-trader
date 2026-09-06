@@ -1,92 +1,92 @@
 # HANDOFF — market-edge kit execution
 
-**Last updated:** 2026-09-05
+**Last updated:** 2026-09-06
 **Session:** `cbc400f8-2c7e-492a-9c9a-2f3550d6aae5`
-**Resume with:** `/polytropos:execute market-edge` (the kit's 24 planned tasks are all `done`; what
-remains is post-review remediation, tracked below)
+**Resume with:** `/polytropos:execute market-edge` — the kit's 24 planned tasks and every
+remediation task are `done`. The queue is empty; what remains is listed under "What is actually
+left" below, and none of it is blocking.
 
 ---
 
 ## State in one paragraph
 
-The `market-edge` kit is fully executed: **24/24 planned tasks done, plus 7 unplanned remediation
-tasks** (T21b–T21f, T26, T27) that came out of a Phase 3 review, a red-team pass, and a final
-whole-kit review. The backend suite went **654 → 728 passing**, migrations **001 → 007**, and the
-frontend typechecks and lints clean. Nothing is blocked. **Two remediation tasks were still running
-when this session paused** — see "In flight" below, and check their state before doing anything else.
+The `market-edge` kit is fully executed: **24/24 planned tasks, plus 22 unplanned remediation tasks**
+(T21b–T21f, T25–T43) driven by two phase reviews, three red-team passes, a verification pass, and a
+deployment audit. The backend suite went **654 → 841 passing**, migrations **001 → 007**, the
+frontend typechecks and lints clean, and everything is committed and pushed to `main`. Nothing is
+in flight and nothing is blocked.
+
+The routing scorecard reads **34/40 first-try, 80% cheap-model review survival** (run it yourself —
+see "Where things live"). Note that number counts only tasks present in `TASKS.md`; outcomes for
+tasks dispatched without a `TASKS.md` entry are silently dropped, which happened twice in this run.
+**Write the entry at dispatch time, not at close.**
 
 ---
 
-## What landed at the pause
+## The defect worth remembering, and why it was invisible
 
-Both remediation tasks in flight at the pause **completed their code changes and are committed**.
-They were stopped mid-*verification* (both had reached their red-green proof step), so their fixes
-are in the tree and green, but neither filed a final report.
+**The headline ask was dead code for most of this build.** `scanner.near_resolution_pass()` — the
+"events culminating soon" bucket — had **no production caller**. It was invoked from exactly one
+place in the repo: its own test file. No beat, no route, no frontend. And the general `scan()` path
+could not substitute, for two independent reasons: `settlement_edge` sits in the `"edge"` strategy
+category so `ARBITRAGE_STRATEGIES` never ran it, and even forced via `?strategies=settlement_edge`,
+`scan()` called `score()` without `allow_past_close=True`, which raises for every past-close market —
+by construction, *every* settlement-edge intent.
 
-| Task | What it did | Verify before building on it |
-|---|---|---|
-| **T25** | Added `scan_near_resolution` as a second Celery beat running `near_resolution_pass()` every `settings.near_resolution_scan_interval_s` (300s). Also fixed the `/opportunities` scan-id filter and reconciled fills erasing fence exposure. | `grep -n "scan_near_resolution" backend/app/tasks/scanner.py` |
-| **T28** | Rewrote `test_sweep.py` to CHARACTERIZE the capital-cap confound rather than dodge it — three new tests drive the cap and the book independently. | `python3 -m app.scripts.sweep --synthetic` — check whether `pct_intents_downsized` is now > 0 at the top level (PLAN R4's tripwire) |
+So the entire bucket-cap apparatus built to close a severe exploit was correct, well-tested, and
+**inert**. Every test passed. The UI answered a `near_resolution` filter with a confident empty list.
 
-**Neither task's red-green proof was completed.** Re-run it before trusting the new tests:
-revert each fix in a `$TMPDIR` copy, confirm the test fails, restore. This kit has already shipped a
-test that passed vacuously.
+**Fixed (T25) and verified**: a `scan_near_resolution` beat runs the pass on its own interval, and the
+chain was traced by reading it rather than trusting a test — beat → `run_near_resolution_scan()` →
+`near_resolution_pass()` → the strategy stamps `metadata["bucket"]` → persisted to
+`IntentRecord.extra_data` → `check_order_limits` enforces the cap, exercised end to end through the
+real `OrderRouter.submit()`.
 
-State at the pause: **740 tests passing**, `alembic heads` = `007 (head)`, frontend `tsc` and
-`npm run lint` both exit 0, working tree clean, all work merged to `main` and pushed.
-
----
-
-## The one finding that matters most
-
-**The user's headline ask was dead code, and T25 was dispatched to fix it.**
-
-`scanner.near_resolution_pass()` — the "events culminating soon" bucket — had **no production
-caller**. It was invoked from exactly one place in the repo: its own test file. No Celery beat entry,
-no API route, no frontend caller. The general `scan()` path cannot substitute for two independent
-reasons:
-
-1. `settlement_edge` is in the `"edge"` strategy category, so `ARBITRAGE_STRATEGIES` (built from
-   `STRATEGY_CATEGORIES["arbitrage"]`) never runs it.
-2. Even forced via `?strategies=settlement_edge`, `scan()` calls `score()` **without**
-   `allow_past_close=True`, so `scoring.py` raises `UnscorableIntent` for every past-close market —
-   which is, by construction, *every* settlement-edge intent. 100% silently skipped.
-
-Consequence: the entire bucket-cap apparatus (the `check_order_limits` bucket cap,
-`warn_unknown_bucket`, `_bucket_open_notional`, and the `Position.extra_data["bucket_notional"]`
-ledger built to close a severe exploit) is correct, well-tested, and **inert in production**. The UI
-answers a `near_resolution` filter with a confident empty list.
-
-**If T25 did not land, this is the first thing to finish.** Its brief is recorded in NOTES.md.
+**The generalizable lesson, which recurred three more times after this:** a green suite says a unit
+works, never that anything calls it. Three of four discovery surfaces in this repo were built,
+tested, reviewed — and unwired. When you add a capability here, the last question is *what production
+path invokes this*, and the answer must be a code path you traced, not a test that constructs it
+directly.
 
 ---
 
-## Remaining known defects
+## What is actually left
 
-The queue from the final review is **cleared**. What was item 1-7 is now:
+**The remediation queue is empty.** Everything found by the reviews, the red-team passes and the
+deployment audit is fixed, each with a regression test proven to fail against the pre-fix code.
 
-| Was | Status |
-|---|---|
-| `unmarked_positions` never reaching the API | Fixed (T29) — persisted unconditionally, badge fires |
-| Fee-basis divergence | Fixed (T29) — cross-venue prices per fill; worst case was 59% of its own edge gate |
-| `composite` ranking incomparable values | Fixed (T31) — strategies publish pre-risk edge, scoring applies every haircut once |
-| Cross-venue producing nothing out of the box | Fixed (T30) — hourly link-proposal beat, still human-gated |
-| `POST /backtests/sweep` with no UI producer | Fixed (T32) |
-| Frontend/backend contract drift | Fixed (T32) — 12 mismatches, incl. a silent slippage no-op |
-| Stale `types/index.ts` comment | Fixed (T32) |
+### The one gap I could not close
 
-### Open, lower priority
+**Nobody has run this system end to end.** All 841 tests exercise units against fixtures, and the
+deployment audit was deliberately static because GUARDRAILS §1.4 bars the venue network. So these
+remain genuinely unknown:
 
-The six items listed here at the last pause are **all closed** (T33/T34/T35). What remains:
+- whether the adapters parse real Polymarket and Kalshi payloads (they parse recorded fixtures)
+- whether Postgres/TimescaleDB accepts migration `001`–`007` against a live database (offline SQL
+  only; **never** run `alembic upgrade head` from a kit task)
+- whether the three beats behave under real venue latency and rate limits
+- whether `Settings`' default `postgresql+asyncpg://postgres:postgres@…` fails an auth handshake
+  against compose's `polymarket:polymarket` Postgres on a local non-Docker run — a plausible
+  first-run trap, unverified
 
-1. **`frontend/src/types/index.ts` types all 15 metrics fields as `number`; 11 can now be `null`.**
-   Nothing renders wrongly today (only the 4 column-backed ones are shown), but those interfaces need
-   `number | null`.
-2. **`win_rate` / `sharpe_ratio` / `max_drawdown` still coerce a NULL column to `0.0`.** Left that way
-   deliberately — the frontend does `max_drawdown * 100` with no null guard, so nulling them before
-   the frontend change would trade a silent zero for a rendered one. **Do item 1 first**, then this.
-3. **`mypy`**: one untyped-celery-decorator finding on the new task module, identical to what all four
-   existing task modules report. Left unsilenced deliberately.
+**Start in paper mode**, watch the scanner logs for `scan_book_fetch_complete` (it reports
+`books_failed` and per-venue error types), and expect the first real payload to disagree with a
+fixture somewhere.
+
+### Small, deliberate, and documented rather than fixed
+
+1. **Two rejections committing *concurrently* last-write-wins on the merged notes text.** Sequential
+   rejections — what a review queue actually produces — are safe. The alternatives put a failure mode
+   on the fail-safe direction or move the merge into SQL.
+2. **Rejection is terminal**: no route returns a link to `proposed`, so a mistyped `link_id` on reject
+   permanently bans a pair, correctable only in the database. The 409 says so plainly now rather than
+   suggesting a path that does not exist.
+3. **Two admitted gaps in the AST fence** over the matching package: a fully dynamic
+   `setattr(obj, name_from_config, value)` (undecidable syntactically) and a mapping built on an
+   earlier line then passed by name. Both are stated in the fence's own docstring with a test pinning
+   that the first is still missed.
+4. **`mypy`**: one untyped-celery-decorator finding on the new task module, identical to what all
+   four existing task modules report. Left unsilenced deliberately.
 
 ---
 
@@ -100,7 +100,16 @@ These are load-bearing. Two were violated by the repo itself and had to be fixed
   concurrent-update overwrite — reproduced: the venue filled **1802 contracts while the ledger
   recorded 902**. The portable fix (optimistic concurrency, a `version` column on `positions`) is
   **not implemented**. `docker/backend/Dockerfile` was shipping `--workers 4` against this rule and
-  now pins `--workers 1`.
+  now pins `--workers 1`; `celery-worker` pins `--concurrency=1` for the same reason, since the
+  prefork default is one process per CPU. No Celery task routes orders today, so that pin is defense
+  in depth — but it is the guard that makes adding one safe.
+- **Configuration must actually reach the process.** `docker-compose.yml` forwarded 12 of 56 settings
+  and had no `env_file`, so `.env.example`'s own "copy this to `.env`" instruction was false for 44
+  values — including both Kalshi credentials, which meant the dockerized deployment could not
+  authenticate to Kalshi at all. Fixed with `env_file` (topology-derived values stay pinned as
+  explicit `environment:` entries so a local `.env` cannot redirect the container at its own
+  database). `backend/tests/test_env_example_coverage.py` now fails if a `Settings` alias goes
+  undocumented, because this same drift had already been fixed once and silently reopened.
 - **`TRADING_MODE` defaults to `paper`** and must stay `paper` in every test process. Live requires
   `LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_REAL_MONEY` *and* no kill-switch file.
 - **The kill-switch variable is `KILL_SWITCH_PATH`**, not `TRADING_KILL_SWITCH_PATH`. `CLAUDE.md`

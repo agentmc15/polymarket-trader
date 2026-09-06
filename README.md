@@ -88,8 +88,11 @@ Python 3.12. No virtualenv is assumed.
 cd backend && python3 -m pytest -q
 ```
 
-**826 tests**, SQLite in-memory via `aiosqlite`, **no network access** — every venue interaction in
-the suite goes through recorded fixtures or `httpx.MockTransport`.
+Runs on SQLite in-memory via `aiosqlite` with **no network access** — every venue interaction in the
+suite goes through recorded fixtures or `httpx.MockTransport`, enforced by GUARDRAILS §1.4.
+
+The count is deliberately not quoted here: it has been wrong twice in this file's history, because a
+number in prose rots on the next commit while nothing checks it. `pytest -q` prints the current one.
 
 ### Run a capital sweep with no database
 
