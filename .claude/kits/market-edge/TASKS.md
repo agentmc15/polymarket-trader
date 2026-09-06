@@ -1601,7 +1601,7 @@ cd backend && python3 -m pytest -q tests/venues/
 ---
 
 ### T45 — A preflight command that checks everything checkable without a venue
-- status: in-progress
+- status: done
 - model: sonnet
 - independent: yes
 

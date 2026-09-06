@@ -6470,3 +6470,127 @@ missed; remediation tasks are invented mid-run by the orchestrator, and the ledg
 step that nothing forces. The fix is not vigilance — vigilance already failed three times — it is
 ordering: write the `TASKS.md` entry as part of composing the brief, in the same edit, so a task
 that was never written down is also a task that was never dispatched.
+
+### T45
+
+Built `backend/app/scripts/preflight.py` (`python3 -m app.scripts.preflight`) — an operator command
+that checks everything checkable before the stack ever starts, without contacting a venue: trading
+mode and its two-variable-plus-kill-switch fence (ending in an explicit "would this process place a
+real order right now" decision, computed with the identical logic `assert_live_allowed` uses),
+Polymarket/Kalshi credential presence-and-shape (never a value), database reachability and migration
+drift against the local `alembic` head, Redis/Celery broker reachability, and a "settings that are set
+but inert" group. Report is grouped by concern, each line marked pass/warn/fail, closed by a fixed "NOT
+checked" list naming venue connectivity first.
+
+**The FAIL/WARN split, worked through case by case rather than templated:** FAIL means the configured
+mode cannot work (no database, no credentials `TRADING_MODE=live` needs); WARN means it works but the
+configuration looks like it doesn't mean what it says. A kill-switch file is WARN in every mode, even
+fully-armed live — the brief itself classifies that as "works but you probably didn't mean it," and my
+first instinct (treat live+switch as decisive-therefore-FAIL) was wrong against that line; the switch
+existing is the system behaving exactly as designed, not a break.
+
+**Three of the "set but inert" findings are traced to real code, not guessed:** (1) `REDIS_URL` is a
+real `Settings` field with a real default and `grep -rn "redis_url\b" app/` finds exactly one hit —
+the field declaration itself; only `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` configure the
+connection this system uses, so setting `REDIS_URL` alone does nothing, flagged only when an operator
+has actually set it. (2) `POLYMARKET_API_KEY`/`_SECRET`/`_PASSPHRASE` are read together in
+`ClobClientWrapper.initialize` (`if api_key and api_secret and api_passphrase: ... else: derive`) —
+setting one or two of three is silently discarded in favor of deriving from the private key, so a
+partial trio gets its own warning rather than three independent "missing" lines. (3) Kalshi's
+`KALSHI_API_KEY_ID`/`KALSHI_PRIVATE_KEY_PEM` are required together the same way
+(`KalshiAdapter._signing_key`: `if not (key_id and pem.strip()): return None`) — one alone signs
+nothing. I nearly shipped all five Polymarket credential fields as independently "required" before
+reading `client.py`; that would have been a false FAIL in live mode for an operator who deliberately
+left the API trio unset to let it derive from the private key, which the real code treats as a
+perfectly working configuration. A fourth check generalizes the exact `TRADING_KILL_SWITCH_PATH` (not
+`KILL_SWITCH_PATH`) gotcha README.md's own "Money safety" section already calls out by hand, via
+`difflib.get_close_matches` against all 56 real aliases at a cutoff (0.75) tuned empirically so it
+catches that real case while producing zero false positives against a batch of ordinary shell/OS
+variables (`PATH`, `HOME`, `PYTHONPATH`, `CI`, ...) — 0.8 was tried first and missed it (ratio 0.80,
+just under). A fifth (`KALSHI_BASE_URL` set to the exact production default while `KALSHI_ENV=demo`)
+is traced to `Settings.kalshi_api_base_url`'s own "equals the default means not overridden" comparison
+— typing the exact string `.env.example` shows commented-out accomplishes nothing.
+
+**Every network-shaped fact is injected, not invoked.** `build_report` takes a pre-computed
+`DatabaseCheck`/`BrokerCheck` and an explicit `env` mapping as plain parameters; the real,
+network-touching `default_check_database`/`default_check_broker` exist only for `main()` and are never
+imported by tests. This is the whole reason `backend/tests/test_preflight.py`'s 20 tests run in 0.1s
+with no database or Redis anywhere near them, and it is also why every scenario — including "live
+mode," "kill switch armed," "database behind head" — is built the GUARDRAILS.md §1.2 way: an explicit
+`Settings(...)` passed as a parameter, `TRADING_MODE` never touched in the actual test process.
+
+**Red-green, all 8 non-trivial behaviors at once.** Backed up the working `preflight.py`, applied 8
+independent regressions in place (demote the live-mode LIVE_TRADING_CONFIRMATION fail to a warn; strip
+the kill-switch "ONLY thing preventing" wording; make the missing-credential check mode-independent;
+turn an unreachable-database FAIL into a PASS; `elif False and ...` out the schema-behind-head
+comparison; splice a raw credential value into its own "safe" presence line; raise the near-miss
+cutoff to 0.999 so it never matches; and `if False and ...` out the `REDIS_URL` check), reran
+`test_preflight.py`, and got exactly the 8 targeted failures — `test_live_mode_without_confirmation_
+fails_and_names_it`, `test_kill_switch_present_is_decisive_but_still_a_warn_in_live_mode`,
+`test_missing_kalshi_credential_fails_in_live_mode`, `test_unreachable_database_fails`,
+`test_schema_behind_head_fails_naming_the_revision_gap`, `test_no_secret_value_ever_appears_in_the_
+rendered_report`, `test_redis_url_flagged_as_inert_when_set`, `test_near_miss_env_var_name_is_
+flagged` — with the other 12 unaffected (8 failed, 12 passed). Restored from the backup; diffed the
+restored file against the backup to confirm byte-identical; reran to 20/20 green.
+
+**Verification.** Suite **861 passed** (841 at start, +20 mine), zero failures. `ruff check` and
+`mypy` scoped to exactly `app/scripts/preflight.py` and `tests/test_preflight.py`: clean on both — the
+new file's only real mypy findings before fixing were a missing return annotation on a test helper and
+a `str`-vs-`Literal` mismatch in a parametrized test, both fixed; the remaining `Settings(ALIAS=...)`
+"unexpected keyword argument" noise mypy raises against `tests/test_preflight.py` is the SAME
+pre-existing false-positive class already present against `tests/test_fences.py` (26 near-identical
+errors there, verified by running mypy on it directly) — an artifact of the pydantic-mypy plugin not
+understanding the alias-normalization GUARDRAILS.md §1.2 itself prescribes, not a defect introduced
+here, and `test_fences.py` carries the same noise unsuppressed. Ran `python3 -m app.scripts.preflight`
+for real, from `backend/`, on this machine (no Postgres, no Redis running): exits 1, both connectivity
+checks FAIL with real `OSError`/`ConnectionError` text, both venues' credentials WARN (paper mode,
+correctly), the "NOT checked" section prints — pasted into README.md's new "Preflight check" section
+verbatim. Added that section between "Run the stack" and "Money safety" in README.md.
+
+`git status --porcelain` shows my two files (`backend/app/scripts/preflight.py`,
+`backend/tests/test_preflight.py`) plus `README.md`, plus five files I never touched —
+`.claude/kits/market-edge/NOTES.md`, `.claude/kits/market-edge/TASKS.md`, `HANDOFF.md`,
+`backend/app/venues/kalshi/adapter.py`, `backend/app/venues/polymarket/adapter.py` — all large diffs
+(47–525 lines) that are the concurrently-running agent's work on `app/venues/*/adapter.py` and its own
+ledger/handoff entries, confirmed via `git diff --stat` before this entry was appended. No overlap
+with my files.
+
+### T45 adjudication (orchestrator)
+
+Ran `python3 -m app.scripts.preflight` myself rather than taking the agent's word: real output, exit
+1, two FAILs (no Postgres and no Redis on this machine), two WARNs (missing credentials, correct in
+paper mode), and the "NOT checked" block naming venue connectivity first. The DECISION line reads
+`this process would NOT place real orders right now`, which is the one sentence an operator actually
+needs. `preflight.py` imports `Settings`, `LIVE_TRADING_CONFIRMATION_PHRASE`, redis and sqlalchemy
+and nothing else — no registry, no router, no venue client — so the `TRADING_MODE="live"` `Settings`
+objects the tests construct are inert and §1.2 holds in substance, not just in wording.
+
+Checked one output line that looked like the known wrong-alias gotcha: `No kill-switch file at
+'TRADING_KILL_SWITCH'`. It is correct — `KILL_SWITCH_PATH` defaults to the literal *filename*
+`TRADING_KILL_SWITCH` (`config.py:338`), armed with `touch TRADING_KILL_SWITCH`. Not a defect.
+
+**Defect found in verification, fixed: `redis://:password@host` was not redacted.**
+`test_no_secret_value_ever_appears_in_the_rendered_report` asserts no secret reaches the report, but
+it passes `build_report` a `display_url` that is **already masked** (`produser:***`), so its
+`"SUPERSECRETPASSWORD" not in rendered` assertion holds no matter what `_redact_url` does and cannot
+fail if redaction breaks. Redaction — the most safety-critical line in the module — had no direct
+coverage at all. Writing that coverage found a live leak: `_URL_PASSWORD_RE` required a **non-empty**
+username (`[^:/@\s]+`), so the password-only form `redis://:password@host` did not match and printed
+in full. That is not an exotic shape — it is the standard Redis URL for password-only AUTH and what
+`CELERY_BROKER_URL` looks like on essentially every managed Redis, i.e. the most likely real-world
+leak rather than the least. One character (`+` → `*`) fixes it; red-green confirms the change alters
+that shape and only that shape, leaving user:pass, no-password and username-only URLs identical.
+
+This is the vacuous-assertion family again, and the third instance in this kit: a test whose subject
+is pre-satisfied by its own fixture. The tell is the same each time — the assertion's input is
+constructed in the shape the assertion is checking for.
+
+Probed whether the raw `f"{type(exc).__name__}: {exc}"` interpolation in the database and broker
+error paths can leak a URL password, across four realistic failures (redis unreachable with password
+in URL, malformed redis URL, unknown SQLAlchemy driver, asyncpg connection refused). **None leak** —
+every one reports errno/plugin text without the URL. Left as-is rather than defensively redacting
+exception text; recording the four probed paths so a future reader knows it was measured, not
+assumed, and that it is four paths rather than a proof.
+
+agent: T45 id=adc72ec7f78e99a3e role=implementer model=sonnet
+outcome: T45 model=sonnet attempts=1 result=pass review=revised run=2026-09-05-3bd5
