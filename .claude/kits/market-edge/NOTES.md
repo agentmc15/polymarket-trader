@@ -4086,3 +4086,17 @@ rather than dispatched immediately, to avoid a fifth concurrent agent for a one-
 
 agent: T27 id=ac7f1583b0d58e598 role=implementer model=sonnet
 outcome: T27 model=sonnet attempts=1 result=pass review=clean run=2026-09-05-3bd5
+
+## Session close
+
+Paused at the 5-hour mark with the tree green and everything merged to `main`. T25 and T28 were
+stopped mid-verification (both had landed their code and reached the red-green step); their fixes are
+committed and the suite is at **740 passing**, but neither filed a report and neither red-green proof
+completed. HANDOFF.md carries what to re-check.
+
+Work committed as 8 scoped commits on `feat/market-edge`, merged `--no-ff` into `main`. The repo's
+`commit-msg` hook stripped the `Co-Authored-By` trailer as designed but does NOT match
+`Claude-Session:`, so that line survives in public history -- flagged to the user with the one-line
+hook fix.
+
+session: cbc400f8-2c7e-492a-9c9a-2f3550d6aae5

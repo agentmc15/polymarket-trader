@@ -17,18 +17,23 @@ when this session paused** — see "In flight" below, and check their state befo
 
 ---
 
-## In flight when the session paused — CHECK THIS FIRST
+## What landed at the pause
 
-Two implementer subagents were mid-write. If their work did not land, the tree may hold partial
-edits; if it did, verify before building on it.
+Both remediation tasks in flight at the pause **completed their code changes and are committed**.
+They were stopped mid-*verification* (both had reached their red-green proof step), so their fixes
+are in the tree and green, but neither filed a final report.
 
-| Task | Scope | Files |
+| Task | What it did | Verify before building on it |
 |---|---|---|
-| **T25** | Wire `near_resolution_pass` into production; fix the `/opportunities` scan-id filter; fix reconciled fills erasing fence exposure | `app/tasks/__init__.py`, `app/tasks/scanner.py`, `app/services/scanner.py`, `app/api/routes/arbitrage.py`, `app/execution/reconcile.py` |
-| **T28** | Fix `pct_intents_downsized` (contaminated by the capital cap; fails PLAN R4's tripwire on the shipped demo) | `app/services/backtesting/sweep.py`, `app/services/backtesting/engine.py`, `tests/backtesting/test_sweep.py` |
+| **T25** | Added `scan_near_resolution` as a second Celery beat running `near_resolution_pass()` every `settings.near_resolution_scan_interval_s` (300s). Also fixed the `/opportunities` scan-id filter and reconciled fills erasing fence exposure. | `grep -n "scan_near_resolution" backend/app/tasks/scanner.py` |
+| **T28** | Rewrote `test_sweep.py` to CHARACTERIZE the capital-cap confound rather than dodge it — three new tests drive the cap and the book independently. | `python3 -m app.scripts.sweep --synthetic` — check whether `pct_intents_downsized` is now > 0 at the top level (PLAN R4's tripwire) |
 
-**To check:** `cd backend && python3 -m pytest -q` (expect ≥728, zero failures) and
-`git log --oneline -3`. If either task's files are half-edited, the suite will say so.
+**Neither task's red-green proof was completed.** Re-run it before trusting the new tests:
+revert each fix in a `$TMPDIR` copy, confirm the test fails, restore. This kit has already shipped a
+test that passed vacuously.
+
+State at the pause: **740 tests passing**, `alembic heads` = `007 (head)`, frontend `tsc` and
+`npm run lint` both exit 0, working tree clean, all work merged to `main` and pushed.
 
 ---
 
