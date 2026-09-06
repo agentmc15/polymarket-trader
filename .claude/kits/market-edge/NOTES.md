@@ -6816,3 +6816,54 @@ structural tests on that axis, both written after the drift had already happened
 
 **No `outcome:` line, same reasoning as T46** — orchestrator-performed, no implementer dispatch and
 no independent verification, so it is not evidence about routing.
+
+---
+
+### First live run — the three unknowns, and the five defects they hid
+
+User authorized lifting GUARDRAILS §1.4 for read-only public venue endpoints, and running
+`alembic upgrade head` against a disposable container. §1.1 (no order placement), §1.2
+(`TRADING_MODE=paper`) and §1.3 (no secrets) stayed in force throughout and were checked, not
+assumed: every run reported `TRADING_MODE=paper`, no credentials exist in this repo at all, and
+nothing authenticated was called.
+
+**Five defects, none of which a 954-test suite could see:**
+
+1. **`alembic/env.py` stripped `+asyncpg` at module scope.** `run_migrations_online` feeds that
+   string to `async_engine_from_config`, which refuses a sync driver. `upgrade head` could never run.
+2. **Both `create_hypertable` calls were rejected by TimescaleDB.** The surrogate `id` PK omits the
+   partitioning column. Migration 001 died at the first step, so the documented stack could not be
+   migrated at all.
+3. **The Polymarket adapter read two fields that do not exist.** The CLOB `/markets` payload spells
+   them `minimum_tick_size`/`minimum_order_size`; the adapter read the `/book` spellings. Present
+   under our names in **0 of 1000** live markets, so every market took a silent default — tick 0.01
+   against a real 0.001, min size 0.0 against a real 15.
+4. **Every beat worked exactly once per worker process.** `asyncio.run` per tick closes its loop; the
+   module-level engine pool and the paper adapter's httpx client both outlive it.
+5. **A vacuous test I wrote for #4 and caught myself.** Calling `asyncio.run` twice under
+   `MockTransport` passes against the broken code, because a mock transport has no sockets and does
+   not care what loop it is on. Caught by red-green, not by reading it.
+
+**The pattern under four of the five, and the thing worth carrying forward: the sanctioned safe check
+was the only check that could not fail.** `--sql` never builds an engine, so it could not see #1.
+Offline rendering prints a `DO` block without executing it, so it could not see #2. A hand-written
+fixture cannot catch a wrong field name because the same author writes both sides, so it could not
+see #3 — and T44 hardened this exact adapter against seventeen divergence classes while sharing the
+fixture's wrong assumption. One event loop per test process meant #4 could not exist in the suite,
+and a mock transport meant #5's first test could not fail. Each was a green check measuring nothing.
+
+This is the same family as the kit's headline defect (a bucket cap that was correct, well-tested and
+had no production caller) and the same family as the vacuous assertions found in T45 and twice
+before. The generalization has now recurred often enough to state flatly: **in this repo, ask what
+would have to be true for this check to fail, and if the answer is "nothing reachable", the check is
+decoration.**
+
+**Not defects, but worth knowing.** Kalshi returned `VenueRateLimited` mid-pass and the scanner
+logged it and finished (T38 resilience, confirmed against a real rate limit). A live pass at
+`SCAN_TOP_N=10` took 3.8s, 20/20 books, 0 failures. The single opportunity found on live data was a
+YES at 0.001 against NO at 0.5 — an arithmetic 48c edge on a stale one-sided book — scored
+`fill_confidence: 0.0` and `composite: 0.0`, so it could never be ranked or acted on. The scoring
+guards did on real data exactly what they were built to do.
+
+**No `outcome:` lines for any of this** — orchestrator-performed, no implementer dispatch and no
+independent verification, so it is not evidence about routing.

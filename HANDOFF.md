@@ -63,49 +63,46 @@ directly.
 **The remediation queue is empty.** Everything found by the reviews, the red-team passes and the
 deployment audit is fixed, each with a regression test proven to fail against the pre-fix code.
 
-### The one gap I could not close
+### The gap, now largely closed — and what it cost to find out
 
-**Nobody has run this system end to end.** Every test exercises units against fixtures, and the
-deployment audit was deliberately static because GUARDRAILS §1.4 bars the venue network. So these
-remain genuinely unknown:
+**This system had never been run.** On 2026-09-06 it was, with the venue-network
+guardrail lifted for read-only public endpoints and a disposable Postgres container. All three
+unknowns are now answered, and **five real defects** came out of it — every one invisible to a
+954-test suite:
 
-- whether the adapters parse real Polymarket and Kalshi payloads (they parse recorded fixtures)
-- whether Postgres/TimescaleDB accepts migration `001`–`007` against a live database (offline SQL
-  only; **never** run `alembic upgrade head` from a kit task)
-- whether the three beats behave under real venue latency and rate limits
+| # | Unknown | Verdict | What it found |
+|---|---|---|---|
+| 1 | Do the adapters parse real payloads? | **Closed for Polymarket, mostly for Kalshi** | The adapter read `tick_size`/`min_order_size` from the CLOB *market* payload, which spells them `minimum_tick_size`/`minimum_order_size`. Present in **0/1000** live markets under the names we used, so every market silently took a default: tick 10x too coarse, min size 0.0 instead of 15. |
+| 2 | Do migrations apply to a live database? | **Closed** | Two blockers. `alembic/env.py` stripped `+asyncpg`, so `upgrade head` could never build an engine. And both `create_hypertable` calls were rejected by TimescaleDB because the surrogate `id` PK omits the partitioning column — 001 died at the first step. |
+| 3 | Do the beats survive real latency and rate limits? | **Closed** | Latency and rate limits were never the problem. Every beat worked **exactly once per worker process**: `asyncio.run` per tick closes the loop, and both the engine pool and the paper adapter's httpx client outlive it, so tick 2 onward raised `Event loop is closed` forever. |
 
-The fourth item that used to sit here — the `postgres:postgres` first-run trap — is **closed** (T47).
-It was real and more specific than "plausible": three files declared the same database credentials
-and one disagreed. `.env.example` and `docker-compose.yml` both said `polymarket:polymarket`, while
-`Settings.database_url` defaulted to `postgres:postgres`. That default applies in exactly one
-situation, nothing configured it, which is the first run — and the documented first run starts a
-compose Postgres whose superuser is `polymarket`, so no `postgres` role exists to authenticate as.
-The default now matches, and `backend/tests/test_database_url_default.py` compares the userinfo in
-all three sources so the drift cannot reopen silently (host and database name are deliberately not
-compared — `localhost` vs `postgres` differ for a correct reason).
+**The lesson that generalises.** Four of the five were hidden by the same thing: *the safe way to
+check was the only way that could not fail.* `alembic upgrade head --sql` never builds an engine.
+Offline SQL renders a `DO` block without executing it. `MockTransport` has no sockets, so it does not
+care which event loop it is on. A hand-written fixture cannot catch a wrong field name, because the
+same author writes the fixture and the lookup, and they agree with each other while both disagree
+with the venue. Every one of these was a green check measuring nothing.
 
-**T44 and T45 do not close this gap — nothing inside the fence can.** They make the day it closes
-cheap instead of expensive, from the two ends:
+**What is still genuinely unverified:**
 
-- **`python3 -m app.scripts.preflight` (T45)** checks everything checkable without a venue — trading
-  mode and its fences, credential presence and shape, database reachability and migration drift,
-  broker reachability, settings that are set but inert — and ends with an explicit list of what it
-  did **not** check, venue connectivity first. Only FAIL affects the exit code; WARN never does. Run
-  it before starting the stack.
-- **Payload-divergence hardening (T44)** turned seventeen quiet-and-wrong adapter behaviours into
-  typed `VenuePayloadError`s naming venue, market and field. Read the classification honestly: these
-  are not seventeen confirmed live bugs, they are seventeen classes that *would have been silent*.
-  The mechanism is verified in each case; whether a venue actually sends that shape is exactly what
-  §1.4 prevents anyone here from knowing.
+- **Kalshi order-book depth against a liquid market.** The container shape (`orderbook_fp` with
+  `yes_dollars`/`no_dollars`) is confirmed and the adapter already handles it, but every public
+  market sampled at that hour was `initialized` or had an empty book, so no non-empty depth was
+  parsed.
+- **Authenticated endpoints on both venues** — balances, positions, resting orders. No credentials
+  exist in this repo (there is no `.env`), so those payloads are still fixture-only.
+- **Sustained multi-hour beat operation.** Ticks were verified consecutively, not over hours.
 
-The sharpest example of why this mattered: `bool(gamma_item.get("resolved", False))`. Since
-`bool("false")` is `True`, a string-encoded flag would have marked **every live market resolved** and
-dropped it from **every open scan** — surfacing as an empty opportunity list, which looks exactly
-like a quiet market. That is this repo's signature failure shape, and it is now a raise.
+**Observed while live, worth knowing:** Kalshi returned `VenueRateLimited` on a `list_markets` call
+and the scanner logged it and completed the pass rather than dying — the T38 resilience working
+against a real rate limit. A live scan at `SCAN_TOP_N=10` took **3.8s** with 20/20 books fetched and
+0 failures. And the one opportunity found on real data was a YES at 0.1c against NO at 50c, an
+arithmetic 48c "edge" that scored `fill_confidence: 0.0` and therefore `composite: 0.0` — the
+ranking correctly refusing to believe a stale one-sided book. That is the honest-labeling discipline
+paying for itself on live data.
 
-**Start in paper mode**, run the preflight first, watch the scanner logs for
-`scan_book_fetch_complete` (it reports `books_failed` and per-venue error types), and expect the
-first real payload to disagree with a fixture somewhere — it will now say so by name.
+**Start in paper mode**, run `python3 -m app.scripts.preflight` first, and watch for
+`scan_book_fetch_complete` (it reports `books_failed` and per-venue error types).
 
 ### Small, deliberate, and documented rather than fixed
 
