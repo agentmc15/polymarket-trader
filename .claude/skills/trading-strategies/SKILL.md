@@ -114,47 +114,7 @@ class ArbitrageStrategy(BaseStrategy):
         return None
 ```
 
-### 2. Copy Trading Strategy
-```python
-class CopyTradingStrategy(BaseStrategy):
-    """Mirror trades of successful traders."""
-    
-    def __init__(self, config: dict):
-        super().__init__(config)
-        self.tracked_traders = config.get("tracked_traders", [])
-        self.trade_delay = config.get("delay_seconds", 30)
-        self.size_multiplier = config.get("size_multiplier", 0.5)
-    
-    async def process_trader_activity(
-        self,
-        trader_address: str,
-        trade: dict
-    ) -> Optional[Signal]:
-        """Generate signal based on tracked trader activity."""
-        if trader_address not in self.tracked_traders:
-            return None
-        
-        trader_score = await self._get_trader_score(trader_address)
-        
-        return Signal(
-            type=SignalType.BUY if trade["side"] == "BUY" else SignalType.SELL,
-            token_id=trade["token_id"],
-            price=trade["price"],
-            size=self._scale_size(trade["size"], trader_score),
-            confidence=trader_score,
-            timestamp=datetime.utcnow(),
-            metadata={
-                "source_trader": trader_address,
-                "original_size": trade["size"]
-            }
-        )
-    
-    def _scale_size(self, original_size: float, score: float) -> float:
-        """Scale position size based on trader confidence."""
-        return original_size * self.size_multiplier * score
-```
-
-### 3. Momentum Strategy
+### 2. Momentum Strategy
 ```python
 class MomentumStrategy(BaseStrategy):
     """Trade based on price momentum and volume."""
@@ -208,7 +168,7 @@ class MomentumStrategy(BaseStrategy):
         return (total_bids - total_asks) / (total_bids + total_asks)
 ```
 
-### 4. Mean Reversion Strategy
+### 3. Mean Reversion Strategy
 ```python
 class MeanReversionStrategy(BaseStrategy):
     """Trade reversals from price extremes."""

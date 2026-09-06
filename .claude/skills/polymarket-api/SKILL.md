@@ -22,7 +22,10 @@ Base URL: `https://clob.polymarket.com`
 #### Key Endpoints
 ```
 GET  /markets              # List all markets
-GET  /markets/{token_id}   # Get specific market
+GET  /markets/{condition_id}  # Get specific market (condition_id is the
+                               # MARKET key; token_id is the per-outcome
+                               # BOOK key used by /price, /midpoint, /book
+                               # below — the two are not interchangeable)
 GET  /price?token_id=X     # Get current price
 GET  /midpoint?token_id=X  # Get midpoint price
 GET  /book?token_id=X      # Get orderbook
@@ -140,6 +143,33 @@ class GammaClient:
 - **GTD** (Good Till Date): Expires at specified time
 - **FOK** (Fill or Kill): Must fill entirely or cancel
 - **IOC** (Immediate or Cancel): Fill what's available, cancel rest
+
+## Fee Model
+
+**Polymarket's taker-only formula** (docs.polymarket.com/trading/fees, fetched 2026-09-04):
+
+```
+fee = C × rate × p × (1 − p)
+```
+
+Where:
+- `C` = contract count ($1 per contract at resolution)
+- `rate` = taker fee rate (category-dependent, makers never pay)
+- `p` = fill price, a probability in [0, 1]
+- `(1 − p)` = the fee term; maximized at p=0.5 (coin-flip), vanishes at tails (p→0 or p→1)
+
+**Category taker rates** (charged in USDC):
+
+| Category | Rate |
+|----------|------|
+| Crypto | 0.07 |
+| Sports / Economics / Culture / Weather / Other | 0.05 |
+| Finance / Politics / Mentions / Tech | 0.04 |
+| Geopolitics | 0.00 |
+
+**Per-market override**: The CLOB market payload may carry `maker_base_fee`/`taker_base_fee` (historical field names), which is authoritative over the category table when present. These fields are in BASIS POINTS, not a dimensionless rate — `taker_base_fee=700` means 0.07, not 700. Divide by `10_000` to get the rate `FeeSchedule` expects (`app/venues/polymarket/adapter.py` does this at the two places it reads these fields) before building a `FeeSchedule` from the payload (`source="clob_market"`) rather than from `category_rate()`. Skipping the division is a 10,000× fee error.
+
+**Maker fees**: Always 0 on Polymarket CLOB; taker-only venue.
 
 ## Price Calculations
 
