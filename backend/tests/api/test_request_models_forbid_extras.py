@@ -32,6 +32,7 @@ are the positive and negative controls for that walker, in the spirit of
 `tests/test_fences.py`: a fence that passes because it found nothing is
 indistinguishable from one that passes because it looked nowhere.
 """
+from collections.abc import Iterable, Iterator
 from typing import Any, ForwardRef, get_args, get_type_hints
 
 import pytest
@@ -40,6 +41,7 @@ from fastapi.dependencies.utils import get_flat_dependant
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
+from starlette.routing import BaseRoute, Mount
 
 from app.api.routes.backtesting import BacktestRequest, SweepRequest
 from app.main import app
@@ -159,6 +161,36 @@ def _reachable_models(
     return seen
 
 
+def _api_routes(routes: Iterable[BaseRoute]) -> Iterator[APIRoute]:
+    """Yield every `APIRoute` reachable from `routes`, descending into `Mount`s.
+
+    T42 F5: a sub-application attached with `app.mount(path, sub_app)`
+    appears in the PARENT app's `.routes` as a single
+    `starlette.routing.Mount`, never as an `APIRoute` — the mount's own
+    route table lives one level down, on `Mount.routes` (a property that
+    proxies to the mounted ASGI app's own `.routes`, `[]` if it has
+    none). A walker that skips anything that is not already an
+    `APIRoute` — the pre-T42 shape of `_request_body_models` and
+    `_response_models` below — therefore never sees a single route
+    behind a mount, however many the sub-app declares: the identical
+    "walker looked nowhere" failure `test_the_walker_flags_a_permissive_
+    model_in_an_app_it_has_never_seen` exists to catch, through a shape
+    that test does not construct. Recurses rather than descending one
+    level, since a mount can itself contain another mount.
+
+    Args:
+        routes: A route list — an app's `.routes`, or a `Mount`'s.
+
+    Returns:
+        Iterator[APIRoute]: Every `APIRoute` found, at any depth.
+    """
+    for route in routes:
+        if isinstance(route, Mount):
+            yield from _api_routes(route.routes)
+        elif isinstance(route, APIRoute):
+            yield route
+
+
 def _request_body_models(application: FastAPI) -> dict[str, type[BaseModel]]:
     """Return every model `application` parses a request BODY into.
 
@@ -172,6 +204,12 @@ def _request_body_models(application: FastAPI) -> dict[str, type[BaseModel]]:
     be checked identically; `route.dependant.body_params` alone is blind
     to it.
 
+    Walks `_api_routes(application.routes)` rather than
+    `application.routes` directly (T42 F5), so a body model declared
+    inside a mounted sub-application is checked identically to one
+    declared directly on `application` — see `_api_routes` for why a
+    walker blind to `Mount` sees nothing behind one at all.
+
     Args:
         application: The FastAPI app to inspect.
 
@@ -179,9 +217,7 @@ def _request_body_models(application: FastAPI) -> dict[str, type[BaseModel]]:
         dict[str, type[BaseModel]]: Body models by dotted name.
     """
     found: dict[str, type[BaseModel]] = {}
-    for route in application.routes:
-        if not isinstance(route, APIRoute):
-            continue
+    for route in _api_routes(application.routes):
         for param in get_flat_dependant(route.dependant).body_params:
             _reachable_models(getattr(param, "type_", None), found)
     return found
@@ -189,6 +225,11 @@ def _request_body_models(application: FastAPI) -> dict[str, type[BaseModel]]:
 
 def _response_models(application: FastAPI) -> dict[str, type[BaseModel]]:
     """Return every model `application` declares as a `response_model`.
+
+    Recurses into mounted sub-applications the same way
+    `_request_body_models` does (T42 F5, `_api_routes`) — a response
+    model declared behind a mount is exactly as much this app's concern
+    as one declared directly on it.
 
     Args:
         application: The FastAPI app to inspect.
@@ -198,9 +239,7 @@ def _response_models(application: FastAPI) -> dict[str, type[BaseModel]]:
             including everything nested inside them.
     """
     found: dict[str, type[BaseModel]] = {}
-    for route in application.routes:
-        if not isinstance(route, APIRoute):
-            continue
+    for route in _api_routes(application.routes):
         _reachable_models(route.response_model, found)
     return found
 
@@ -361,6 +400,66 @@ def test_the_walker_sees_a_permissive_model_behind_a_forward_reference() -> None
     assert inner_name in found
     assert found[inner_name] is _ForwardRefInner
     assert found[inner_name].model_config.get("extra") != "forbid"
+
+
+def test_the_walker_sees_a_permissive_model_behind_a_mounted_sub_application() -> None:
+    """T42 F5: a body model that lives behind `app.mount(path, sub_app)`.
+
+    A route inside a mounted sub-application appears in the PARENT app's
+    `.routes` as a single `starlette.routing.Mount`, never as an
+    `APIRoute` — the sub-app's own route table is one level down, on
+    `Mount.routes`. The pre-T42 walker's `if not isinstance(route,
+    APIRoute): continue` discarded the whole mount without looking
+    inside it, so every body model behind one — however many routes the
+    sub-app declared — was as invisible as if the routes did not exist.
+    `app/main.py` mounts nothing today (this gap is latent, not live),
+    but nothing about `app.mount(...)` is exotic — it is FastAPI's own
+    documented way to compose a sub-application, and the walker's job is
+    to see the live route table whatever shape it takes next.
+    """
+
+    class _MountedPermissive(BaseModel):
+        """Mirrors the ORIGINAL bug's shape yet again (this module's
+        docstring): the frontend's actual spelling (`slippage_bps`)
+        posted against a model that declares `slippage_value`, with no
+        `extra="forbid"` to turn the mismatch into a 422.
+        """
+
+        slippage_value: float = 0.001
+
+    sub_app = FastAPI()
+
+    @sub_app.post("/probe")
+    async def _handler(body: _MountedPermissive) -> dict[str, float]:
+        return {"slippage_value": body.slippage_value}
+
+    probe = FastAPI()
+    probe.mount("/sub", sub_app)
+
+    mounted_name = f"{_MountedPermissive.__module__}.{_MountedPermissive.__qualname__}"
+
+    # RED: the pre-T42 walker looked only at `application.routes`
+    # directly and skipped anything that was not already an `APIRoute`.
+    old_found: dict[str, type[BaseModel]] = {}
+    for route in probe.routes:
+        if isinstance(route, APIRoute):
+            for param in get_flat_dependant(route.dependant).body_params:
+                _reachable_models(getattr(param, "type_", None), old_found)
+    assert old_found == {}, "the pre-T42 walker must find nothing behind the mount"
+
+    # GREEN: the current walker descends into the mount and finds it.
+    found = _request_body_models(probe)
+    assert mounted_name in found
+    assert found[mounted_name] is _MountedPermissive
+    assert found[mounted_name].model_config.get("extra") != "forbid"
+
+    # The original bug, reproduced through a mount: `TestClient` POSTs
+    # the frontend's actual spelling to the sub-app's own route, and it
+    # is silently discarded rather than rejected.
+    client = TestClient(probe)
+    response = client.post("/sub/probe", json={"slippage_bps": 50})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"slippage_value": 0.001}
 
 
 def test_no_response_model_forbids_extras() -> None:
