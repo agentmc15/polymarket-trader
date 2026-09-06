@@ -647,7 +647,7 @@ async def test_a_market_the_domain_type_rejects_is_a_venue_error() -> None:
     `app.services.scanner.VENUE_READ_FAULTS`: one such market would abort
     a whole scan pass instead of being skipped.
     """
-    adapter = _adapter(clob_market=dict(CLOB_MARKET, tick_size=0))
+    adapter = _adapter(clob_market=dict(CLOB_MARKET, minimum_tick_size=0))
 
     with pytest.raises(VenuePayloadError) as excinfo:
         await adapter.get_market(MARKET_A001)
@@ -1095,7 +1095,7 @@ async def test_one_unparseable_trade_among_good_ones_is_skipped_not_fatal(
 
 def adapter_with_a_market_the_domain_type_rejects() -> PolymarketAdapter:
     """A Polymarket adapter whose CLOB enrichment carries `tick_size: 0`."""
-    return _adapter(clob_market=dict(CLOB_MARKET, tick_size=0))
+    return _adapter(clob_market=dict(CLOB_MARKET, minimum_tick_size=0))
 
 
 def adapter_with_a_balance_payload_missing_its_amount(

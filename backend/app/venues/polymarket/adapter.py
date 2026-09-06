@@ -564,8 +564,18 @@ class PolymarketAdapter(BaseAdapter):
         tick_size = 0.01
         min_size = 0.0
         if clob_item is not None:
-            tick_size = _to_float(clob_item.get("tick_size"), default=tick_size)
-            min_size = _to_float(clob_item.get("min_order_size"), default=min_size)
+            tick_size = _clob_size_field(
+                clob_item,
+                ("minimum_tick_size", "tick_size"),
+                market_id=market_id,
+                label="tick size",
+            )
+            min_size = _clob_size_field(
+                clob_item,
+                ("minimum_order_size", "min_order_size"),
+                market_id=market_id,
+                label="minimum order size",
+            )
             taker_bps = clob_item.get("taker_base_fee")
             if taker_bps is not None:
                 maker_bps = clob_item.get("maker_base_fee")
@@ -1113,6 +1123,74 @@ def _parse_list_field(value: object) -> list[Any]:
         f"expected a list or JSON-encoded list, got {value!r}", raw=value
     )
 
+
+
+def _clob_size_field(
+    clob_item: Mapping[str, Any],
+    spellings: tuple[str, ...],
+    *,
+    market_id: str,
+    label: str,
+) -> float:
+    """Read a CLOB-market numeric field, trying each spelling in order.
+
+    THE FIRST SPELLING IS THE ONE THE LIVE API ACTUALLY SENDS. The
+    `/markets` payload uses `minimum_tick_size` and `minimum_order_size`;
+    the `/book` payload uses the shorter `tick_size` / `min_order_size`
+    for the same quantities. This adapter read the BOOK's spellings out
+    of the MARKET payload, so both lookups missed on every real market
+    and silently took their defaults -- `tick_size=0.01` and
+    `min_size=0.0`.
+
+    Measured against 1000 live markets (2026-09-06): `minimum_tick_size`
+    and `minimum_order_size` were present in 1000/1000, while
+    `tick_size` and `min_order_size` appeared in 0/1000. The real values
+    are not the defaults either: minimum order size was 15 on 962 of
+    them and 5 on 34, against a default of 0.0, and 32 markets carried a
+    tick of 0.001 or 0.04 against a default of 0.01.
+
+    Both defaults are wrong in the dangerous direction. A tick 10x too
+    coarse rounds prices past an edge that settlement strategies measure
+    in fractions of a cent, and a minimum order size of 0.0 lets sizing
+    propose an order the venue will simply refuse.
+
+    Absence is therefore LOUD rather than defaulted: every real payload
+    carries these, so a missing one means the contract changed and a
+    guessed number would be priced. The raise is a `VenuePayloadError`,
+    which `scanner.VENUE_READ_FAULTS` already skips per market rather
+    than aborting a pass.
+
+    Args:
+        clob_item: The CLOB `/markets` payload for one market.
+        spellings: Field names to try, live spelling first.
+        market_id: For the error message.
+        label: Human name of the quantity, for the error message.
+
+    Returns:
+        float: The field's value.
+
+    Raises:
+        VenuePayloadError: If no spelling is present, or the value is
+            not numeric.
+    """
+    for name in spellings:
+        if name not in clob_item:
+            continue
+        value = clob_item[name]
+        try:
+            return float(cast(Any, value))
+        except (TypeError, ValueError) as exc:
+            raise VenuePayloadError(
+                f"polymarket market {market_id}: {label} field {name!r} is "
+                f"{value!r}, which is not a number",
+                raw=clob_item,
+            ) from exc
+    raise VenuePayloadError(
+        f"polymarket market {market_id}: CLOB payload carries no {label} under "
+        f"any of {list(spellings)!r}; refusing to substitute a default, because "
+        f"a wrong {label} is priced silently",
+        raw=clob_item,
+    )
 
 def _to_float(value: object, *, default: float) -> float:
     """Best-effort `float(value)`, falling back to `default` on failure/`None`."""

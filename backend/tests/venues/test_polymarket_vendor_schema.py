@@ -23,7 +23,18 @@ from typing import Any, get_type_hints
 import pytest
 from py_clob_client.clob_types import OrderBookSummary, OrderSummary
 
-from tests.venues.test_polymarket_adapter import CLOB_BOOK, MARKET_A001, _adapter
+from app.venues.base import VenuePayloadError
+from tests.venues.test_polymarket_adapter import (
+    CLOB_BOOK,
+    CLOB_MARKET,
+    MARKET_A001,
+    _adapter,
+)
+
+
+def _load_clob_market_fixture() -> dict[str, Any]:
+    """A mutable copy of the CLOB `/markets` fixture."""
+    return dict(CLOB_MARKET)
 
 _BOOK_FIELDS = {f.name for f in fields(OrderBookSummary)}
 _LEVEL_FIELDS = {f.name for f in fields(OrderSummary)}
@@ -112,3 +123,66 @@ async def test_a_book_built_from_the_vendor_dataclass_parses() -> None:
 
     assert [(lvl.price, lvl.size) for lvl in book.bids] == [(0.40, 120.5)]
     assert [(lvl.price, lvl.size) for lvl in book.asks] == [(0.42, 80.0)]
+
+
+# ---------------------------------------------------------------------------
+# CLOB /markets field names (measured against the live API, 2026-09-06).
+# ---------------------------------------------------------------------------
+#
+# The `/markets` payload spells these `minimum_tick_size` and
+# `minimum_order_size`. The `/book` payload spells the SAME quantities
+# `tick_size` and `min_order_size`. The adapter read the book's
+# spellings out of the market payload, so both lookups missed on every
+# real market and silently fell back to `tick_size=0.01`,
+# `min_size=0.0`.
+#
+# Sampled 1000 live markets: minimum_tick_size and minimum_order_size
+# present in 1000/1000; tick_size and min_order_size in 0/1000. Real
+# values were not the defaults either -- minimum order size was 15 on
+# 962 and 5 on 34 (default 0.0), and 32 markets carried a tick of 0.001
+# or 0.04 (default 0.01).
+#
+# A fixture could never have caught this: the same hand wrote the
+# fixture and the lookup, so they agreed on a name the venue does not
+# use.
+
+
+def test_the_fixture_uses_the_live_market_spellings() -> None:
+    """The fixture encoded the bug, which is why nothing caught it."""
+    market = _load_clob_market_fixture()
+
+    assert "minimum_tick_size" in market
+    assert "minimum_order_size" in market
+    assert "tick_size" not in market, (
+        "the CLOB /markets payload does not carry 'tick_size'; that is the "
+        "/book spelling, and putting it in this fixture is what hid the bug"
+    )
+    assert "min_order_size" not in market
+
+
+@pytest.mark.asyncio
+async def test_live_spellings_reach_the_venue_market() -> None:
+    """Values must come from the payload, never from a default."""
+    market = dict(
+        _load_clob_market_fixture(), minimum_tick_size=0.001, minimum_order_size=15
+    )
+
+    built = await _adapter(clob_market=market).get_market(MARKET_A001)
+
+    assert built.tick_size == 0.001, "fell back to the 0.01 default"
+    assert built.min_size == 15.0, "fell back to the 0.0 default"
+
+
+@pytest.mark.asyncio
+async def test_a_market_carrying_neither_spelling_is_refused() -> None:
+    """Absence is loud: a guessed tick is priced silently."""
+    market = {
+        k: v
+        for k, v in _load_clob_market_fixture().items()
+        if k not in {"minimum_tick_size", "tick_size"}
+    }
+
+    with pytest.raises(VenuePayloadError) as excinfo:
+        await _adapter(clob_market=market).get_market(MARKET_A001)
+
+    assert "tick size" in str(excinfo.value)
