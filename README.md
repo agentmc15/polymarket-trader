@@ -124,6 +124,66 @@ docker compose up
 
 Postgres + TimescaleDB, Redis, the FastAPI backend, a Celery worker and beat, and the Vite frontend.
 
+### Preflight check
+
+Run this **before** `docker compose up` — it checks everything checkable without touching a venue
+(trading-mode fences, credential presence/shape, database reachability and migration state, the
+Redis/Celery broker, and a few settings this repo has shipped that looked configured and did
+nothing) and reports pass/warn/fail, grouped by concern:
+
+```bash
+cd backend
+python3 -m app.scripts.preflight
+```
+
+Exit code is non-zero only on a real **FAIL** (something that would not work); a **WARN** means "this
+works, but the configuration probably doesn't mean what it says" and never blocks the exit code — see
+`app/scripts/preflight.py`'s module docstring for why conflating the two is exactly the mistake to
+avoid. Sample output, captured on a machine with no Postgres or Redis running (a fine demonstration —
+it shows the failure path is legible):
+
+```
+Preflight check (app.scripts.preflight)
+==============================================================================
+
+-- Trading mode & fences -----------------------------------------------------
+[PASS] TRADING_MODE='paper'
+[PASS] LIVE_TRADING_CONFIRMATION not set (fine for paper mode).
+[PASS] No kill-switch file at 'TRADING_KILL_SWITCH'.
+[PASS] DECISION: this process would NOT place real orders right now.
+
+-- Credentials (presence and shape only -- never a value) --------------------
+[WARN] POLYMARKET_PRIVATE_KEY: MISSING -- fine for paper mode; required for any Polymarket order ...
+[PASS] POLYMARKET_FUNDER_ADDRESS: not set -- optional, falls back to None.
+[PASS] POLYMARKET_API_KEY/SECRET/PASSPHRASE: none set; will be derived automatically from ...
+[WARN] Kalshi credentials: MISSING -- fine for paper mode; KALSHI_API_KEY_ID and ... both required ...
+
+-- Database ------------------------------------------------------------------
+[FAIL] cannot connect to postgresql+asyncpg://postgres:***@localhost:5432/polymarket: OSError: ...
+
+-- Redis / Celery broker -----------------------------------------------------
+[FAIL] CELERY_BROKER_URL (redis://localhost:6379/0): unreachable -- ConnectionError: ...
+
+-- Settings that are set but inert -------------------------------------------
+[PASS] No known inert-configuration pattern detected.
+
+-- NOT checked by this tool --------------------------------------------------
+  - Venue connectivity -- Polymarket, Kalshi, and any Polygon RPC are never contacted by this tool ...
+  - Credential VALIDITY -- only presence and coarse shape are checked, never whether a venue accepts it.
+  - Whether the migration FILES apply cleanly to this database ...
+  - Whether a Celery worker or beat process is actually running and consuming from the broker ...
+  - Wallet or account balances at either venue.
+  - Frontend build/typecheck/lint (see Development below).
+
+==============================================================================
+SUMMARY: 12 passed, 2 warning(s), 2 failed -- overall FAIL (exit code 1)
+```
+
+A password embedded in `DATABASE_URL`/broker URLs is always masked (`user:***@`) before display, and a
+credential is only ever reported as presence-and-shape (`set (PEM, 1704 bytes)`, `MISSING`) — never a
+value. `backend/tests/test_preflight.py` has a dedicated test asserting a recognisable fake secret
+never appears anywhere in rendered output.
+
 ---
 
 ## Money safety
