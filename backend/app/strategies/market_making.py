@@ -71,17 +71,62 @@ DEFAULT_MIN_SPREAD = 0.10
 CONSERVATIVE_MIN_SPREAD = 0.25
 
 #: Fraction of the spread to keep as edge when improving the touch. At
-#: 0.5 the quote sits halfway between the touch and the mid: still
-#: improving the book (so it earns queue priority, the variable that
-#: decides everything above) while keeping half the measured edge.
-DEFAULT_EDGE_FRACTION = 0.5
+#: 1.0 the quote sits ON the touch; at 0.5, halfway between touch and
+#: mid.
+#:
+#: CALIBRATED, and it is the parameter that carries the whole result.
+#: Sweeping it on 537 markets (min_spread 0.10, max_inventory 20, return
+#: on capital per quoted market-hour):
+#:
+#:     edge   traded   mean P&L     ROC
+#:     0.50      196    +0.2760   +0.0137
+#:     0.70      190    +0.8718   +0.0474
+#:     0.80      184    +1.0878   +0.0612   <- broad optimum
+#:     0.90      160    +1.1434   +0.0597
+#:     1.00      133    +0.6395   +0.0287
+#:
+#: The optimum is interior for a reason worth keeping: quoting too close
+#: to the mid (low values) fills often but hands most of the spread back
+#: as adverse selection, while quoting AT the touch (1.0) earns no queue
+#: priority and simply trades less — 133 markets against 184. Verified
+#: out of sample and across 60 independent random halves, where 0.80 beat
+#: the old 0.5 default on 60 of 60 draws.
+DEFAULT_EDGE_FRACTION = 0.80
 
 #: Inventory at which one side is withdrawn entirely, in contracts.
-DEFAULT_MAX_INVENTORY = 100.0
+#:
+#: CALIBRATED to 20 (was 100): a tight limit is the primary risk control,
+#: and it is a SUBSTITUTE for `skew_strength` rather than a complement.
+#: Worst single-market P&L, edge_fraction 0.80:
+#:
+#:     max_inventory   skew 0.0   skew 1.0   skew 2.0
+#:              20       -8.90      -6.90      -6.90
+#:             100      -46.25     -13.25     -11.60
+#:
+#: At 100 the skew is what stands between the book and a -46 market; at
+#: 20 the withdrawal does that job already. Raising this WITHOUT raising
+#: `skew_strength` re-opens exactly that tail.
+DEFAULT_MAX_INVENTORY = 20.0
 
 #: How hard inventory pushes the quote, as a fraction of the half-spread
 #: at full inventory. At 1.0 a maxed-out book shifts its quotes by a full
 #: half-spread toward getting flat.
+#:
+#: DELIBERATELY LEFT AT 1.0, against the grid search. At the calibrated
+#: `DEFAULT_MAX_INVENTORY` of 20 the measured trade-off is:
+#:
+#:     skew   mean P&L      ROC   5th pct   worst
+#:     0.0     +1.0878   +0.0612    -5.200   -8.90
+#:     1.0     +0.6514   +0.0348    -4.700   -6.90
+#:
+#: Zero earns 1.7x more and gives up a slightly worse tail — a risk
+#: appetite, not a fact, and not one this module should silently spend on
+#: an operator's behalf. It is also the parameter this backtest measures
+#: worst: hourly candles cannot see intra-hour inventory swings, so the
+#: value of leaning against them is understated here by construction.
+#: An operator running the diversified portfolio this strategy needs
+#: (~2,500 simultaneous markets, where per-market tails average out) has
+#: a good case for lowering it; that is their call to make explicitly.
 DEFAULT_SKEW_STRENGTH = 1.0
 
 

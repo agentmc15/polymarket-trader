@@ -11,6 +11,8 @@ import pytest
 
 from app.strategies.market_making import (
     CONSERVATIVE_MIN_SPREAD,
+    DEFAULT_EDGE_FRACTION,
+    DEFAULT_MAX_INVENTORY,
     DEFAULT_MIN_SPREAD,
     MarketMaker,
     round_to_tick,
@@ -100,8 +102,14 @@ def test_a_wider_edge_fraction_never_produces_a_worse_price(edge_fraction) -> No
 
 
 def test_long_inventory_leans_the_quote_down_to_sell_it() -> None:
-    flat = MarketMaker().quote(_book(0.30, 0.70), tick_size=TICK, inventory=0.0)
-    long = MarketMaker().quote(_book(0.30, 0.70), tick_size=TICK, inventory=50.0)
+    # Half the configured limit, so the lean is exercised without the
+    # withdrawal that fires AT the limit. Expressed relative to the
+    # parameter rather than hardcoded, so recalibrating the limit does
+    # not silently turn this into a test of something else.
+    mm = MarketMaker()
+    half = mm.max_inventory / 2.0
+    flat = mm.quote(_book(0.30, 0.70), tick_size=TICK, inventory=0.0)
+    long = mm.quote(_book(0.30, 0.70), tick_size=TICK, inventory=half)
 
     assert long.bid.price < flat.bid.price
     assert long.ask.price < flat.ask.price
@@ -110,8 +118,10 @@ def test_long_inventory_leans_the_quote_down_to_sell_it() -> None:
 def test_short_inventory_leans_the_quote_up_to_buy_it_back() -> None:
     """The live fill imbalance runs 1.5-2x toward sells, so this is the
     direction a two-sided quoter actually drifts."""
-    flat = MarketMaker().quote(_book(0.30, 0.70), tick_size=TICK, inventory=0.0)
-    short = MarketMaker().quote(_book(0.30, 0.70), tick_size=TICK, inventory=-50.0)
+    mm = MarketMaker()
+    half = mm.max_inventory / 2.0
+    flat = mm.quote(_book(0.30, 0.70), tick_size=TICK, inventory=0.0)
+    short = mm.quote(_book(0.30, 0.70), tick_size=TICK, inventory=-half)
 
     assert short.bid.price > flat.bid.price
     assert short.ask.price > flat.ask.price
@@ -203,6 +213,26 @@ def test_the_thresholds_match_the_measurement_they_came_from() -> None:
     """
     assert DEFAULT_MIN_SPREAD == 0.10
     assert CONSERVATIVE_MIN_SPREAD == 0.25
+
+
+def test_the_calibrated_defaults_are_the_measured_ones() -> None:
+    """`edge_fraction` carries the whole result — it beat the previous
+    0.5 default on 60 of 60 independent random halves — and the tight
+    inventory limit is what replaces skew as the primary risk control."""
+    assert DEFAULT_EDGE_FRACTION == 0.80
+    assert DEFAULT_MAX_INVENTORY == 20.0
+
+
+def test_raising_the_inventory_limit_without_skew_is_the_documented_tail() -> None:
+    """A regression guard on the pairing, not on either value alone.
+
+    Measured worst single-market P&L at edge 0.80: -8.90 at
+    max_inventory 20, but -46.25 at 100 with skew 0. The two parameters
+    are substitutes, so a default that loosens one while zeroing the
+    other re-opens that tail. This pins that the SHIPPED default keeps
+    skew active.
+    """
+    assert MarketMaker().skew_strength > 0.0
 
 
 @pytest.mark.parametrize(
