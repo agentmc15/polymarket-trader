@@ -543,7 +543,8 @@ class PolymarketAdapter(BaseAdapter):
                 markets.append(
                     self._build_market(
                         item,
-                        event_id_by_market.get(_market_id(item) or ""),
+                        self._event_id_from_item(item)
+                        or event_id_by_market.get(_market_id(item) or ""),
                         clob_by_condition_id.get(_market_id(item) or ""),
                     )
                 )
@@ -597,7 +598,11 @@ class PolymarketAdapter(BaseAdapter):
             )
         event_id_by_market = await self._event_id_by_market_id()
         clob_item = await self._fetch_clob_market(market_id)
-        return self._build_market(match, event_id_by_market.get(market_id), clob_item)
+        return self._build_market(
+            match,
+            self._event_id_from_item(match) or event_id_by_market.get(market_id),
+            clob_item,
+        )
 
     def _build_market(
         self,
@@ -789,8 +794,60 @@ class PolymarketAdapter(BaseAdapter):
         return _require_list_of_dicts(items, context="gamma /markets")
 
     async def _fetch_events(self) -> list[dict[str, Any]]:
-        """`GET {gamma_api_url}/events`, defensively parsed to `list[dict]`."""
-        response = await self._gamma_client.get("/events")
+        """`GET {gamma_api_url}/events`, paged and defensively parsed.
+
+        Gamma's default page is 20 here exactly as it is on `/markets`,
+        and this call was issued bare — so the event listing stopped at
+        20 events however many existed, and every market outside them
+        silently lost its `event_id`. Same defect, same fix, same page
+        constants as the sibling listing; the 422-on-a-later-page
+        handling is the same contract too (an offset past Gamma's
+        ceiling is the end of the listing, not a failure).
+        """
+        collected: list[dict[str, Any]] = []
+        for page in range(_MAX_GAMMA_PAGES):
+            try:
+                batch = await self._fetch_events_page(
+                    {
+                        "limit": str(_GAMMA_PAGE_LIMIT),
+                        "offset": str(page * _GAMMA_PAGE_LIMIT),
+                    }
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 422 or page == 0:
+                    raise
+                logger.warning(
+                    "polymarket",
+                    extra={
+                        "event": "gamma_event_offset_ceiling",
+                        "page": page,
+                        "events": len(collected),
+                        "detail": "gamma refused the next offset; listing ends here",
+                    },
+                )
+                return collected
+            collected.extend(batch)
+            if len(batch) < _GAMMA_PAGE_LIMIT:
+                return collected
+        logger.warning(
+            "polymarket",
+            extra={
+                "event": "gamma_event_page_cap_reached",
+                "pages": _MAX_GAMMA_PAGES,
+                "events": len(collected),
+                "detail": (
+                    "event listing truncated at the page cap; markets beyond "
+                    "it lose their event_id and drop out of bundle grouping"
+                ),
+            },
+        )
+        return collected
+
+    async def _fetch_events_page(
+        self, params: dict[str, str] | None
+    ) -> list[dict[str, Any]]:
+        """One `GET {gamma_api_url}/events`, defensively parsed."""
+        response = await self._gamma_client.get("/events", params=params)
         response.raise_for_status()
         payload: object = response.json()
         items: object = payload.get("data", payload) if isinstance(payload, dict) else payload
@@ -811,8 +868,47 @@ class PolymarketAdapter(BaseAdapter):
         """
         return await self._events_memo.get("", self._build_event_id_by_market_id)
 
+    @staticmethod
+    def _event_id_from_item(item: dict[str, Any]) -> str | None:
+        """Read a market's event id out of its OWN Gamma payload.
+
+        Gamma embeds the market's parent event in every `/markets` item —
+        measured present on 1,918 of 1,918 live open markets — so the
+        grouping needs no second endpoint at all. Preferring it here
+        fixes a defect that survived two other fixes: `GET /events`
+        unfiltered returns CLOSED events, while `list_markets` returns
+        OPEN markets, so the two listings were disjoint and the join
+        still produced 0 of 1,918 tagged even once the key spaces and the
+        pagination were both correct.
+
+        A market belongs to one event in practice; `[0]` is that event.
+
+        Returns:
+            str | None: The event id, or `None` when the payload carries
+                no usable grouping — the same "no event" contract
+                `_event_id_by_market_id` documents.
+        """
+        events = item.get("events")
+        if not isinstance(events, list):
+            return None
+        for event in events:
+            if isinstance(event, dict) and event.get("id") is not None:
+                return str(event["id"])
+        return None
+
     async def _build_event_id_by_market_id(self) -> dict[str, str]:
-        """Fetch Gamma `/events` and fold it into `{market_id: event_id}`."""
+        """Fetch Gamma `/events` and fold it into `{market_id: event_id}`.
+
+        KEYED BY `conditionId`, because that is what `_market_id` returns
+        and therefore the only key the caller will ever look up with.
+        Gamma's nested markets carry BOTH ids: a numeric surrogate under
+        `id` (`"239826"`) and the condition id under `conditionId`
+        (`"0x064d33..."`). This previously preferred `id`, so the mapping
+        and the lookup lived in different key spaces and the join could
+        never hit — measured 0 of 1,918 live markets tagged, with the
+        `or nested_market.get("conditionId")` fallback dead code because
+        `id` is always present.
+        """
         events = await self._fetch_events()
         mapping: dict[str, str] = {}
         for event in events:
@@ -825,9 +921,9 @@ class PolymarketAdapter(BaseAdapter):
             for nested_market in nested:
                 if not isinstance(nested_market, dict):
                     continue
-                nested_id = nested_market.get("id") or nested_market.get("conditionId")
-                if nested_id is not None:
-                    mapping[str(nested_id)] = str(event_id_raw)
+                condition_id = nested_market.get("conditionId")
+                if condition_id is not None:
+                    mapping[str(condition_id)] = str(event_id_raw)
         return mapping
 
     async def _fetch_clob_markets_by_condition_id(self) -> dict[str, dict[str, Any]]:
