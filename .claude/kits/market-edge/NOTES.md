@@ -7133,3 +7133,45 @@ fixtures encode the assumption. **The only thing that catches this class is runn
 venue and counting how many real rows reach the strategy.**
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Polymarket complement arbitrage: arbitraged to the tick
+
+Kalshi's complement is impossible by construction (previous entry). Polymarket's is NOT — YES and NO
+are separate CLOB tokens with INDEPENDENT order books, so `yes_ask + no_ask < 1` is genuinely
+available in principle: buy both, redeem the pair for $1.00 however it settles.
+
+Measured on real books — 500 fetches across the 250 most liquid markets, both sides each:
+**0 of 136 priced markets have `yes_ask + no_ask < 1`.** The tightest sit at exactly **1.0010**, one
+tick above parity, on markets quoting hundreds of thousands of contracts deep. Polymarket's
+complement is arbitraged to the minimum price increment. (114 of the 250 had no ask on one side and
+could not be priced at all.)
+
+**The probe found a defect worth more than the measurement.** All 500 fetches failed on the first
+run, because `PolymarketAdapter.get_book` resolved its `outcome` with a bare dict lookup while
+`KalshiAdapter.get_book` documents the same argument as case-INSENSITIVE — and Gamma spells its
+outcomes `"Yes"`/`"No"` in title case. One canonical argument, a book from one venue and a raise from
+the other. `normalize_outcome` states the hazard in its own docstring ("every strategy in this kit
+hardcodes uppercase") and T21d already recorded this exact `"Yes"`-vs-`"YES"` split as a money bug.
+
+What makes it dangerous is the failure mode: `VenuePayloadError` is a `VenueError`, so it lives
+inside `scanner.VENUE_READ_FAULTS` — the caller gets a `debug` log and a missing book, never an
+error, and downstream that reads as "no opportunity here". Kalshi books keep arriving while
+Polymarket's quietly stop. **The scanner is not affected today** (it iterates `market.outcomes`, so
+each venue gets its own spelling), which is exactly why it is pinned rather than merely noted: the
+trap is armed for the next caller, and nothing in 988 tests noticed.
+
+**Running tally of accessible arbitrage, all measured live:**
+
+| structure | equivalence risk | result |
+|---|---|---|
+| Cross-venue linked pairs | high (the hard problem) | ~14 genuine pairs, 0.1-1.1c over 26 months |
+| Kalshi YES+NO | none | impossible by construction (`no_ask = 1 - yes_bid`, 14,028/14,028) |
+| Polymarket YES+NO | none | 0 of 136; tightest is 1.0010, one tick |
+| Polymarket exclusive bundles | none (given `enableNegRisk`) | 1 of 32 at +0.0040 on a $5 basket |
+
+Every structure this system can reach is efficient at the sizes it can trade. That is now four
+independent measurements agreeing, not one.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
