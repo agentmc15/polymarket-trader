@@ -94,6 +94,7 @@ live response before trusting them for sizing.
 import asyncio
 import json
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
@@ -141,6 +142,10 @@ _OrderAckStatus = Literal["open", "filled", "partially_filled", "cancelled", "re
 #: Items per Gamma `/markets` page. Gamma caps a page at 100 regardless of
 #: a larger `limit`, and DEFAULTS TO 20 when none is sent — which is what
 #: `list_markets` was getting.
+#: `FeeSchedule.source` for a rate the venue published on the market
+#: itself, which outranks the hand-maintained category table.
+_FEE_SOURCE_VENUE = "venue_schedule"
+
 _GAMMA_PAGE_LIMIT = 100
 
 #: Pages `_fetch_gamma_markets` will walk. Gamma REFUSES an offset past
@@ -663,7 +668,12 @@ class PolymarketAdapter(BaseAdapter):
         )
         category = gamma_item.get("category")
         category_str = str(category) if category is not None else None
-        fee = category_fee_schedule(category_str)
+        # The venue's OWN published rate first; the hand-maintained
+        # category table is the fallback for markets that do not carry
+        # one this model can honor.
+        fee = _published_fee_schedule(gamma_item) or category_fee_schedule(
+            category_str
+        )
         tick_size = 0.01
         min_size = 0.0
         if clob_item is not None:
@@ -679,8 +689,12 @@ class PolymarketAdapter(BaseAdapter):
                 market_id=market_id,
                 label="minimum order size",
             )
+            # CLOB's `taker_base_fee` is a legacy field reading 0 on
+            # every live market while the venue charges 3-7% through
+            # `feeSchedule`, so it must never override a rate the venue
+            # published.
             taker_bps = clob_item.get("taker_base_fee")
-            if taker_bps is not None:
+            if taker_bps is not None and fee.source != _FEE_SOURCE_VENUE:
                 maker_bps = clob_item.get("maker_base_fee")
                 fee = FeeSchedule(
                     taker_rate=_fee_rate_from_bps(taker_bps, field="taker_base_fee"),
@@ -1257,6 +1271,63 @@ def _resolve_outcome_token(
         f"outcomes are {sorted(outcome_ids)}",
         raw=dict(outcome_ids),
     )
+
+
+def _published_fee_schedule(gamma_item: dict[str, Any]) -> FeeSchedule | None:
+    """Build a `FeeSchedule` from the rate Polymarket itself publishes.
+
+    Every Gamma market carries `feesEnabled`, and most carry a
+    `feeSchedule` object — `{"exponent": 1, "rate": 0.04, "takerOnly":
+    true, "rebateRate": 0.25}`. That `rate` is the venue's own per-market
+    answer, and it outranks any table maintained by hand here: the
+    category table must guess from a `category` string that is often
+    absent, which is why every one of 1,918 live markets fell through to
+    its 0.05 unknown-category fallback while the venue was publishing
+    0.03, 0.04, 0.05 and 0.07 — 82% of them wrong, and the 361 crypto
+    markets wrong in the understating direction.
+
+    REFUSES rather than guesses. `PolymarketFeeModel` computes
+    `rate * p * (1 - p)`, i.e. exponent 1; a schedule declaring any other
+    exponent describes a different curve, and applying its rate under
+    this formula would be a confident wrong number. Same for a missing,
+    non-numeric or out-of-range rate. In every such case this returns
+    `None` and the caller keeps the table's answer AND the table's
+    provenance.
+
+    `takerOnly` is not consulted because the model already hard-codes the
+    stronger claim that Polymarket makers pay nothing, and every one of
+    the 1,776 published schedules agrees. `rebateRate` is deliberately
+    NOT modelled: a rebate paid to makers would change which venue is
+    worth quoting on, and inventing its mechanics would be inventing
+    revenue.
+
+    Args:
+        gamma_item: One raw Gamma market payload.
+
+    Returns:
+        FeeSchedule | None: The venue's schedule with
+            `source="venue_schedule"`, or `None` when the payload does
+            not carry one this model can honor.
+    """
+    enabled = gamma_item.get("feesEnabled")
+    if enabled is False:
+        # An explicit "no fees here" is an answer, not an absence.
+        return FeeSchedule(taker_rate=0.0, maker_rate=0.0,
+                           source=_FEE_SOURCE_VENUE)
+    schedule = gamma_item.get("feeSchedule")
+    if not isinstance(schedule, dict):
+        return None
+    exponent = schedule.get("exponent")
+    if exponent is not None and exponent != 1:
+        return None
+    rate = schedule.get("rate")
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+        return None
+    rate = float(rate)
+    if not (math.isfinite(rate) and 0.0 <= rate <= 1.0):
+        return None
+    return FeeSchedule(taker_rate=rate, maker_rate=0.0,
+                       source=_FEE_SOURCE_VENUE)
 
 
 def _market_id(item: dict[str, Any]) -> str | None:
