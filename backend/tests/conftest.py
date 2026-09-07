@@ -14,6 +14,15 @@ hold for the entire session and never overwrite an already-`paper` value.
 """
 import os
 
+# BEFORE any `app.*` import: `Settings` reads the repo-root `.env`, so a
+# developer's real credentials would otherwise load into every test
+# process -- making tests depend on the machine they run on, and putting
+# live keys one careless print away from a log (GUARDRAILS.md §1.3).
+# Empty string means "no env file at all"; see `app.config._ENV_FILES`.
+os.environ.setdefault("POLYMARKET_TRADER_ENV_FILE", "")
+
+import os
+
 os.environ.setdefault("TRADING_MODE", "paper")
 
 from collections.abc import AsyncGenerator  # noqa: E402

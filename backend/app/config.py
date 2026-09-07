@@ -1,5 +1,7 @@
 """Application configuration using Pydantic Settings."""
+import os
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import Field, SecretStr, field_validator
@@ -68,6 +70,35 @@ KALSHI_DEMO_BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
 _PAPER_LEDGER_VENUES = frozenset({"polymarket", "kalshi"})
 
 
+#: Repo root, resolved from this file rather than from the cwd:
+#: `backend/app/config.py` -> parents[2]. Used to anchor `.env` so the
+#: working directory cannot decide whether configuration loads.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Which `.env` files `Settings` reads, overridable by
+#: `POLYMARKET_TRADER_ENV_FILE`:
+#:
+#:   unset  -> the repo-root `.env`, then a cwd-relative one (normal use)
+#:   ""     -> NO env file at all
+#:   path   -> exactly that file
+#:
+#: The empty-string case exists for the TEST SUITE, and it is a
+#: correctness requirement rather than a convenience. `tests/conftest.py`
+#: sets it before `app.config` is imported, because once `.env` is
+#: anchored to the repo root a developer's real credentials load into
+#: every test process — which broke three tests asserting defaults the
+#: moment a real `.env` appeared, and would have put live keys one
+#: careless `print` away from a test log (GUARDRAILS.md §1.3). Tests must
+#: describe the code, not the machine they run on.
+_ENV_FILE_OVERRIDE = os.environ.get("POLYMARKET_TRADER_ENV_FILE")
+if _ENV_FILE_OVERRIDE == "":
+    _ENV_FILES: tuple[str | Path, ...] = ()
+elif _ENV_FILE_OVERRIDE:
+    _ENV_FILES = (_ENV_FILE_OVERRIDE,)
+else:
+    _ENV_FILES = (_REPO_ROOT / ".env", ".env")
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables.
 
@@ -102,7 +133,19 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # BOTH the repo-root `.env` and a cwd-relative one, repo-root first
+        # so a cwd-local file still wins if someone deliberately keeps one.
+        #
+        # A bare `".env"` resolves against the CURRENT WORKING DIRECTORY,
+        # and every documented command in this repo runs from `backend/`
+        # (`cd backend && python3 -m pytest`, `... -m app.scripts.preflight`)
+        # while `.env` lives at the repo root next to `docker-compose.yml`,
+        # which is where `.env.example` and the compose `env_file:` both
+        # point. So the documented local workflow loaded NO `.env` at all:
+        # credentials sat in the file and preflight reported them MISSING,
+        # with nothing saying why. Docker was unaffected, which is what
+        # kept it hidden -- compose passes the file explicitly.
+        env_file=_ENV_FILES,
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",

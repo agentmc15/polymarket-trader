@@ -15,6 +15,8 @@ exactly that with the field name would have exercised PAPER mode while
 believing it had proved the LIVE branch -- and would have passed. These
 tests exist so that regression cannot come back unnoticed.
 """
+import os
+
 import pytest
 
 from app.config import KALSHI_DEMO_BASE_URL, Settings
@@ -81,3 +83,25 @@ def test_the_kalshi_private_key_is_a_secret() -> None:
 
     assert "pretend-pem-material" not in repr(settings)
     assert settings.kalshi_private_key_pem.get_secret_value() == "pretend-pem-material"
+
+
+def test_the_test_process_reads_no_env_file() -> None:
+    """Tests must describe the code, not the machine they run on.
+
+    `Settings` anchors `.env` to the REPO ROOT so the documented
+    workflow (`cd backend && ...`) actually loads configuration. The
+    side effect is that a developer's real `.env` would otherwise load
+    into every test process: it broke three tests asserting defaults the
+    moment a real one appeared, and it puts live credentials one
+    careless `print` away from a test log (GUARDRAILS.md §1.3).
+
+    `tests/conftest.py` sets `POLYMARKET_TRADER_ENV_FILE=""` before any
+    `app.*` import. This asserts that guard is still in place, so
+    deleting it fails here with the reason rather than showing up later
+    as tests that pass or fail depending on whose laptop they run on.
+    """
+    assert os.environ.get("POLYMARKET_TRADER_ENV_FILE") == "", (
+        "conftest.py must disable .env loading for tests; without it this "
+        "process inherits the developer's real credentials"
+    )
+    assert Settings().kalshi_api_key_id == ""
