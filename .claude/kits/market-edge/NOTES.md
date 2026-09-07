@@ -7438,3 +7438,59 @@ than a measurement deserves the same treatment: `redemption_gas_usd`, `transfer_
 had no equivalent confirmation.
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Checking the other venue's fees, and finding the market-making thesis was on the wrong one
+
+Applying the Kalshi maker-fee lesson to Polymarket. Both findings came from data already being
+fetched and thrown away.
+
+**1. 82% of Polymarket markets carried the wrong fee.** The adapter assigned **0.05 to all 1,918**
+open markets, because the category table must guess from a `category` string that is frequently
+absent — so every market fell through to the unknown-category fallback rather than landing on a
+category rate at all. Meanwhile the venue publishes the answer per-market in the Gamma payload:
+
+| venue rate | markets | we used | direction |
+|---|---|---|---|
+| 0.04 politics | 954 | 0.05 | overstated |
+| 0.07 crypto | 361 | 0.05 | **UNDERSTATED** |
+| 0.03 sports | 267 | 0.05 | overstated |
+| 0.05 | 194 | 0.05 | correct |
+| `feesEnabled: false` | 142 | 0.05 | charged where the venue does not |
+
+Fixed by reading `feeSchedule.rate`, which now matches the venue on all 1,918 with **0 disagreements**.
+It REFUSES rather than guesses: `PolymarketFeeModel` computes `rate x p x (1-p)`, so a schedule
+declaring any exponent other than 1 describes a different curve and falls back to the table. CLOB's
+`taker_base_fee` no longer overrides a published rate — it reads 0 on every live market while the
+venue charges 3-7%, so honouring it would reinstate exactly the zero-fee error.
+
+**2. `takerOnly: true` on all 1,776 published schedules** confirms the standing "Polymarket makers pay
+nothing" assumption. Unlike Kalshi's, that one was right.
+
+**3. THE FINDING THAT MATTERS: Polymarket PAYS makers, Kalshi CHARGES them.** Polymarket's Maker
+Rebates Program redistributes 15-25% of taker fees to makers daily (crypto 20%, sports 15%,
+politics/finance/tech 25%), published per-market as `feeSchedule.rebateRate`. Per contract at p=0.50:
+
+| | per contract |
+|---|---|
+| Kalshi maker | **−0.00438** (a cost) |
+| Polymarket politics maker | **+0.00250** (a payment) |
+| swing | **+0.00688** |
+
+**That swing is larger than the entire realised half-spread measured for passive quoting on Kalshi**
+(+0.0051 optimistic, −0.0095 pessimistic). On these numbers **which venue to quote on outweighs how to
+quote — and the whole market-making calibration was done on the venue that charges.** There is also a
+separate Liquidity Rewards Program paying for resting orders near the midpoint *even when unfilled*,
+which is not modelled at all.
+
+The rebate is carried on `FeeSchedule.maker_rebate_rate` but **deliberately not credited by `fee()`**:
+it is a daily programme payout under terms the venue can change, not a per-fill discount, and
+crediting it in the fee model would let projected revenue leak into every cost calculation here as
+though it were banked. That is how a fee correction becomes a fee fiction.
+
+**Running score on "constants that were never checked": 3 for 3 wrong.** Kalshi maker rate (0 -> 1.75%),
+Polymarket per-market rate (82% wrong), Polymarket rebate (unmodelled revenue). Still unverified:
+`redemption_gas_usd`, `transfer_cost_usd`, `transfer_latency_hours`.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
