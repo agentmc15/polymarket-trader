@@ -160,6 +160,14 @@ _MARKETS_PAGE_LIMIT = 200
 #: repeated cursor, so this only bounds the pathological case.
 _MAX_MARKET_PAGES = 50
 
+#: Events per `/events` page, and pages walked. 200 x 10 is ~20,000
+#: nested markets in ~8s, of which roughly 60% carry a live bid. The
+#: scanner keeps only the top `scan_top_n` by 24h volume, so a deeper
+#: walk buys a better-ranked pool with diminishing returns and linear
+#: time; 10 pages is far more than `scan_top_n` (200) can consume.
+_EVENTS_PAGE_LIMIT = 200
+_MAX_EVENT_PAGES = 10
+
 #: Extra attempts after a 429 before giving up on one request.
 _RATE_LIMIT_RETRIES = 2
 
@@ -513,22 +521,10 @@ class KalshiAdapter(BaseAdapter):
         if status is not None:
             base_params["status"] = _STATUS_QUERY_VALUE[status]
 
-        payloads: list[dict[str, Any]] = []
-        cursor = ""
-        seen_cursors: set[str] = set()
-        for _ in range(_MAX_MARKET_PAGES):
-            params = dict(base_params)
-            if cursor:
-                params["cursor"] = cursor
-            body = await self._get("/markets", params=params)
-            page = _require_envelope_list(
-                body, ("markets",), context="kalshi /markets"
-            )
-            payloads.extend(page)
-            cursor = str(body.get("cursor") or "")
-            if not cursor or not page or cursor in seen_cursors:
-                break
-            seen_cursors.add(cursor)
+        if status == "open":
+            payloads = await self._fetch_open_event_markets()
+        else:
+            payloads = await self._fetch_flat_markets(base_params)
 
         # Same contract as the Polymarket adapter: ONE unbuildable market
         # must not blank the venue. A single market that `VenueMarket`'s
@@ -587,6 +583,80 @@ class KalshiAdapter(BaseAdapter):
                 f"kalshi /markets/{market_id} carried no market object", raw=body
             )
         return self._build_market(raw)
+
+    async def _fetch_flat_markets(
+        self, base_params: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        """Page `GET /markets` by cursor. Used for every status but open."""
+        payloads: list[dict[str, Any]] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        for _ in range(_MAX_MARKET_PAGES):
+            params = dict(base_params)
+            if cursor:
+                params["cursor"] = cursor
+            body = await self._get("/markets", params=params)
+            page = _require_envelope_list(
+                body, ("markets",), context="kalshi /markets"
+            )
+            payloads.extend(page)
+            cursor = str(body.get("cursor") or "")
+            if not cursor or not page or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+        return payloads
+
+    async def _fetch_open_event_markets(self) -> list[dict[str, Any]]:
+        """Open markets via `GET /events`, which is where the LIQUID ones are.
+
+        `GET /markets` returns an unordered global listing dominated by
+        synthetic `KXMVECROSSCATEGORY` multi-leg markets. Measured against
+        the live API with credentials: of 10,000 markets fetched — the
+        pagination cap — **2 carried a live bid**. Real series were
+        quoting the whole time (`KXFEDDECISION` 58 of 65, `KXNFLGAME` 32
+        of 100) but sit below the cap, so the scanner never reached a
+        single tradeable Kalshi market and cross-venue arbitrage could
+        not fire.
+
+        `GET /events?status=open&with_nested_markets=true` is the same
+        data selected usefully: 1024 nested markets, 892 with a live bid
+        — 87% against 0.02%. The nested payloads carry every field
+        `_build_market` reads; the only fields they omit are the
+        MVE-specific ones belonging to the markets we do not want.
+
+        This is a DIFFERENT SELECTION, not a superset: an open market
+        whose event is not itself open would appear in the flat listing
+        and not here. That trade is made deliberately — the flat listing
+        is truncated at its cap anyway, so it was never complete either,
+        and it was complete-looking while being 99.98% unusable.
+
+        Returns:
+            list[dict[str, Any]]: Raw nested market payloads.
+        """
+        payloads: list[dict[str, Any]] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        for _ in range(_MAX_EVENT_PAGES):
+            params = {
+                "limit": str(_EVENTS_PAGE_LIMIT),
+                "status": "open",
+                "with_nested_markets": "true",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            body = await self._get("/events", params=params)
+            events = _require_envelope_list(
+                body, ("events",), context="kalshi /events"
+            )
+            for event in events:
+                nested = event.get("markets")
+                if isinstance(nested, list):
+                    payloads.extend(m for m in nested if isinstance(m, dict))
+            cursor = str(body.get("cursor") or "")
+            if not cursor or not events or cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+        return payloads
 
     def _build_market(self, raw: dict[str, Any]) -> VenueMarket:
         """Normalize one Kalshi market payload into a `VenueMarket`.
