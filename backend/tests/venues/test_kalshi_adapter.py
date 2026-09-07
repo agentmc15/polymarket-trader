@@ -528,15 +528,24 @@ async def test_active_fee_waiver_wins_over_settings_rates() -> None:
 async def test_expired_fee_waiver_falls_back_to_settings_rates() -> None:
     """ALPHA's waiver expired in 2020 -> the `Settings` rates apply.
 
-    A waiver that ended is not a waiver. `KALSHI_TAKER_FEE_RATE`
-    defaults to 0.07 (PLAN.md §3).
+    A waiver that ended is not a waiver. Asserted against `Settings`
+    itself rather than against literals: this test is about the waiver
+    falling back, and duplicating the rates here made it fail for an
+    unrelated reason when the maker rate was corrected from a wrong 0.0
+    to Kalshi's actual 1.75%. The rates themselves are pinned once, in
+    `tests/test_fee_rates.py`.
     """
-    markets = await make_adapter().list_markets()
+    settings_obj = make_settings()
+    markets = await make_adapter(settings_obj=settings_obj).list_markets()
     by_id = {m.market_id: m for m in markets}
 
     assert by_id[ALPHA].fee.source == "settings"
-    assert by_id[ALPHA].fee.taker_rate == pytest.approx(0.07)
-    assert by_id[ALPHA].fee.maker_rate == pytest.approx(0.0)
+    assert by_id[ALPHA].fee.taker_rate == pytest.approx(
+        settings_obj.kalshi_taker_fee_rate
+    )
+    assert by_id[ALPHA].fee.maker_rate == pytest.approx(
+        settings_obj.kalshi_maker_fee_rate
+    )
 
 
 @pytest.mark.asyncio

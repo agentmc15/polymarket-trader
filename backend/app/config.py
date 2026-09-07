@@ -311,7 +311,29 @@ class Settings(BaseSettings):
         default=0.10, alias="KALSHI_MIN_REQUEST_INTERVAL_S"
     )
     kalshi_taker_fee_rate: float = Field(default=0.07, alias="KALSHI_TAKER_FEE_RATE")
-    kalshi_maker_fee_rate: float = Field(default=0.0, alias="KALSHI_MAKER_FEE_RATE")
+
+    #: MAKERS PAY ON KALSHI. This defaulted to 0.0, which was wrong, and
+    #: it was wrong in the single most expensive direction available: the
+    #: entire market-making thesis in this kit was built on the premise
+    #: that a resting quote collects the spread with no fee drag.
+    #:
+    #: Confirmed 2026-09-06 against Kalshi's own help centre, which states
+    #: it plainly -- "Maker fees are charged for orders placed that are
+    #: not immediately matched and are instead left as resting orders on
+    #: the orderbook" -- and against the published fee schedule, which
+    #: puts the maker rate at 1.75% x p x (1-p), exactly a QUARTER of the
+    #: 7% taker rate. Fees are charged only when the resting order
+    #: actually executes; cancelling one is free.
+    #:
+    #: The API publishes NO fee data at all: no fee field on any market
+    #: payload (checked across 400 live markets) and no fee endpoint, so
+    #: this cannot be sourced at runtime and a wrong constant here is
+    #: silent. Both rates are per-market overridable by the venue for
+    #: special events (elections, championships), which this single
+    #: default cannot express -- treat it as the standard-market rate.
+    kalshi_maker_fee_rate: float = Field(
+        default=0.0175, alias="KALSHI_MAKER_FEE_RATE"
+    )
     polymarket_taker_fee_overrides: dict[str, float] = Field(
         default_factory=dict, alias="POLYMARKET_TAKER_FEE_OVERRIDES"
     )

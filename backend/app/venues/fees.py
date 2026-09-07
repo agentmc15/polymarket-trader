@@ -288,8 +288,14 @@ def _ceil_decimal(value: float, places: int) -> float:
 class KalshiFeeModel(FeeModel):
     """Kalshi's retail fee formula, rounded per fill (PLAN.md §3).
 
-    NOT re-confirmed on 2026-09-04; 0.07 is Kalshi's historically
-    published standard taker rate.
+    Rates re-confirmed 2026-09-06 against Kalshi's help centre and its
+    published fee schedule: 7% taker, 1.75% maker (a quarter of taker).
+    MAKERS PAY — this repo previously carried a 0.0 maker default, which
+    is the costliest direction to be wrong in, because a maker rate of
+    zero makes passive quoting look free. Neither rate is available from
+    the API (no fee field on any market payload, no fee endpoint), so
+    both are constants that can only go stale silently; both are
+    per-market overridable by the venue for special events.
 
     Formula: `model_fee = size_contracts * rate * price * (1 - price)`,
     then `trade_fee = ceil_6dp(model_fee)` — the fee is rounded UP to
