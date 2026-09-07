@@ -7278,3 +7278,62 @@ thesis, where it is collected instead.
 Reproducible: `python3 -m app.scripts.calibration --sample 5000 --horizons 24 168 --cache <path>`.
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Thesis 2: market making. The edge is real, tiny, and only exists as a portfolio
+
+Taking loses to the spread in every measurement here. This is the other side: Kalshi charges takers
+**7%** and makers **0%**, so a resting quote collects the spread with no fee drag. (That maker rate
+comes from `Settings` and is load-bearing for the entire thesis — **re-confirm it against the venue
+before trading**.)
+
+**Nothing could evaluate it.** `SimulatedFillEngine` is a taker engine — it walks a book and crosses
+it. Built `app/execution/passive_fill.py` as the counterpart, plus `app/strategies/market_making.py`
+for the policy.
+
+**THE QUEUE IS INVISIBLE TO HISTORY, and that gap is the result.** A trade tape says a trade printed;
+it never says whether YOUR order filled. So `PassiveFillEngine` takes an explicit `FillModel` and
+stamps it on every fill. Measured on 34,137 hourly candles across 537 settled markets:
+
+| fill model | fills | quoted half | realized half | adverse selection |
+|---|---|---|---|---|
+| front of queue (`optimistic`) | 7,857 | +0.0182 | **+0.0051** | 72% |
+| behind the queue (`pessimistic`) | 3,046 | +0.0236 | **−0.0095** | 140% |
+
+Adverse selection eats 72-140% of the quoted spread. **Quoting indiscriminately is a coin flip on
+execution quality.** By spread bucket, only the widest pays under BOTH models (>=0.25: +0.1152 /
++0.0735; <=0.02: +0.0000 / −0.0156) — tight books are a losing opportunity, not a smaller one.
+
+**Inventory drift is measured, not assumed.** Sell fills outnumber buy fills **1.5-2.0x in every
+price bucket**, including 0.30-0.70 where a floor at zero cannot explain it. Takers are net buyers of
+YES; a two-sided quoter drifts short by construction.
+
+**THE BACKTEST LIED UNTIL IT SETTLED ITS INVENTORY.** Marking open positions, all four configurations
+were significantly profitable. Settling them at the venue's actual result — **160 of 537 markets
+carried a position into resolution, 65 short into YES** — moved every confidence interval to span
+zero. Carrying inventory into a binary settlement is not a tail risk; it is a coin flip on the whole
+position. Comparing terminal policies: `taper` best (+0.4107), `hold` middle (+0.2786), `flatten`
+worst (−0.1066 — crossing the spread costs more than the settlement risk it avoids). None significant.
+
+**THE ACTUAL ANSWER IS A SAMPLE-SIZE STATEMENT, and it has a number.** Per market the edge is
++$0.15 to +$0.26 on 10-contract quotes against a standard deviation of **$3.45-$5.46** — a Sharpe of
+**~0.05 per market**. Resampling portfolios:
+
+| markets quoted | 5th percentile | P(profit) |
+|---|---|---|
+| 500 | −0.1381 | 86.6% |
+| 1,000 | −0.0320 | 93.2% |
+| **2,500** | **+0.0807** | **99.2%** |
+| 10,000 | +0.1715 | 100.0% |
+
+**~2,500 simultaneous markets** is where the edge becomes reliable. Kalshi has 97,487 open markets, so
+that is 2.6% of the venue — achievable, and only reachable at all because the discovery truncation
+above was fixed. This assumes markets are independent, which correlated events (one game, one race)
+violate, so read 2,500 as a floor.
+
+**Market making is a portfolio business here, not a per-market bet.** That is a real, positive answer
+— the first the kit has produced — and it is far more demanding operationally than anything built so
+far: thousands of live quotes, continuous revision, and inventory managed across all of them.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
