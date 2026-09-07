@@ -160,13 +160,31 @@ _MARKETS_PAGE_LIMIT = 200
 #: repeated cursor, so this only bounds the pathological case.
 _MAX_MARKET_PAGES = 50
 
-#: Events per `/events` page, and pages walked. 200 x 10 is ~20,000
-#: nested markets in ~8s, of which roughly 60% carry a live bid. The
-#: scanner keeps only the top `scan_top_n` by 24h volume, so a deeper
-#: walk buys a better-ranked pool with diminishing returns and linear
-#: time; 10 pages is far more than `scan_top_n` (200) can consume.
+#: Events per `/events` page, and pages walked.
+#:
+#: MEASURED LIVE: the listing exhausts after 57 pages at 99,253 open
+#: markets in 10.1s. The cap was 10, so the adapter saw 14,028 — 14% of
+#: the venue — and the truncation was not random. Kalshi returns its
+#: NEAR-DATED markets in the tail: 5,106 close within 24 hours, 16,143
+#: within 7 days, 37,554 within 30 days, and exactly 27 of those 37,554
+#: fell inside ten pages. 27,063 of them carry a live bid, so this was
+#: not a tail of dead contracts.
+#:
+#: The previous reasoning — "10 pages is far more than `scan_top_n` (200)
+#: can consume" — holds only if the listing arrives ordered by the thing
+#: being selected on. It does not. Truncating an unsorted listing yields
+#: an arbitrary 14% of the venue, not the top 200 by volume; and
+#: `scan_near_resolution` selects on CLOSE TIME, so the one beat whose
+#: whole purpose is "events culminating soon" was reading the slice that
+#: systematically excluded them and reporting the empty result as a fact
+#: about the market.
+#:
+#: The cap remains because an endpoint handing back a fresh cursor
+#: forever must not spin this coroutine, but it is set with real headroom
+#: over the observed 57 — and reaching it now logs, because a silently
+#: short listing is indistinguishable from a small venue.
 _EVENTS_PAGE_LIMIT = 200
-_MAX_EVENT_PAGES = 10
+_MAX_EVENT_PAGES = 150
 
 #: Extra attempts after a 429 before giving up on one request.
 _RATE_LIMIT_RETRIES = 2
@@ -636,7 +654,7 @@ class KalshiAdapter(BaseAdapter):
         payloads: list[dict[str, Any]] = []
         cursor = ""
         seen_cursors: set[str] = set()
-        for _ in range(_MAX_EVENT_PAGES):
+        for _page in range(_MAX_EVENT_PAGES):
             params = {
                 "limit": str(_EVENTS_PAGE_LIMIT),
                 "status": "open",
@@ -654,8 +672,21 @@ class KalshiAdapter(BaseAdapter):
                     payloads.extend(m for m in nested if isinstance(m, dict))
             cursor = str(body.get("cursor") or "")
             if not cursor or not events or cursor in seen_cursors:
-                break
+                return payloads
             seen_cursors.add(cursor)
+        logger.warning(
+            "kalshi",
+            extra={
+                "event": "kalshi_event_page_cap_reached",
+                "pages": _MAX_EVENT_PAGES,
+                "markets": len(payloads),
+                "detail": (
+                    "event listing truncated at the page cap; Kalshi returns "
+                    "its near-dated markets last, so the missing tail is the "
+                    "part scan_near_resolution needs most"
+                ),
+            },
+        )
         return payloads
 
     def _build_market(self, raw: dict[str, Any]) -> VenueMarket:
