@@ -539,10 +539,18 @@ class KalshiAdapter(BaseAdapter):
         if status is not None:
             base_params["status"] = _STATUS_QUERY_VALUE[status]
 
-        if status == "open":
-            payloads = await self._fetch_open_event_markets()
-        else:
+        # EVERY status goes through the event listing, not just "open".
+        # The flat `/markets` listing is dominated by synthetic
+        # `KXMVECROSSCATEGORY` shards in every status, not merely the open
+        # one: `status="resolved"` returned 10,000 markets of which 10,000
+        # were shards with zero volume. Only the open branch had been
+        # moved, so the settled listing — the one historical dataset
+        # either venue exposes, and the only way to ask whether prices are
+        # calibrated — was 100% unusable and looked like a venue limit.
+        if status is None:
             payloads = await self._fetch_flat_markets(base_params)
+        else:
+            payloads = await self._fetch_event_markets(_STATUS_QUERY_VALUE[status])
 
         # Same contract as the Polymarket adapter: ONE unbuildable market
         # must not blank the venue. A single market that `VenueMarket`'s
@@ -651,13 +659,28 @@ class KalshiAdapter(BaseAdapter):
         Returns:
             list[dict[str, Any]]: Raw nested market payloads.
         """
+        return await self._fetch_event_markets("open")
+
+    async def _fetch_event_markets(self, status: str) -> list[dict[str, Any]]:
+        """Walk `GET /events` for one venue status word.
+
+        `status` is Kalshi's OWN vocabulary (`"open"`, `"closed"`,
+        `"settled"`), already translated by `_STATUS_QUERY_VALUE` — this
+        method does not know the normalized names.
+
+        Args:
+            status: The venue's status word to filter events by.
+
+        Returns:
+            list[dict[str, Any]]: Raw nested market payloads.
+        """
         payloads: list[dict[str, Any]] = []
         cursor = ""
         seen_cursors: set[str] = set()
         for _page in range(_MAX_EVENT_PAGES):
             params = {
                 "limit": str(_EVENTS_PAGE_LIMIT),
-                "status": "open",
+                "status": status,
                 "with_nested_markets": "true",
             }
             if cursor:

@@ -128,9 +128,11 @@ def make_transport(
 ) -> httpx.MockTransport:
     """Route Kalshi requests to fixture data, paginating `/markets`.
 
-    `/markets` serves `page_size` markets at a time and hands back a
-    `cursor` until the list is exhausted, so `list_markets` exercises
-    real cursor pagination rather than a single page.
+    `/markets` and `/events` each serve `page_size` markets at a time and
+    hand back a `cursor` until the list is exhausted, so `list_markets`
+    exercises real cursor pagination rather than a single page. Both are
+    routed because `list_markets` discovers through `/events` whenever a
+    status is given and falls back to `/markets` only when none is.
 
     Args:
         markets: Market payloads for `/markets`. Defaults to the fixture.
@@ -157,6 +159,24 @@ def make_transport(
         path = request.url.path.removeprefix(DEMO_PATH_PREFIX)
         if request.method == "POST" and path in (V2_ORDERS_PATH, LEGACY_ORDERS_PATH):
             return httpx.Response(201, json=order_ack)
+        if path == "/events":
+            # `list_markets` discovers through the EVENT listing for every
+            # status now, not only "open" — the flat listing is dominated
+            # by synthetic MVE shards in every status. Serving the same
+            # fixtures here keeps this factory covering the endpoint the
+            # adapter actually calls, so a status test cannot silently
+            # escape to the network.
+            start = int(request.url.params.get("cursor") or 0)
+            page = markets[start : start + page_size]
+            nxt = start + page_size
+            cursor = str(nxt) if nxt < len(markets) else ""
+            return httpx.Response(
+                200,
+                json={
+                    "events": [{"event_ticker": "EV1", "markets": page}],
+                    "cursor": cursor,
+                },
+            )
         if path == "/markets":
             start = int(request.url.params.get("cursor") or 0)
             page = markets[start : start + page_size]
