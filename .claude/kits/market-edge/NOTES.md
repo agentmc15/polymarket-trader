@@ -6970,3 +6970,52 @@ a product decision about what the scanner looks at, so it is recorded here rathe
 unilaterally.
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Cross-venue arbitrage, measured end to end for the first time
+
+With Kalshi credentials and the events-based discovery in place, the whole chain ran on live data:
+list markets on both venues -> propose links -> human-verify -> approve -> scan -> price the pairs.
+
+**The matching pass, first run on real data.** 14,028 Kalshi + 1,918 Polymarket markets -> 1,080
+proposals in 45s. All landed `proposed`; none auto-approved.
+
+**Matcher precision, measured by reading both venues' question text for the top 20 structurally
+cleanest candidates (unambiguous 1:1, close times agreeing): 12 right, 6 wrong, 2 doubtful.** The
+correct ones are exact equivalences ("Will X be the Democratic Presidential nominee in 2028?" vs
+"Will X win the 2028 Democratic presidential nomination?"). The wrong ones are instructive: an Iowa
+caucus market matched to a nomination market, a nomination matched to winning the election, and two
+absurd pairings — a TV series release matched to a headset release, a coach's departure matched to an
+AI safety bill. All shared a date token and shallow title overlap.
+
+**That is why the human gate is load-bearing, and the matcher is honest about it.** Its evidence blob
+carries `close_score` separately from `title_jaccard`, so the three `KXDEFAULT` markets for 2027,
+2028 and 2029 that all matched one Polymarket market scored `title_jaccard: 1.0` and
+`close_score: 0.0` — identical text, a year apart, correctly refused a high confidence. Confidence
+alone is the wrong approval criterion; the evidence fields are the useful signal.
+
+**A structural defect this exposed.** Selection is top-N by volume, per venue, independent. So a
+linked pair is scannable only when BOTH sides survive their own cut — and they did not: all 12
+Polymarket sides ranked 4-1301, every Kalshi side 1705-4476, so at `scan_top_n=400` zero pairs were
+fetched together and `links_skew_measured` was 0. `cross_venue_arbitrage` was built, tested, supplied
+with correct links, and unreachable. Fixed: an approved link's markets join the scan set regardless
+of rank (12 Kalshi + 4 Polymarket added, all 12 pairs then measured).
+
+**THE ECONOMIC RESULT. Across all 12 verified pairs there is no cross-venue arbitrage, gross of
+fees.** Best available spread was **+0.0000**; every other pair was negative. Kalshi's bid-ask is
+what kills it — 0.04/0.26 on the Ukraine election against Polymarket's 0.05/0.07, a 22-cent spread
+you would have to cross. Kamala -0.0200, Rubio -0.0180, Ukraine -0.0300. Add the 7% Kalshi taker fee
+and it is worse still.
+
+So the answer to "does this make money" on today's data is **no, and for a good reason**: the pairs
+that are genuinely the same event are priced consistently, and the ones that look mispriced are
+illiquid enough that the spread exceeds the difference. The scanner found nothing because there is
+nothing — which is the system working, not failing.
+
+**One number worth carrying: `max_link_pair_skew_s` was 31s** (mean 19s) between the two venues' book
+fetches. If an edge did exist at these sizes, a 19-31 second skew is a large fraction of its life.
+T35 built the concurrent fetch to bound exactly this; the bound is much looser once linked markets
+sit far apart in the fetch order.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
