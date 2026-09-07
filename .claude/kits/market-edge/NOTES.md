@@ -7019,3 +7019,64 @@ T35 built the concurrent fetch to bound exactly this; the bound is much looser o
 sit far apart in the fetch order.
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Liquidity-first matching, and a correction to the previous entry
+
+The entry above concluded "no cross-venue arbitrage exists" from 12 pairs picked by matcher
+CONFIDENCE. Confidence ranking surfaces long-shot political markets, whose books are 20c wide, so
+that conclusion was drawn from the least tradeable corner of the venue. Re-measured properly:
+
+**Kalshi is not a wide-spread venue.** Of 14,028 open markets, 780 quote <=1c, 1,164 quote <=2c, and
+6,170 have two-sided books with >=100 contracts a side. The 22c spreads in the previous entry are
+real but unrepresentative. The generalization in that entry was wrong; its 12 specific measurements
+were not.
+
+**A cheaper way to see liquidity.** Kalshi's `/events` listing carries `yes_bid_dollars`,
+`yes_ask_dollars` AND `yes_bid_size_fp`/`yes_ask_size_fp` — top-of-book price and depth, for every
+market, in one 2s call. Venue-wide liquidity is measurable without fetching a single order book.
+Field names carry `_dollars`/`_fp` suffixes; reading them as `yes_bid`/`volume` silently yields
+`None` for all 14,028, which is what the first pass of this measurement did.
+
+**Matching the LIQUID subsets** (Kalshi spread <=3c with >=100 contracts a side: 832 markets;
+Polymarket spread <=3c with >=$1000 liquidity: 1,200) gives 111 proposals in 1.2s, of which 79 show
+a positive gross edge. Reading all 79: **none is a real arbitrage.** They divide into three classes,
+and the first two are now handled in code.
+
+1. **Close-time mismatch (8 pairs) — FIXED, as a veto.** `close_score` is a 0.20-weight
+   contribution, not a veto, so identical wording clears the 0.5 floor with `close_score` at 0.0.
+   "Will Benny Gantz be the next Prime Minister of Israel?" exists on both venues with identical
+   titles, close times eighteen years apart, scoring 0.68. The deltas were strictly bimodal — 103
+   same-day and all genuine, 8 at 366+ days and all different events, nothing in between — so this
+   earned the `THRESHOLD_MISMATCH_CAP` treatment. The three largest apparent edges that survived
+   every other filter were all here: a **2028** Louisiana Senate race priced against the **2026** one
+   (+0.0300), "default by Dec 31 2027" against "default by 2027" (+0.0210), and Gantz. Those are the
+   ones that would have cost money.
+
+   This corrects the previous entry's claim that the matcher "correctly refused a high confidence" on
+   the KXDEFAULT year-apart trio. 0.68 is not a refusal — it is a proposal.
+
+2. **Scope asymmetry and wrong subject (61 pairs) — REPORTED, not vetoed.** A conjunction matched to
+   one of its parts ("Youngkin **and** Rubio ticket" vs "Rubio nomination"), or a different person
+   sharing a template ("Jon Ossoff" vs "Jon Stewart"). Both reduce to a named subject in exactly one
+   question. Note the direction: the narrow event is systematically cheaper, so these fake a
+   **positive** spread — with tight books they look like money, where the previous pass's wide
+   spreads hid them behind negative numbers. Deliberately evidence and not a veto: venues abbreviate
+   ("Benjamin Netanyahu" vs "Netanyahu"), the signal does not separate cleanly the way close time
+   does, and suppressing a real edge is the costlier error.
+
+3. **Nomination vs election (the residual ~15) — left to the human gate.** "Will X be the Democratic
+   nominee?" against "Will X win the Presidential Election?" — same subject, same close date, one
+   event strictly inside the other. No structural signal distinguishes it; it needs the rules text,
+   which is what the reviewer is for.
+
+**THE ECONOMIC RESULT STANDS, on much firmer ground.** The genuinely-equivalent pairs are the ~14
+"nominee"/"nomination" pairs, all closing 2028-11-07, with gross edges of **0.1c to 1.1c over 26
+months** — under 1% annualized before fees, on markets quoting 1c wide. Two venues price the same
+event correctly; the apparent edges are all artifacts. Different corner of the venue, same answer,
+and now for a reason that survives scrutiny.
+
+**Net effect on the reviewer's queue: 14,028 x 1,918 markets -> 103 proposals -> 29 worth reading.**
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
