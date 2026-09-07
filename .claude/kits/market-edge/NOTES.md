@@ -7227,3 +7227,54 @@ with results** — a real dataset for a calibration / favorite-longshot study �
 Polymarket returns **0**, which is likely the same class of filter defect as the `/events` one.
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Thesis 1 tested: prices are calibrated, and the bias is smaller than the spread
+
+The favorite-longshot bias is the classic prediction-market inefficiency, and this kit already ships
+two strategies built for it (`favorite_compounder`, `no_bias_exploit`) that had never been validated
+against data. Kalshi exposes settled markets with outcomes, so it is testable. Tested.
+
+**Getting the data required fixing the study's own foundation.** `list_markets(status="resolved")`
+returned 10,000 markets of which **10,000 were `KXMVECROSSCATEGORY` synthetic shards** — zero volume,
+created and settled seconds apart, enough of them to fill the pagination cap on their own. Only the
+`status == "open"` branch had been moved to `/events`; every other status still used the flat listing
+that the open branch was moved AWAY from. Routing all statuses through the event walk gives
+**427,332 resolved markets, 0% shards, 145,742 with real volume across 1,745 series**.
+
+**Three methodological traps, each of which produces a confident wrong answer:**
+
+1. **The settlement price is posterior.** `last_price_dollars` is recorded AT settlement — measured,
+   **516 of 566** settled markets carried it within 5c of the outcome. Bucketing on it yields a
+   perfect calibration curve that means nothing. Prices here come from the candlestick history at a
+   fixed horizon BEFORE close.
+2. **The mid is not tradeable.** Mean quoted spread on the sample is **0.1616** against calibration
+   deviations of 3-9 cents. Pricing at the mid is the difference between a thesis and an artifact, so
+   P&L executes at the touch: buy the ask, sell the bid.
+3. **Outcomes inside an event are correlated.** Candidates in a race, props on one game. Intervals
+   are a cluster bootstrap over whole events, not over markets.
+
+A first pass caught trap 1 but not 2, and produced an apparent favorite edge with realized = 1.0000
+across every bucket above 0.90 — 0 losses where ~8 were expected, p ~ 0.0003. That was the signal to
+distrust it, not to report it.
+
+**RESULT, on 2,853 observations across 1,522 events and 749 series: Kalshi is broadly calibrated, and
+NOT ONE bucket has a P&L interval above zero** — in either direction, at either horizon (24h and 7d),
+split by spread, by volume, or by series. The two largest deviations (0.35-0.50 overpriced by 0.067,
+0.50-0.65 underpriced by 0.058) are ADJACENT AND OPPOSITE, which is a boundary artifact rather than a
+bias; neither survived the horizon change.
+
+**The apparent underpricing of favorites is the fee floor, not an inefficiency.** The 0.95-1.00
+bucket settles yes 98.7% of the time and still loses money: Kalshi's fee ceils to a whole cent per
+fill, so buying at 0.99 to collect 1.00 cannot pay. The market stops at 0.99 for exactly that reason.
+
+**The most useful number is the shape of the losses: monotone in the spread** — widest third -0.2580,
+middle -0.0032, tightest -0.0217 per contract. That is the signature of paying the spread to a
+market that is right. Everything this system has measured now says the same thing from a fifth angle:
+**the spread is the product, and we have been paying it.** Which is the argument for the market-making
+thesis, where it is collected instead.
+
+Reproducible: `python3 -m app.scripts.calibration --sample 5000 --horizons 24 168 --cache <path>`.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
