@@ -693,6 +693,48 @@ NOT_CHECKED: tuple[str, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class VenueCheck:
+    """One venue's PUBLIC reachability probe.
+
+    Reachability only. No credential is sent and no order endpoint is
+    touched, so a clean result says the venue answered, never that your
+    key works -- `NOT_CHECKED` keeps saying so even when this runs.
+
+    Attributes:
+        label: Venue name for the report line.
+        url: The endpoint probed, for a legible failure.
+        reachable: Whether the probe got a usable answer.
+        detail: Extra fact worth printing (e.g. exchange open/closed).
+        error: Failure text when `reachable` is False.
+    """
+
+    label: str
+    url: str
+    reachable: bool
+    detail: str | None = None
+    error: str | None = None
+
+
+def _venue_group(venue_checks: Sequence[VenueCheck]) -> CheckGroup:
+    """Render the opt-in venue reachability probes."""
+    checks: list[Check] = []
+    for vc in venue_checks:
+        if vc.reachable:
+            suffix = f" -- {vc.detail}" if vc.detail else ""
+            checks.append(Check("pass", f"{vc.label}: reachable at {vc.url}{suffix}"))
+        else:
+            checks.append(
+                Check(
+                    "fail",
+                    f"{vc.label}: UNREACHABLE at {vc.url} -- {vc.error}. Market data "
+                    "cannot be read from this venue, so it will contribute nothing "
+                    "to a scan.",
+                )
+            )
+    return CheckGroup("Venue reachability (public endpoints, no credentials sent)", checks)
+
+
 def build_report(
     settings_obj: Settings,
     *,
@@ -700,6 +742,7 @@ def build_report(
     broker_checks: Sequence[BrokerCheck],
     expected_head_revision: str | None,
     env: Mapping[str, str],
+    venue_checks: Sequence[VenueCheck] | None = None,
 ) -> PreflightReport:
     """Assemble the full report from already-resolved inputs.
 
@@ -733,7 +776,21 @@ def build_report(
         _broker_group(broker_checks),
         _inert_settings_group(settings_obj, env),
     ]
-    return PreflightReport(groups=groups, not_checked=list(NOT_CHECKED))
+    not_checked = list(NOT_CHECKED)
+    if venue_checks is not None:
+        groups.append(_venue_group(venue_checks))
+        # Reachability WAS checked, so that line would now be false. The
+        # credential-validity line stays: a public probe sends no key.
+        not_checked = [
+            item for item in not_checked if not item.startswith("Venue connectivity")
+        ]
+        not_checked.insert(
+            0,
+            "Venue AUTHENTICATION -- the probe above is a public endpoint and sends "
+            "no credential, so a reachable venue still says nothing about whether "
+            "your API key is accepted.",
+        )
+    return PreflightReport(groups=groups, not_checked=not_checked)
 
 
 # ---------------------------------------------------------------------------
@@ -835,12 +892,90 @@ def _expected_head_revision() -> str:
     return heads[0]
 
 
+
+def default_check_venues(settings_obj: Settings, timeout_s: float = 8.0) -> list[VenueCheck]:
+    """Probe both venues' PUBLIC endpoints. Not used by tests.
+
+    Opt-in only (`--check-venues`), because the default report promises it
+    contacts no venue and that promise is worth keeping literally.
+
+    Both probes are unauthenticated GETs against read-only status/listing
+    endpoints. No credential is sent, nothing is written, and no order
+    endpoint is touched — so this answers "can I reach the venue", never
+    "is my key accepted".
+
+    Kalshi's `/exchange/status` also reports whether the exchange is OPEN,
+    which is worth surfacing: a reachable venue with a closed exchange
+    produces empty books, and an empty book is indistinguishable from a
+    quiet market unless something says so.
+    """
+    import httpx
+
+    checks: list[VenueCheck] = []
+
+    kalshi_url = f"{settings_obj.kalshi_api_base_url}/exchange/status"
+    try:
+        response = httpx.get(kalshi_url, timeout=timeout_s)
+        response.raise_for_status()
+        body = response.json()
+        active = body.get("exchange_active")
+        trading = body.get("trading_active")
+        checks.append(
+            VenueCheck(
+                label=f"Kalshi ({settings_obj.kalshi_env})",
+                url=kalshi_url,
+                reachable=True,
+                detail=f"exchange_active={active}, trading_active={trading}",
+            )
+        )
+    except Exception as exc:
+        checks.append(
+            VenueCheck(
+                label=f"Kalshi ({settings_obj.kalshi_env})",
+                url=kalshi_url,
+                reachable=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
+
+    gamma_url = f"{settings_obj.gamma_api_url}/markets"
+    try:
+        response = httpx.get(gamma_url, params={"limit": 1}, timeout=timeout_s)
+        response.raise_for_status()
+        payload = response.json()
+        items = payload.get("data", payload) if isinstance(payload, dict) else payload
+        checks.append(
+            VenueCheck(
+                label="Polymarket (Gamma)",
+                url=gamma_url,
+                reachable=True,
+                detail=f"listing returned {len(items)} market(s)",
+            )
+        )
+    except Exception as exc:
+        checks.append(
+            VenueCheck(
+                label="Polymarket (Gamma)",
+                url=gamma_url,
+                reachable=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
+    return checks
+
+
 def main() -> int:
     """Real CLI entry point: checks the process-wide `Settings`.
+
+    `--check-venues` additionally probes both venues' PUBLIC endpoints.
+    It is opt-in so the default run keeps its promise of contacting no
+    venue at all, and even with it the report still says authentication
+    was not checked — the probe sends no credential.
 
     Returns:
         int: The process exit code (`PreflightReport.exit_code`).
     """
+    check_venues = "--check-venues" in sys.argv[1:]
     try:
         settings_obj = get_settings()
     except Exception as exc:
@@ -874,6 +1009,7 @@ def main() -> int:
         broker_checks=broker_checks,
         expected_head_revision=expected_head,
         env=os.environ,
+        venue_checks=default_check_venues(settings_obj) if check_venues else None,
     )
     print(report.render())
     return report.exit_code

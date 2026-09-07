@@ -22,6 +22,7 @@ from app.scripts.preflight import (
     DatabaseCheck,
     PreflightReport,
     Status,
+    VenueCheck,
     _redact_url,
     build_report,
 )
@@ -499,3 +500,64 @@ def test_redact_url_masks_a_password_containing_url_punctuation() -> None:
 
     assert redacted == "postgresql+asyncpg://u:***@localhost:5432/db"
     assert "aB3+xY9=zQ.w-1" not in redacted
+
+
+# ---------------------------------------------------------------------------
+# Opt-in venue reachability (--check-venues).
+# ---------------------------------------------------------------------------
+#
+# The default report promises it contacts no venue, and that promise is
+# worth keeping literally -- so the probe is opt-in and the default path
+# must stay unchanged. Even when it runs it sends NO credential, so
+# "reachable" must never be allowed to read as "my API key works".
+
+
+def test_by_default_no_venue_is_contacted_and_the_report_says_so(tmp_path: Path) -> None:
+    report = _report(Settings(KILL_SWITCH_PATH=str(tmp_path / "TRADING_KILL_SWITCH")))
+
+    assert not any("Venue reachability" in g.name for g in report.groups)
+    assert any(item.startswith("Venue connectivity") for item in report.not_checked)
+
+
+def test_a_reachable_venue_never_claims_authentication_was_checked(
+    tmp_path: Path,
+) -> None:
+    cfg = Settings(KILL_SWITCH_PATH=str(tmp_path / "TRADING_KILL_SWITCH"))
+
+    report = build_report(
+        cfg,
+        db_check=_OK_DB,
+        broker_checks=_OK_BROKER,
+        expected_head_revision="007",
+        env={},
+        venue_checks=[
+            VenueCheck(label="Kalshi (prod)", url="https://x/exchange/status",
+                       reachable=True, detail="exchange_active=True"),
+        ],
+    )
+
+    assert any("Venue reachability" in g.name for g in report.groups)
+    # The now-false blanket claim is gone; the narrower true one replaces it.
+    assert not any(item.startswith("Venue connectivity") for item in report.not_checked)
+    assert any(item.startswith("Venue AUTHENTICATION") for item in report.not_checked)
+    assert report.status != "fail"
+
+
+def test_an_unreachable_venue_fails_and_says_what_it_costs(tmp_path: Path) -> None:
+    cfg = Settings(KILL_SWITCH_PATH=str(tmp_path / "TRADING_KILL_SWITCH"))
+
+    report = build_report(
+        cfg,
+        db_check=_OK_DB,
+        broker_checks=_OK_BROKER,
+        expected_head_revision="007",
+        env={},
+        venue_checks=[
+            VenueCheck(label="Kalshi (prod)", url="https://x/exchange/status",
+                       reachable=False, error="ConnectError: nope"),
+        ],
+    )
+
+    assert report.status == "fail"
+    fails = [c.message for g in report.groups for c in g.checks if c.status == "fail"]
+    assert any("UNREACHABLE" in m and "contribute nothing to a scan" in m for m in fails)

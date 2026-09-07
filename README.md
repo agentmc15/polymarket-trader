@@ -148,6 +148,15 @@ cd backend
 python3 -m app.scripts.preflight
 ```
 
+`--check-venues` additionally probes both venues' **public** endpoints (Kalshi
+`/exchange/status`, Polymarket Gamma `/markets`) and reports whether the exchange is open. It is
+opt-in so the default run keeps its promise of contacting no venue, and even with it the report still
+says authentication was not checked — the probe sends no credential.
+
+```bash
+python3 -m app.scripts.preflight --check-venues
+```
+
 Exit code is non-zero only on a real **FAIL** (something that would not work); a **WARN** means "this
 works, but the configuration probably doesn't mean what it says" and never blocks the exit code — see
 `app/scripts/preflight.py`'s module docstring for why conflating the two is exactly the mistake to
@@ -197,6 +206,37 @@ value. `backend/tests/test_preflight.py` has a dedicated test asserting a recogn
 never appears anywhere in rendered output.
 
 ---
+
+### Kalshi credentials
+
+Kalshi API keys are created in your Kalshi account settings; you get a **Key ID** and download an
+**RSA private key** (shown once). Put them in `.env` yourself — `.gitignore` already covers it, and
+nothing in this repo ever prints a credential value.
+
+```dotenv
+KALSHI_API_KEY_ID=<your key id>
+KALSHI_ENV=prod                    # your kalshi.com account is production
+TRADING_MODE=paper                 # keep this; see Money safety below
+
+# The PEM MUST keep real newlines. Wrap it in double quotes:
+KALSHI_PRIVATE_KEY_PEM="-----BEGIN PRIVATE KEY-----
+MIIEvg...
+-----END PRIVATE KEY-----"
+```
+
+Three traps, all verified rather than guessed:
+
+1. **An unquoted multi-line PEM does not parse.** Double-quoted multi-line works, and so does a
+   single line with `\n` escapes inside double quotes (dotenv expands them). Unquoted fails.
+2. **`KALSHI_ENV` defaults to `demo`**, which is a *different site with its own account and its own
+   synthetic markets*. A kalshi.com key will not authenticate against it, and cross-venue arbitrage
+   computed against demo prices is meaningless. Set `prod`.
+3. **`KALSHI_ENV=prod` does not enable live trading.** It selects which data you read;
+   `TRADING_MODE` independently gates whether orders are real. With `prod` + `paper`, constructing a
+   live adapter is still refused by the fence (`LiveTradingDisabled`).
+
+Verify with `python3 -m app.scripts.preflight --check-venues`, which reports credential *presence and
+shape* only — never a value.
 
 ## Money safety
 
