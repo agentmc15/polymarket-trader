@@ -1016,14 +1016,7 @@ class PolymarketAdapter(BaseAdapter):
                 "cannot be addressed",
                 raw=dict(market.raw),
             )
-        try:
-            token_id = market.outcome_ids[outcome]
-        except KeyError:
-            raise VenuePayloadError(
-                f"unknown outcome {outcome!r} for market {market_id!r}; known "
-                f"outcomes are {sorted(market.outcome_ids)}",
-                raw=dict(market.outcome_ids),
-            ) from None
+        token_id = _resolve_outcome_token(market.outcome_ids, outcome, market_id)
         response = await self._clob_client.get("/book", params={"token_id": token_id})
         response.raise_for_status()
         # A non-JSON body is the VENUE's fault, not a caller's — but
@@ -1205,6 +1198,65 @@ class PolymarketAdapter(BaseAdapter):
 # Module-level parsing helpers (shared by the adapter and, for book
 # parsing, exercised directly by tests).
 # ---------------------------------------------------------------------------
+
+
+def _resolve_outcome_token(
+    outcome_ids: Mapping[str, str], outcome: str, market_id: str
+) -> str:
+    """Resolve an outcome name to its CLOB token id.
+
+    EXACT MATCH FIRST, then a case- and whitespace-insensitive fallback.
+    That ordering is the whole design: a venue's own spelling always
+    addresses exactly the token the venue paired with it, and folding is
+    only ever a way to accept a caller who spelled the BINARY pair the
+    way the rest of this kit spells it.
+
+    Why the fallback exists at all. `KalshiAdapter.get_book` documents
+    its `outcome` as case-INSENSITIVE, while this one resolved with a
+    bare dict lookup — and Gamma spells its outcomes `"Yes"`/`"No"` in
+    title case. So `get_book(mid, "YES")` fetched a book from one venue
+    and raised on the other, for the canonical spelling that
+    `app.strategies.base.normalize_outcome` says "every strategy in this
+    kit hardcodes". Worse, it raised `VenuePayloadError`, which is inside
+    `scanner.VENUE_READ_FAULTS` — so the caller got no error at all, just
+    a `debug` log and a missing book that reads downstream as "no
+    opportunity here". T21d recorded this same `"Yes"`-vs-`"YES"` split
+    between resolving an outcome and keying on one as a money bug.
+
+    Ambiguity is NOT resolved by guessing: two outcomes that differ only
+    in case are a venue's business, and a fold that could mean either
+    raises rather than picking one.
+
+    Args:
+        outcome_ids: The market's outcome -> token id mapping.
+        outcome: The requested outcome name, in any casing.
+        market_id: Condition id, for the error message only.
+
+    Returns:
+        str: The CLOB token id addressing that outcome's book.
+
+    Raises:
+        VenuePayloadError: If no outcome matches, or if only case
+            distinguishes two that do.
+    """
+    if outcome in outcome_ids:
+        return outcome_ids[outcome]
+    folded = outcome.strip().casefold()
+    matches = [name for name in outcome_ids if name.strip().casefold() == folded]
+    if len(matches) == 1:
+        return outcome_ids[matches[0]]
+    if len(matches) > 1:
+        raise VenuePayloadError(
+            f"ambiguous outcome {outcome!r} for market {market_id!r}: it "
+            f"case-folds onto {sorted(matches)}, which this adapter will not "
+            "choose between",
+            raw=dict(outcome_ids),
+        )
+    raise VenuePayloadError(
+        f"unknown outcome {outcome!r} for market {market_id!r}; known "
+        f"outcomes are {sorted(outcome_ids)}",
+        raw=dict(outcome_ids),
+    )
 
 
 def _market_id(item: dict[str, Any]) -> str | None:
