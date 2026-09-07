@@ -337,7 +337,13 @@ from app.strategies.cross_venue_arbitrage import CrossVenueArbitrageStrategy
 from app.strategies.settlement_edge import SettlementEdgeStrategy
 from app.utils.time import utcnow
 from app.venues.base import MarketDataAdapter, VenueError
-from app.venues.types import BookLevel, OrderBook, VenueId, VenueMarket
+from app.venues.types import (
+    BookLevel,
+    OrderBook,
+    VenueId,
+    VenueMarket,
+    venue_volume,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -473,22 +479,21 @@ class ScoredIntent:
 
 
 def _volume(market: VenueMarket) -> float:
-    """Return the best available 24h-volume proxy for ranking, or `0.0`.
+    """Return the volume this venue publishes, for top-N ranking.
 
-    See the module docstring's "VOLUME RANKING" section.
+    Delegates to `app.venues.types.venue_volume`. This was a local copy
+    reading `raw["volume"]`, a key Kalshi's `/events` payload does not
+    send — so every one of 96,478 open Kalshi markets ranked 0.0 and the
+    "top N by volume" was a tie across the whole venue. See
+    `venue_volume` for the field list and the reasoning.
 
     Args:
         market: The market to rank.
 
     Returns:
-        float: `market.raw["volume"]` coerced to `float`; `0.0` if the
-            key is absent or not numeric.
+        float: Volume, `>= 0.0`.
     """
-    raw_volume = market.raw.get("volume")
-    try:
-        return float(raw_volume)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0.0
+    return venue_volume(market)
 
 
 def _level_price(level: BookLevel | None) -> float | None:

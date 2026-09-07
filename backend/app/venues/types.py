@@ -510,6 +510,64 @@ class VenueMarket:
         object.__setattr__(self, "raw", MappingProxyType(dict(self.raw)))
 
 
+#: Payload keys carrying a market's traded volume, in the order they are
+#: preferred. 24-hour fields come first because both consumers of
+#: `venue_volume` document their ranking as a 24h-volume proxy; the
+#: lifetime totals are the fallback for markets that do not publish a
+#: recent figure.
+#:
+#: THESE ARE THE LIVE NAMES, not the fixture ones. Reading a bare
+#: `"volume"` returned 0.0 for all 96,478 open Kalshi markets, because
+#: `/events` sends `volume_fp` and `volume_24h_fp` and never a bare
+#: `volume`. That turned "the top N markets by volume" into a tie across
+#: an entire venue — 200 arbitrary markets out of ~96,000 — which is the
+#: same fixture-versus-reality gap that hid `tick_size` behind
+#: `minimum_tick_size`.
+_VOLUME_KEYS: tuple[str, ...] = (
+    "volume_24h_fp",   # kalshi, 24h
+    "volume24hr",      # polymarket, 24h
+    "volume_fp",       # kalshi, lifetime
+    "volume",          # polymarket, lifetime
+    "volumeNum",       # polymarket, lifetime (numeric variant)
+)
+
+
+def venue_volume(market: "VenueMarket") -> float:
+    """Return a market's traded volume for ranking, or `0.0`.
+
+    The single implementation behind `app.services.scanner._volume` and
+    `app.services.data_collector._book_collection_volume`, which were two
+    copies documented as mirroring each other and drifted from the venue
+    together.
+
+    Tries `_VOLUME_KEYS` in order and returns the first that parses to a
+    finite non-negative number. A market that publishes nothing usable
+    ranks 0.0 rather than raising: an unrankable market should sort last,
+    not abort a scan over every other market.
+
+    Args:
+        market: The market to rank.
+
+    Returns:
+        float: Volume, `>= 0.0`.
+    """
+    for key in _VOLUME_KEYS:
+        if key not in market.raw:
+            continue
+        value = market.raw[key]
+        if isinstance(value, bool):
+            continue
+        try:
+            parsed = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            # A negative volume is meaningless and must not sort BELOW a
+            # market with none.
+            return max(parsed, 0.0)
+    return 0.0
+
+
 @dataclass(frozen=True)
 class OrderRequest:
     """A normalized order to place on one venue.

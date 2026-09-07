@@ -27,7 +27,7 @@ from app.models.price_history import PriceHistory
 from app.models.trade_history import TradeHistory, TradeOutcome, TradeSide
 from app.strategies.base import outcome_key
 from app.venues.base import MarketDataAdapter, VenueError
-from app.venues.types import OrderBook, VenueId, VenueMarket
+from app.venues.types import OrderBook, VenueId, VenueMarket, venue_volume
 
 logger = logging.getLogger(__name__)
 
@@ -39,27 +39,21 @@ DATA_API_BASE = "https://data-api.polymarket.com"
 
 
 def _book_collection_volume(market: VenueMarket) -> float:
-    """Return the best available 24h-volume proxy for `collect_books` ranking.
+    """Return the volume this venue publishes, for top-N ranking.
 
-    Mirrors `app.services.scanner._volume` exactly: `VenueMarket` has no
-    normalized `volume_24h` field, but both real venues' raw payloads
-    carry a `"volume"` key (`tests/fixtures/polymarket/gamma_markets.json`,
-    `tests/fixtures/kalshi/markets.json`), so this reads
-    `VenueMarket.raw["volume"]` rather than inventing a second, competing
-    ranking key for the same "top-N markets by volume" purpose.
+    Delegates to `app.venues.types.venue_volume`. This was a local copy
+    reading `raw["volume"]`, a key Kalshi's `/events` payload does not
+    send — so every one of 96,478 open Kalshi markets ranked 0.0 and the
+    "top N by volume" was a tie across the whole venue. See
+    `venue_volume` for the field list and the reasoning.
 
     Args:
         market: The market to rank.
 
     Returns:
-        float: `market.raw["volume"]` coerced to `float`; `0.0` if the
-            key is absent or not numeric.
+        float: Volume, `>= 0.0`.
     """
-    raw_volume = market.raw.get("volume")
-    try:
-        return float(raw_volume)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0.0
+    return venue_volume(market)
 
 
 class GammaAPIClient:
