@@ -7337,3 +7337,59 @@ violate, so read 2,500 as a floor.
 far: thousands of live quotes, continuous revision, and inventory managed across all of them.
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Calibrating the quoting policy, and what it costs in capital
+
+**First, the number that reverses an earlier conclusion.** Per FILL, `min_spread` 0.25 looked better
+than 0.10. Per CAPITAL it is less than half as good, because Kalshi collateralises a resting order at
+full notional and the stricter filter needs ~12,000 markets quoted to reach 2,500 trading ones:
+
+| min_spread | markets quoted for 2,500 trading | capital locked | P&L / 2.6-day window | ROC |
+|---|---|---|---|---|
+| 0.10 | 6,849 | $53,033 | $591 | **1.11% per window** |
+| 0.25 | 12,317 | $85,028 | $366 | 0.43% per window |
+
+Sustained order rate: **2.2-3.8 orders/sec** for continuous requoting — inside Kalshi's ~10/s
+unauthenticated budget, but not by a wide margin, and that is before cancels.
+
+**Calibration method, because a grid search on 537 markets will find a spurious optimum.** Split by
+EVENT (never by market — markets in one event share an outcome, so a market-level split leaks across
+the fold), tune on one half, score on the half never seen. Objective is return on capital.
+
+**`edge_fraction` carries the entire result: 0.50 -> 0.80.**
+
+| edge_fraction | markets traded | mean P&L | ROC |
+|---|---|---|---|
+| 0.50 | 196 | +0.2760 | +0.0137 |
+| 0.70 | 190 | +0.8718 | +0.0474 |
+| **0.80** | 184 | +1.0878 | **+0.0612** |
+| 1.00 | 133 | +0.6395 | +0.0287 |
+
+The optimum is INTERIOR, and both sides explain the mechanism: quoting near the mid fills often and
+hands the spread straight back as adverse selection; quoting AT the touch earns no queue priority and
+simply trades less — 133 markets against 184. Out of sample it was significant under both fill models
+(+1.2500/event, CI [+0.3378, +2.1141] pessimistic), where the old defaults were not.
+
+**`max_inventory` and `skew_strength` are SUBSTITUTES, not complements.** Worst single-market P&L:
+
+| max_inventory | skew 0.0 | skew 1.0 | skew 2.0 |
+|---|---|---|---|
+| 20 | −8.90 | −6.90 | −6.90 |
+| 100 | **−46.25** | −13.25 | −11.60 |
+
+At 100 the skew is the only thing between the book and a −46 market; at 20 the withdrawal already
+does that job. So `max_inventory` drops 100 -> 20, and a test pins the pairing: loosening the limit
+while zeroing the skew re-opens that tail.
+
+**`skew_strength` deliberately STAYS at 1.0, against the grid search**, which wanted 0.0. At
+max_inventory 20 zero earns 1.7x more (+1.0878 vs +0.6514) for a slightly worse tail. That is a risk
+appetite, not a fact, and hourly candles are exactly the wrong instrument for measuring intra-hour
+inventory swings — the backtest understates skew's value by construction. The table is in the
+docstring so an operator running the diversified portfolio can lower it knowingly.
+
+**Validated on 60 independent random halves with a fresh seed:** new defaults beat old on **60 of 60
+draws**, median ROC +0.0339 vs +0.0124, positive on 100% of draws vs 70%.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
