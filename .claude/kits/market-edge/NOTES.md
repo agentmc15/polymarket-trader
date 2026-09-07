@@ -7080,3 +7080,56 @@ and now for a reason that survives scrutiny.
 **Net effect on the reviewer's queue: 14,028 x 1,918 markets -> 103 proposals -> 29 worth reading.**
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Same-venue arbitrage: the one structure with no equivalence risk
+
+Cross-venue arb dies on "are these the same event?". Within one venue that question does not
+exist, so this is where to look next. Two structures, both measured on live data.
+
+**1. Binary complement (YES+NO on one market) is structurally impossible on Kalshi.** `no_ask` equals
+`1 - yes_bid` on **14,028 of 14,028** markets — the listing derives it rather than quoting a real
+resting order, because Kalshi's book holds bids only. So `yes_ask + no_ask = 1 + spread >= 1` by
+construction, and no amount of scanning will ever find one. Confirmed: 0 hits.
+
+**2. Multi-outcome bundles were unreachable, for three stacked defects.** `multi_outcome_bundle_
+arbitrage` needs `>= 3` outcomes on ONE market. Live, **every** market on **both** venues is binary
+(1,918/1,918 and 14,028/14,028), so the strategy cannot fire at all. The multi-outcome structure that
+really exists is the EVENT: N binary candidate markets, at most one resolving YES. That is reachable
+only through `event_id` — which was `None` on 1,918 of 1,918 Polymarket markets.
+
+Three independent defects, each sufficient, found by fixing them in turn:
+  1. **Key space.** The mapping was keyed by Gamma's numeric `id`; callers look up by `conditionId`.
+     Never hit. The `or ... conditionId` fallback was dead code — `id` is always present.
+  2. **Pagination.** `GET /events` was issued bare; Gamma's default page is 20. Same defect already
+     fixed on the sibling `/markets` call, left in place on the endpoint next to it.
+  3. **Disjoint listings.** Fixing both still gave 0/1,918: unfiltered `/events` returns CLOSED
+     events, `list_markets` returns OPEN markets.
+
+All three dissolve by reading the grouping where it already was — Gamma embeds the parent event in
+every `/markets` item. One listing, no key translation, no extra round trip. Now 1,918/1,918.
+
+**THE TRADE, and the trap in it.** For a mutually exclusive set, buying every NO leg pays at least
+`N - 1` whatever happens, so `sum(no_ask) < N - 1` is an arbitrage — and unlike `sum(yes_ask) < 1` it
+needs NO assumption that the listed candidates are exhaustive. But mutual exclusivity is the whole
+foundation, and **half the events do not have it**: of 132 events with >=3 markets, only 68 are
+exclusive. The other 64 are multi-select — "Which states will Donald Trump visit in 2026?", "Who will
+Trump pardon before 2027?" — where many legs resolve YES and the identity collapses. Ignoring that
+produced a spurious **+5.33** on the Trump-states event, the same shape of error as the cross-venue
+scope asymmetry: an assumption about event structure the data does not support. Polymarket publishes
+the flag for it (`enableNegRisk`), and it must gate this trade.
+
+**Result on the 32 fully priced exclusive bundles: one positive, +0.0040 across six legs on a $5
+basket** — 0.08%, before fees, before any depth check, i.e. noise. The rest sit a hair above `N - 1`,
+which is the bid-ask spread. That tight clustering just above fair value is what an efficient market
+looks like.
+
+**Standing methodological note.** Three times now the same failure has appeared: a strategy built,
+tested, and structurally unreachable on live data (`cross_venue_arbitrage` behind top-N selection,
+Kalshi discovery via `/markets`, and now `multi_outcome_bundle_arbitrage` behind a broken `event_id`
+AND an outcome-count assumption no live market meets). Unit tests pass in every case because the
+fixtures encode the assumption. **The only thing that catches this class is running against the
+venue and counting how many real rows reach the strategy.**
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
