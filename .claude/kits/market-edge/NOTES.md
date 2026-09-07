@@ -7393,3 +7393,48 @@ docstring so an operator running the diversified portfolio can lower it knowingl
 draws**, median ROC +0.0339 vs +0.0124, positive on 100% of draws vs 70%.
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### The maker fee was wrong, and it was wrong in the worst possible direction
+
+`kalshi_maker_fee_rate` defaulted to **0.0**. The entire market-making thesis was built on the premise
+that a resting quote collects the spread with no fee drag. It does not.
+
+**Confirmed 2026-09-06.** Kalshi's help centre states it plainly — *"Maker fees are charged for orders
+placed that are not immediately matched and are instead left as resting orders on the orderbook"* —
+and the published fee schedule puts the maker rate at **1.75% x p x (1-p)**, exactly a quarter of the
+7% taker rate. Fees apply only when the resting order executes; cancelling is free.
+
+**The API publishes NO fee data whatsoever.** No fee field on any market payload (checked across 400
+live markets), no fee endpoint; `/exchange/schedule` is trading hours and `/exchange/status` is
+uptime. So neither rate can be sourced at runtime, no automated check can validate them, and a wrong
+constant sits silently underneath every profitability number this repo produces.
+`tests/test_fee_rates.py` now pins both in one place with the date and the source. Both are also
+per-market overridable by the venue for special events, which one default cannot express.
+
+**THE THESIS SURVIVES, SMALLER.** Re-running the calibrated policy over 60 independent random halves:
+
+| configuration | median ROC (fee=0, wrong) | median ROC (fee=1.75%, real) | P(ROC>0) |
+|---|---|---|---|
+| old defaults | +0.0124 | **+0.0066** | 62% |
+| calibrated defaults | +0.0339 | **+0.0293** | 100% |
+| calibrated + skew 0 | +0.0615 | **+0.0564** | 100% |
+
+The fee costs 8-13% of the return and hurts the low-edge configuration proportionally more — which is
+what a fixed cost does. The calibrated defaults still beat the old on 60 of 60 draws.
+
+**A second result, deliberately not acted on.** The whole-cent fee floor makes small quotes dearer per
+contract ($0.0050 at size 10 vs $0.0044 at 50+, p=0.50), which looks like an argument for quoting
+bigger. It is not: sweeping `quote_size` 5 -> 200 moves ROC only +0.0297 -> +0.0310 (4% across a 40x
+size change) while the worst single market scales linearly from -3.47 to -138.71. **Quote size is
+ROC-neutral** — it belongs to capital and risk appetite, not to fee optimisation.
+
+**The lesson worth carrying.** This was the one assumption flagged as load-bearing and unverified, and
+it was wrong. It could not have been caught by any test, any amount of internal consistency, or more
+data — only by reading what the venue publishes. Everything else in this kit that is a constant rather
+than a measurement deserves the same treatment: `redemption_gas_usd`, `transfer_cost_usd`,
+`polymarket_taker_fee_overrides`, and the Polymarket maker rate, which is still assumed zero and has
+had no equivalent confirmation.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
