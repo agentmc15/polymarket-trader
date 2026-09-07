@@ -71,6 +71,7 @@ from app.models.event_link import EventLink
 from app.services.matching.normalize import (
     NormalizedTitle,
     content_tokens,
+    named_entities,
     normalize,
 )
 from app.strategies.base import normalize_outcome
@@ -175,6 +176,18 @@ class LinkEvidence:
             from `threshold_capped` so a reviewer reading
             `GET /links/{id}` sees WHICH disagreement suppressed the
             score, not merely that something did.
+        entities_only_a: Named subjects A's question states and B's does
+            not, sorted. See `entities_only_b`.
+        entities_only_b: The same for B. Reported PER SIDE rather than
+            merged, and deliberately NOT symmetric, because the two
+            arrangements mean different things: subjects on BOTH sides
+            means the questions are about different people ("Jon Ossoff"
+            against "Jon Stewart"), while subjects on ONE side means
+            either an added subject — a conjunction, and so a strictly
+            narrower event that fakes a positive spread — or merely the
+            other venue's shorter rendering of the same name. A reviewer
+            can tell those apart; a scalar cannot, which is why this
+            informs the score by exactly nothing.
     """
 
     title_jaccard: float
@@ -189,6 +202,8 @@ class LinkEvidence:
     distinct_tokens: tuple[str, ...] = ()
     threshold_capped: bool = False
     close_capped: bool = False
+    entities_only_a: tuple[str, ...] = ()
+    entities_only_b: tuple[str, ...] = ()
 
     @property
     def needs_outcome_map(self) -> bool:
@@ -243,6 +258,8 @@ class LinkEvidence:
             "distinct_tokens": list(self.distinct_tokens),
             "threshold_capped": self.threshold_capped,
             "close_capped": self.close_capped,
+            "entities_only_a": list(self.entities_only_a),
+            "entities_only_b": list(self.entities_only_b),
             "needs_outcome_map": self.needs_outcome_map,
         }
 
@@ -400,6 +417,10 @@ def score_pair(a: VenueMarket, b: VenueMarket) -> LinkEvidence:
 
     title_jaccard = jaccard(set_a, set_b)
     close_delta_h = abs((a.close_time - b.close_time).total_seconds()) / 3600.0
+    # Deliberately from the RAW questions, not `norm_a`/`norm_b`:
+    # capitalization is the entire signal and normalization destroys it.
+    entities_a = named_entities(a.question)
+    entities_b = named_entities(b.question)
     threshold_match = compare_thresholds(norm_a.thresholds, norm_b.thresholds)
     source_match = compare_sources(a.resolution_source, b.resolution_source)
 
@@ -436,6 +457,8 @@ def score_pair(a: VenueMarket, b: VenueMarket) -> LinkEvidence:
         distinct_tokens=tuple(sorted(set_a ^ set_b)),
         threshold_capped=capped,
         close_capped=close_capped,
+        entities_only_a=tuple(sorted(entities_a - entities_b)),
+        entities_only_b=tuple(sorted(entities_b - entities_a)),
     )
 
 

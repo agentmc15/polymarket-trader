@@ -86,6 +86,39 @@ _GENERAL_STOPWORDS = frozenset(
 #: The full removal set applied before stemming.
 STOPWORDS = _D9_STOPWORDS | _GENERAL_STOPWORDS
 
+#: Title-case words that are NOT the subject of a question. Capitalization
+#: is the whole signal `named_entities` has, and these words are routinely
+#: capitalized in venue titles while naming no one: sentence-initial
+#: function words, the offices and institutions a contest is fought over,
+#: party labels, and calendar words. Without them "Will the Democratic
+#: Presidential nominee..." would report `Democratic`/`Presidential` as
+#: subjects and every political pair would look asymmetric.
+_ENTITY_STOPWORDS = frozenset(
+    {
+        "will", "the", "a", "an", "who", "what", "which", "when", "where",
+        "why", "how", "by", "in", "on", "before", "after", "at", "for",
+        "and", "or", "be", "is", "are", "was", "were", "do", "does", "did",
+        "us", "usa", "united", "states", "america", "american",
+        "president", "presidential", "presidency", "vice", "election",
+        "elections", "nominee", "nomination", "primary", "caucus",
+        "ticket", "democratic", "democrat", "democrats", "republican",
+        "republicans", "gop", "party", "senate", "senator", "house",
+        "congress", "congressional", "governor", "secretary", "court",
+        "supreme", "federal", "reserve", "fed", "prime", "minister",
+        "parliament", "cabinet", "administration", "government",
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept",
+        "oct", "nov", "dec", "monday", "tuesday", "wednesday", "thursday",
+        "friday", "saturday", "sunday", "q1", "q2", "q3", "q4",
+    }
+)
+
+#: A capitalized word, keeping internal punctuation so `J.B.` arrives here
+#: whole and is stripped to `jb` — venues render the same initials both
+#: ways, and splitting on the dots would make one subject look like two.
+_ENTITY_RE = re.compile(r"\b[A-Z][A-Za-z.'\u2019-]*")
+
 #: Magnitude suffixes recognized on a numeric literal. `%`/`percent` map
 #: to 1.0 (so "above 5%" yields 5.0, matching "above 5 percent"); the
 #: convention only has to be CONSISTENT, since thresholds are compared
@@ -445,6 +478,46 @@ def normalize(title: str) -> NormalizedTitle:
             thresholds stated in the title.
     """
     return _normalize_cached(title)
+
+
+def named_entities(title: str) -> frozenset[str]:
+    """Return the named subjects one market question is about.
+
+    A prediction market's question is about a subject, so the subjects
+    are what decide whether two questions are the same question. Two
+    failure modes measured on live data both reduce to a subject present
+    in exactly one title: a CONJUNCTION that adds one ("Will Glenn
+    Youngkin and Marco Rubio be the 2028 ticket?" against "Will Marco
+    Rubio win the nomination?" — a strictly narrower event, and so
+    systematically cheaper, which fakes a positive spread), and a
+    DIFFERENT subject sharing a template ("Jon Ossoff" against "Jon
+    Stewart", "Mark Cuban" against "Mark Kelly").
+
+    Deterministic and self-contained, like everything else here: no
+    model, no network, no downloaded corpus. Capitalization is the only
+    signal, which is why `_ENTITY_STOPWORDS` has to carry the offices,
+    parties and calendar words venues capitalize without naming anyone.
+
+    The result feeds `LinkEvidence.entities_only_a`/`entities_only_b` as
+    EVIDENCE, never as a veto — see `matcher.score_pair`. Venues
+    abbreviate ("Benjamin Netanyahu" against "Netanyahu"), and silently
+    suppressing a real pair is the costlier error.
+
+    Args:
+        title: Raw venue question text, with its original case — this is
+            the one function here that must NOT be handed a lowercased
+            title. UNTRUSTED input (GUARDRAILS.md §6): tokenized and
+            compared, never executed or interpreted as an instruction.
+
+    Returns:
+        frozenset[str]: Lowercased, punctuation-stripped subject tokens.
+    """
+    found = set()
+    for match in _ENTITY_RE.findall(title or ""):
+        token = re.sub(r"[.'\u2019-]", "", match).lower()
+        if len(token) > 1 and token not in _ENTITY_STOPWORDS:
+            found.add(token)
+    return frozenset(found)
 
 
 def normalize_title(title: str) -> list[str]:
