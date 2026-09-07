@@ -6920,3 +6920,53 @@ Kalshi. Production's unauthenticated listing is no better — 0 of 1000 sampled 
 single most important blocker to answering "does this make money".
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Kalshi credentials wired, and the real blocker turns out not to be access
+
+User supplied a production Kalshi key. Handled without ever reading a value into the transcript
+(GUARDRAILS §1.3): the source file was inspected structurally only — key NAMES, PEM marker counts,
+and long tokens redacted — and `.env` was written by a script that printed shapes, never contents.
+The file also held unrelated secrets (an odds API key, X/Twitter tokens); only the Kalshi pair was
+touched.
+
+**A malformed key id was diagnosed without seeing it.** The first extraction produced a 44-character
+id that failed with HTTP 401. Character-class analysis (23 alpha, 15 digit, 5 dashes, 1 `=`) plus a
+UUID regex located a real UUID at characters 8..44 — i.e. an 8-character label prefix had been
+captured with the value. Trimming to the UUID authenticated immediately. No value was printed at any
+point.
+
+**`Settings` never loaded `.env` in the documented workflow.** `env_file=".env"` resolves against the
+CURRENT WORKING DIRECTORY, and every documented command runs from `backend/` while `.env` lives at
+the repo root (where `.env.example` and compose's `env_file:` both point). So credentials sat in the
+file and preflight reported them MISSING. Docker was unaffected — compose passes the file explicitly
+— which is exactly what kept it hidden. Anchoring `.env` to the repo root then exposed the other
+half: a developer's real credentials load into every TEST process, which broke three tests asserting
+defaults and puts live keys one careless `print` from a log. `POLYMARKET_TRADER_ENV_FILE=""` in
+conftest disables env files for tests, with a test asserting that guard is still there.
+
+**Authenticated results.** `get_balance()` succeeds ($10.00 available). A real LIQUID book parses end
+to end for the first time — `KXFEDDECISION-28JAN-H26`: YES 9 bids/22 asks best 0.09/0.10, NO 22/9
+best 0.90/0.91. That also VALIDATES the bids-only derivation against real data: NO's best bid 0.90
+reflects to YES's best ask 0.10, and YES ask + NO ask = 1.01, correctly showing no arbitrage on an
+efficiently priced market.
+
+**The remaining blocker is SELECTION, not access, and that was worth learning.** Authentication does
+not change the universe `/markets` returns: 9795 of 10000 are `KXMVECROSSCATEGORY` synthetic
+multi-leg markets, and only **2 of 10000 carry a live bid**. Our pagination caps at 10000 (50 pages x
+200) and never reaches the liquid series. Those series exist and are quoting right now —
+`KXFEDDECISION` 58 of 65 with bids, `KXNFLGAME` 32 of 100, `KXCPI` 31 of 59 — but they are buried
+below the cap in the unordered global listing.
+
+Two things ruled out along the way, both worth recording so nobody re-investigates them: the status
+mapping is CORRECT (`"active"` already normalizes to `"open"`, adapter.py:184; the MVE markets are
+`active` too, just illiquid), and the 429 pacing fix works (10000 markets in 5.8s authenticated).
+
+**So cross-venue arbitrage is still unmeasured, for a new and more tractable reason.** Kalshi
+discovery walks an unordered listing dominated by ~10k untradeable markets. The fix is a discovery
+strategy that selects on liquidity or walks `series_ticker`s, rather than paging the global listing —
+a product decision about what the scanner looks at, so it is recorded here rather than made
+unilaterally.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
