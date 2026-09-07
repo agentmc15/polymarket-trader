@@ -7494,3 +7494,43 @@ Polymarket per-market rate (82% wrong), Polymarket rebate (unmodelled revenue). 
 `redemption_gas_usd`, `transfer_cost_usd`, `transfer_latency_hours`.
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### Can the market-making study be re-run on Polymarket? No — and the search found a worse bug
+
+**The question.** Polymarket pays makers where Kalshi charges them, so the calibration should be
+redone on Polymarket. That needs historical bid/ask.
+
+**The answer is no, decisively.** `GET /prices-history` returns only `{t, p}` — a single price per
+timestamp, **no bid, no ask, no volume**. YES and NO histories share **zero common timestamps**, so
+they cannot be paired to derive a spread either. `/trades` returns 401 (needs credentials we do not
+have) and there is no public tape. The Kalshi study was only possible because its candlesticks carry
+`yes_bid`/`yes_ask` OHLC *plus* trade OHLC *plus* volume; Polymarket exposes none of that.
+
+**So a Polymarket market-making backtest can only be run FORWARD.** The infrastructure already
+exists: `BookSnapshot` stores full depth both sides for both venues, `PriceHistory` stores
+`yes_bid`/`yes_ask`/`spread`/`volume`/`open_interest`, and `collect_books` already covers both
+venues. Nothing new is needed but time.
+
+**What the search turned up on the way, which matters more.** `_volume()` — the sort key for
+`scan_top_n` and for `collect_books` — read `raw["volume"]`, a key Kalshi's `/events` payload does
+not send. **It returned 0.0 for all 96,478 open Kalshi markets.** Every scan's "top 200 by volume"
+was a tie across the entire venue: 200 arbitrary markets out of ~96,000, in listing order. The top 5
+it actually selected had volumes of 296, 565, 1,010 and 1,510 while a 118,515-volume market ranked
+identically.
+
+After the fix: 17,236 Kalshi markets rank non-zero, and the top 5 are live sports markets with 3.5M,
+3.4M, 1.2M, 1.0M and 0.86M volume.
+
+**This compounds with the pagination fix rather than being independent of it.** Widening discovery
+from 14,028 to 96,478 markets made an arbitrary top-200 *worse*, not better — the selection step
+meant to concentrate each scan on tradeable markets was diluting it. Every Kalshi economic result
+recorded above was computed on a slice chosen by a broken sort.
+
+**Sixth instance of the same defect shape**, and the third traced to a fixture that agrees with the
+code while the venue does not: `tick_size` vs `minimum_tick_size`, `volume` vs `volume_fp`, the
+`no_ask` derivation. A fixture is evidence about a payload someone once saw, never about the payload
+the adapter reads today.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
