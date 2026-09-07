@@ -7175,3 +7175,55 @@ Every structure this system can reach is efficient at the sizes it can trade. Th
 independent measurements agreeing, not one.
 
 **No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
+
+---
+
+### The venue was 86% invisible, and the missing part was the near-dated part
+
+Asked what data each non-arbitrage thesis could be TESTED on, and the availability probe returned a
+result that invalidates the framing of everything above it.
+
+**Kalshi has 99,253 open markets. The adapter saw 14,028.** `_MAX_EVENT_PAGES = 10` truncated a
+listing that exhausts at 57 pages — 10.1s for the whole thing.
+
+**And the truncation is ordered.** Kalshi returns near-dated markets in the tail:
+
+| horizon | markets | inside the 10-page cap |
+|---|---|---|
+| < 24 hours | 5,106 | 0 |
+| < 7 days | 16,143 | ~6 |
+| < 30 days | 37,554 | **27** |
+
+27,063 of the near-dated markets carry a live bid, so this was not a tail of dead contracts. The
+sub-24-hour markets — crypto prices, hourly index levels, same-day game lines, the most actively
+quoted things on the venue — were absent entirely.
+
+**The bad reasoning was written down in the constant's own comment**: *"10 pages is far more than
+`scan_top_n` (200) can consume"*. That holds only if the listing arrives ordered by the thing being
+selected on. It does not. Truncating an unsorted listing yields an arbitrary 14% of the venue, not
+the top 200 by volume. And `scan_near_resolution` selects on CLOSE TIME, not volume — so the one beat
+whose whole purpose is "events culminating soon", the ranking dimension named first-class at scoping,
+was reading the slice that systematically excluded them and reporting the empty bucket as a fact
+about the market.
+
+After: **97,487 markets in 12s, 11,037 closing inside 7 days (9,492 with a live bid), 5,106 inside 24
+hours** — where there were none.
+
+**This re-scopes the arbitrage findings above.** Every "no opportunity" conclusion about Kalshi was
+computed on the long-dated 14% — which is exactly the illiquid, wide-spread, years-out political
+corner those entries kept running into. The cross-venue result (~14 genuine pairs, all closing
+2028-11-07) is not wrong, but it is a statement about 14% of the venue, and the least tradeable 14%
+at that. **The same-venue results stand** (Kalshi's derived `no_ask` is structural, and the
+Polymarket measurements were never affected by this).
+
+**Fourth instance of the signature defect**, and the first where the flawed reasoning was written
+down and read past several times: a bound chosen against one consumer's needs, silently biasing a
+different consumer's input. `cross_venue_arbitrage` behind top-N selection, Kalshi discovery via
+`/markets`, `multi_outcome_bundle_arbitrage` behind a broken `event_id`, and now the near-resolution
+beat behind a page cap.
+
+**Also found, not yet chased:** `list_markets(status="resolved")` returns **10,000 Kalshi markets
+with results** — a real dataset for a calibration / favorite-longshot study — while the same call on
+Polymarket returns **0**, which is likely the same class of filter defect as the `/events` one.
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
