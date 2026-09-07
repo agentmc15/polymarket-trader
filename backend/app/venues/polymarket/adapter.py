@@ -1326,8 +1326,16 @@ def _published_fee_schedule(gamma_item: dict[str, Any]) -> FeeSchedule | None:
     rate = float(rate)
     if not (math.isfinite(rate) and 0.0 <= rate <= 1.0):
         return None
+    # Carried, never credited — see `FeeSchedule.maker_rebate_rate`.
+    rebate = schedule.get("rebateRate")
+    rebate_rate = 0.0
+    if not isinstance(rebate, bool) and isinstance(rebate, (int, float)):
+        candidate = float(rebate)
+        if math.isfinite(candidate) and 0.0 <= candidate <= 1.0:
+            rebate_rate = candidate
     return FeeSchedule(taker_rate=rate, maker_rate=0.0,
-                       source=_FEE_SOURCE_VENUE)
+                       source=_FEE_SOURCE_VENUE,
+                       maker_rebate_rate=rebate_rate)
 
 
 def _market_id(item: dict[str, Any]) -> str | None:

@@ -170,19 +170,42 @@ class FeeSchedule:
         taker_rate: Fee rate applied to taker fills, >= 0.
         maker_rate: Fee rate applied to maker fills, >= 0.
         source: Where this rate came from, e.g. `"clob_market"`,
-            `"category_table"`, `"fee_waiver"`, `"settings_default"`.
-            Never blank — callers need to know whether a per-market rate
-            overrode the category default.
+            `"category_table"`, `"fee_waiver"`, `"settings_default"`,
+            `"venue_schedule"`. Never blank — callers need to know
+            whether a per-market rate overrode the category default.
+        maker_rebate_rate: Share of the TAKER fee rebated to the maker
+            when a resting order fills, `>= 0` — e.g. `0.25` for 25% of
+            `taker_rate`. Defaults to 0.0, which is every venue that
+            pays no rebate.
+
+            DELIBERATELY NOT APPLIED BY `FeeModel.fee()`. A rebate is a
+            programme payout — Polymarket settles it daily in pUSD,
+            subject to terms the venue can change — not a per-fill
+            discount, and crediting it inside `fee()` would let
+            projected revenue leak into every cost calculation in this
+            repo as though it were already banked. It is carried here so
+            a strategy that wants to reason about it must do so
+            EXPLICITLY, and so the number is not silently dropped on the
+            floor.
+
+            It matters: Kalshi charges makers 1.75% while Polymarket
+            pays 15-25% of its taker fee back, a swing of ~0.0069 per
+            contract at p=0.50 — larger than the entire realised
+            half-spread measured for passive quoting on Kalshi
+            (+0.0051). Which venue to quote on is a bigger decision than
+            how to quote.
     """
 
     taker_rate: float
     maker_rate: float
     source: str
+    maker_rebate_rate: float = 0.0
 
     def __post_init__(self) -> None:
         """Validate fee rates are finite, non-negative, and `source` is set."""
         _check_size(self.taker_rate, field="taker_rate")
         _check_size(self.maker_rate, field="maker_rate")
+        _check_size(self.maker_rebate_rate, field="maker_rebate_rate")
         if not self.source:
             raise ValueError("source must be non-empty")
 

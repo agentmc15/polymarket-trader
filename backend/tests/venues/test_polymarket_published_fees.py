@@ -159,3 +159,65 @@ async def test_an_unusable_schedule_falls_back_rather_than_guessing(schedule) ->
 
     assert fee.taker_rate == pytest.approx(0.07)
     assert fee.source == "category_table"
+
+
+# -- the maker rebate -------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rebate", [0.15, 0.20, 0.25])
+async def test_the_maker_rebate_is_captured_from_the_payload(rebate: float) -> None:
+    """Polymarket PAYS makers where Kalshi charges them.
+
+    A swing of ~0.0069 per contract at p=0.50, which is larger than the
+    entire realised half-spread measured for passive quoting on Kalshi
+    (+0.0051). Dropping this number on the floor would hide the fact
+    that which venue to quote on outweighs how to quote.
+    """
+    fee = await _fee(_market(
+        feesEnabled=True,
+        feeSchedule={"exponent": 1, "rate": 0.04, "takerOnly": True,
+                     "rebateRate": rebate},
+    ))
+
+    assert fee.maker_rebate_rate == pytest.approx(rebate)
+
+
+@pytest.mark.asyncio
+async def test_the_rebate_is_never_credited_as_a_negative_fee() -> None:
+    """It is a daily programme payout, not a per-fill discount.
+
+    Crediting it inside `fee()` would let projected revenue leak into
+    every cost calculation in this repo as though it were banked — so
+    `maker_rate` stays 0.0 and the model keeps returning a cost of zero,
+    never a gain.
+    """
+    from app.venues.fees import PolymarketFeeModel
+
+    fee = await _fee(_market(
+        feesEnabled=True,
+        feeSchedule={"exponent": 1, "rate": 0.07, "takerOnly": True,
+                     "rebateRate": 0.25},
+    ))
+
+    assert fee.maker_rate == 0.0
+    assert PolymarketFeeModel().fee(0.5, 100.0, "maker", fee) == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rebate", [None, "0.25", -0.1, 1.5, True])
+async def test_an_unusable_rebate_is_zero_not_guessed(rebate) -> None:
+    fee = await _fee(_market(
+        feesEnabled=True,
+        feeSchedule={"exponent": 1, "rate": 0.04, "rebateRate": rebate},
+    ))
+
+    assert fee.maker_rebate_rate == 0.0
+
+
+def test_a_schedule_with_no_rebate_defaults_to_zero() -> None:
+    """Every venue that pays nothing, which is the default case."""
+    from app.venues.types import FeeSchedule
+
+    assert FeeSchedule(taker_rate=0.07, maker_rate=0.0,
+                       source="settings").maker_rebate_rate == 0.0
