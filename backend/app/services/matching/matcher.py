@@ -35,7 +35,23 @@ is NOT disagreement, and scoring it 0.0 would systematically suppress
 legitimate pairs for the sin of one venue being terse. It scores 0.5:
 halfway, contributing nothing either way.
 
-THE ONE VETO. A numeric-threshold DISAGREEMENT (`threshold_match is
+TWO VETOES. Both cap the weighted sum from above, both sit below the
+default `min_confidence`, and both only ever LOWER a score — they can
+suppress a proposal, never promote one, which is the safe direction for
+R1.
+
+THE SECOND VETO: a close-time gap beyond `CLOSE_MISMATCH_HOURS` caps the
+result at `CLOSE_MISMATCH_CAP`. `close_score` alone cannot do this job,
+because it is a 0.20-weight CONTRIBUTION rather than a veto: two markets
+with identical wording bank 0.55 from `title_jaccard` plus 0.125 from two
+unknown tri-states, clearing the 0.5 floor with `close_score` at exactly
+0.0. That is not hypothetical — "Will Benny Gantz be the next Prime
+Minister of Israel?" exists on both venues with IDENTICAL titles and
+close times eighteen years apart, and scored 0.68. A date is the other
+dimension on which the same sentence names a different event, so it gets
+the same treatment as a threshold.
+
+THE FIRST VETO. A numeric-threshold DISAGREEMENT (`threshold_match is
 False`: both titles state thresholds and they share no value) caps the
 result at `THRESHOLD_MISMATCH_CAP`, below the default
 `min_confidence`, so such a pair is never even proposed. "BTC above 100k"
@@ -80,6 +96,25 @@ UNKNOWN_SCORE = 0.5
 #: Ceiling applied when two titles state thresholds that disagree. Below
 #: `propose_links`' default `min_confidence` of 0.5 on purpose.
 THRESHOLD_MISMATCH_CAP = 0.45
+
+#: Ceiling applied when two markets close more than
+#: `CLOSE_MISMATCH_HOURS` apart. Same value and same purpose as
+#: `THRESHOLD_MISMATCH_CAP`: below `propose_links`' default
+#: `min_confidence` of 0.5, so such a pair is never proposed.
+CLOSE_MISMATCH_CAP = 0.45
+
+#: Close-time gap beyond which the two markets are treated as naming
+#: DIFFERENT events, whatever their wording. 30 days.
+#:
+#: Measured, not guessed: matching both venues' liquid subsets produced
+#: 111 proposals whose close deltas were strictly bimodal — 103 closed
+#: the same day and were genuine, 8 were 366+ days apart and were all
+#: different events, and NOTHING fell in between. The constant sits far
+#: below that observed gap on purpose. Two markets on one event can
+#: legitimately close a little apart (timezone rollover, a venue
+#: publishing the settlement deadline rather than the scheduled end,
+#: Kalshi's early-close conditions) — a day or two, not a month.
+CLOSE_MISMATCH_HOURS = 720.0
 
 #: Relative tolerance for comparing two extracted thresholds.
 _THRESHOLD_REL_TOL = 1e-9
@@ -134,8 +169,12 @@ class LinkEvidence:
         shared_tokens: Tokens both titles have, sorted.
         distinct_tokens: Tokens exactly one title has, sorted — the ones
             worth a reviewer's eye.
-        threshold_capped: `True` if the veto fired, i.e. the reported
-            `confidence` is lower than the weighted sum.
+        threshold_capped: `True` if the threshold veto fired, i.e. the
+            reported `confidence` is lower than the weighted sum.
+        close_capped: `True` if the close-time veto fired. Kept separate
+            from `threshold_capped` so a reviewer reading
+            `GET /links/{id}` sees WHICH disagreement suppressed the
+            score, not merely that something did.
     """
 
     title_jaccard: float
@@ -149,6 +188,7 @@ class LinkEvidence:
     shared_tokens: tuple[str, ...] = ()
     distinct_tokens: tuple[str, ...] = ()
     threshold_capped: bool = False
+    close_capped: bool = False
 
     @property
     def needs_outcome_map(self) -> bool:
@@ -202,6 +242,7 @@ class LinkEvidence:
             "shared_tokens": list(self.shared_tokens),
             "distinct_tokens": list(self.distinct_tokens),
             "threshold_capped": self.threshold_capped,
+            "close_capped": self.close_capped,
             "needs_outcome_map": self.needs_outcome_map,
         }
 
@@ -370,9 +411,17 @@ def score_pair(a: VenueMarket, b: VenueMarket) -> LinkEvidence:
         + WEIGHTS["source"] * tri_state_score(source_match)
     )
     confidence = min(max(weighted, 0.0), 1.0)
+    # Both vetoes are `min`-like: each lowers the score to its ceiling
+    # only when the score is above it, so neither can ever promote a
+    # pair, and applying both in sequence leaves the lower ceiling.
     capped = threshold_match is False and confidence > THRESHOLD_MISMATCH_CAP
     if capped:
         confidence = THRESHOLD_MISMATCH_CAP
+    close_capped = (
+        close_delta_h > CLOSE_MISMATCH_HOURS and confidence > CLOSE_MISMATCH_CAP
+    )
+    if close_capped:
+        confidence = CLOSE_MISMATCH_CAP
 
     return LinkEvidence(
         title_jaccard=round(title_jaccard, 9),
@@ -386,6 +435,7 @@ def score_pair(a: VenueMarket, b: VenueMarket) -> LinkEvidence:
         shared_tokens=tuple(sorted(set_a & set_b)),
         distinct_tokens=tuple(sorted(set_a ^ set_b)),
         threshold_capped=capped,
+        close_capped=close_capped,
     )
 
 
