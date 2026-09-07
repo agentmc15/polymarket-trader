@@ -111,7 +111,13 @@ from py_clob_client.clob_types import (
 from app.config import settings
 from app.services.polymarket.client import ClobClientWrapper
 from app.utils.time import ensure_aware, utcnow
-from app.venues.base import BaseAdapter, FeeModel, VenueAuthError, VenuePayloadError
+from app.venues.base import (
+    BaseAdapter,
+    FeeModel,
+    VenueAuthError,
+    VenueError,
+    VenuePayloadError,
+)
 from app.venues.fees import PolymarketFeeModel, category_fee_schedule
 from app.venues.types import (
     Balance,
@@ -132,6 +138,17 @@ logger = logging.getLogger(__name__)
 #: `OrderAck.status`'s literal type, named here so parsers can `cast` a
 #: validated `str` back to it without reaching for `Any`.
 _OrderAckStatus = Literal["open", "filled", "partially_filled", "cancelled", "rejected"]
+#: Items per Gamma `/markets` page. Gamma caps a page at 100 regardless of
+#: a larger `limit`, and DEFAULTS TO 20 when none is sent — which is what
+#: `list_markets` was getting.
+_GAMMA_PAGE_LIMIT = 100
+
+#: Pages `_fetch_gamma_markets` will walk. Gamma REFUSES an offset past
+#: 2000 with a 422 (measured: offset 2000 -> 200, offset 2050 -> 422), so
+#: 21 pages of 100 walks right up to that ceiling and no further. The
+#: venue's own limit is what bounds this, not a number we chose.
+_MAX_GAMMA_PAGES = 21
+
 _ORDER_ACK_STATUSES: frozenset[str] = frozenset(
     {"open", "filled", "partially_filled", "cancelled", "rejected"}
 )
@@ -508,14 +525,42 @@ class PolymarketAdapter(BaseAdapter):
         gamma_items = await self._fetch_gamma_markets()
         event_id_by_market = await self._event_id_by_market_id()
         clob_by_condition_id = await self._fetch_clob_markets_by_condition_id()
-        markets = [
-            self._build_market(
-                item,
-                event_id_by_market.get(_market_id(item) or ""),
-                clob_by_condition_id.get(_market_id(item) or ""),
+        # One unbuildable market must not blank the whole venue. This is
+        # the T38 property applied to the LISTING: `_build_market` raises
+        # `VenuePayloadError` on, for example, a market with no `endDate`,
+        # and Gamma really does serve those — invisible until pagination
+        # widened the sample from 20 markets to ~2100, at which point a
+        # single one of them aborted every scan.
+        #
+        # A TARGETED `get_market()` still raises: asking for one market and
+        # getting silence would be the quiet failure. Here the caller asked
+        # "what is listed", and the honest answer is everything that parsed,
+        # with a count of what did not.
+        markets = []
+        skipped: dict[str, int] = {}
+        for item in gamma_items:
+            try:
+                markets.append(
+                    self._build_market(
+                        item,
+                        event_id_by_market.get(_market_id(item) or ""),
+                        clob_by_condition_id.get(_market_id(item) or ""),
+                    )
+                )
+            except VenueError as exc:
+                reason = str(exc).split(":")[0][:60]
+                skipped[reason] = skipped.get(reason, 0) + 1
+        if skipped:
+            logger.warning(
+                "polymarket",
+                extra={
+                    "event": "gamma_markets_skipped",
+                    "listed": len(gamma_items),
+                    "built": len(markets),
+                    "skipped": sum(skipped.values()),
+                    "reasons": skipped,
+                },
             )
-            for item in gamma_items
-        ]
         if status is not None:
             markets = [m for m in markets if m.status == status]
         if updated_since is not None:
@@ -672,7 +717,71 @@ class PolymarketAdapter(BaseAdapter):
     async def _fetch_gamma_markets(
         self, params: dict[str, str] | None = None
     ) -> list[dict[str, Any]]:
-        """`GET {gamma_api_url}/markets`, defensively parsed to `list[dict]`."""
+        """`GET {gamma_api_url}/markets`, defensively parsed to `list[dict]`.
+
+        A TARGETED lookup (`params` given, e.g. `condition_ids=...`) is one
+        request. The UNFILTERED listing paginates, because Gamma's default
+        page is 20 items and it silently returns exactly that.
+
+        That default is why this matters. Before pagination existed this
+        method was called with no params at all, so `list_markets()`
+        returned **20 markets** — out of the thousands Polymarket lists —
+        and reported success. `settings.scan_top_n` (default 200) bounds a
+        list that could never reach 20, so raising it did nothing, and the
+        Kalshi adapter next to it pages through up to 10,000. Every "no
+        opportunities found" was a statement about 20 arbitrary markets,
+        with nothing logged to say so.
+        """
+        if params is not None:
+            return await self._fetch_gamma_page(params)
+
+        collected: list[dict[str, Any]] = []
+        for page in range(_MAX_GAMMA_PAGES):
+            try:
+                batch = await self._fetch_gamma_page(
+                    {
+                        "limit": str(_GAMMA_PAGE_LIMIT),
+                        "offset": str(page * _GAMMA_PAGE_LIMIT),
+                    }
+                )
+            except httpx.HTTPStatusError as exc:
+                # Gamma answers an offset past its ceiling with 422. On a
+                # LATER page that is the end of the listing, so keep what we
+                # have and say so. On the FIRST page it is a real failure and
+                # must not be mistaken for "the venue has no markets".
+                if exc.response.status_code != 422 or page == 0:
+                    raise
+                logger.warning(
+                    "polymarket",
+                    extra={
+                        "event": "gamma_offset_ceiling",
+                        "page": page,
+                        "markets": len(collected),
+                        "detail": "gamma refused the next offset; listing ends here",
+                    },
+                )
+                return collected
+            collected.extend(batch)
+            if len(batch) < _GAMMA_PAGE_LIMIT:
+                return collected
+        logger.warning(
+            "polymarket",
+            extra={
+                "event": "gamma_market_page_cap_reached",
+                "pages": _MAX_GAMMA_PAGES,
+                "markets": len(collected),
+                "detail": (
+                    "listing truncated at the page cap; markets beyond it are "
+                    "invisible to every scan"
+                ),
+            },
+        )
+        return collected
+
+    async def _fetch_gamma_page(
+        self, params: dict[str, str] | None
+    ) -> list[dict[str, Any]]:
+        """One `GET {gamma_api_url}/markets`, defensively parsed."""
         response = await self._gamma_client.get("/markets", params=params)
         response.raise_for_status()
         payload: object = response.json()

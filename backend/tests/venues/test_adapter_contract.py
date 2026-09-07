@@ -298,19 +298,39 @@ def test_stream_books_is_not_faked(case: Any) -> None:
 async def test_a_market_the_domain_types_reject_is_a_typed_venue_error(
     case: DivergenceCase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Out-of-domain market values raise `VenueError`, never a bare `ValueError`.
+    """An out-of-domain market is EXCLUDED from a listing, not fatal to it.
 
     `VenueMarket`'s validators name the offending field but raise a plain
-    `ValueError`. That is not a `VenueError`, so it is not in
-    `app.services.scanner.VENUE_READ_FAULTS`, so a single malformed
-    market would propagate out of `scan()` as if it were a programming
-    error and abort the whole pass -- instead of skipping one venue's
-    listing, which is what every other venue fault does.
+    `ValueError`, which is not in `app.services.scanner.VENUE_READ_FAULTS`
+    and would abort a whole pass as if it were a programming error. So it
+    is still wrapped as a `VenuePayloadError` -- that half is unchanged.
+
+    What changed is the BLAST RADIUS. This test used to assert that
+    `list_markets()` raises, i.e. that one bad market costs the caller
+    every other market from that venue. Running against the live Gamma
+    API showed what that means in practice: 182 of ~2100 real markets
+    carry no `endDate`, so a single one of them blanked the entire
+    Polymarket listing on every scan. The listing now skips the market it
+    cannot build, counts it, logs it, and returns the rest -- the same
+    "one bad market must not blank the venue" property T38 gave book
+    fetching.
+
+    `get_market()` still raises, and that asymmetry is deliberate: asking
+    for ONE market and receiving silence is the quiet failure this repo
+    keeps finding, while asking "what is listed" and being told
+    "everything that parsed, and here is the count that did not" is an
+    honest answer.
     """
     adapter = case.bad_market(monkeypatch)
 
+    markets = await adapter.list_markets()
+
+    assert all(m.market_id != case.market_id for m in markets), (
+        "the market whose payload the domain type rejects must be excluded"
+    )
+
     with pytest.raises(VenueError) as excinfo:
-        await adapter.list_markets()
+        await adapter.get_market(case.market_id)
 
     assert isinstance(excinfo.value, VenuePayloadError)
     # The message must still say WHICH field was wrong -- the whole point

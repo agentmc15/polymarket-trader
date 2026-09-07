@@ -562,8 +562,14 @@ async def test_market_missing_close_time_is_a_payload_error() -> None:
     broken = {k: v for k, v in MARKETS[0].items() if k != "close_time"}
     adapter = make_adapter(markets=[broken])
 
+    # The LISTING excludes it and survives; the TARGETED lookup raises.
+    # One malformed market must not cost the caller the whole venue --
+    # live Gamma serves 182 such markets out of ~2100, and the old
+    # behaviour blanked every scan on account of them.
+    assert await adapter.list_markets() == []
+
     with pytest.raises(VenuePayloadError):
-        await adapter.list_markets()
+        await adapter.get_market(broken["ticker"])
 
 
 # ---------------------------------------------------------------------------
@@ -1559,12 +1565,18 @@ async def test_a_market_the_domain_type_rejects_is_a_venue_error() -> None:
     `VenueMarket`'s own validator names the field but raises a BARE
     `ValueError`, which is not a `VenueError` and therefore not in
     `app.services.scanner.VENUE_READ_FAULTS` -- one bad market would have
-    aborted a whole scan pass instead of skipping this venue's listing.
+    aborted a whole scan pass. The listing now excludes it and survives;
+    only a targeted `get_market()` raises.
     """
     adapter = make_adapter(markets=[dict(MARKETS[0], minimum_order_size=-1)])
 
+    # Excluded from the listing rather than fatal to it (see the shared
+    # contract test); still a typed, field-naming error when asked for
+    # this market directly.
+    assert await adapter.list_markets() == []
+
     with pytest.raises(VenuePayloadError) as excinfo:
-        await adapter.list_markets()
+        await adapter.get_market(MARKETS[0]["ticker"])
 
     assert "min_size" in str(excinfo.value)
 

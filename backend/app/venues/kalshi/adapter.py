@@ -109,6 +109,7 @@ from app.venues.base import (
     BaseAdapter,
     FeeModel,
     VenueAuthError,
+    VenueError,
     VenuePayloadError,
     VenueRateLimited,
 )
@@ -529,7 +530,32 @@ class KalshiAdapter(BaseAdapter):
                 break
             seen_cursors.add(cursor)
 
-        markets = [self._build_market(item) for item in payloads]
+        # Same contract as the Polymarket adapter: ONE unbuildable market
+        # must not blank the venue. A single market that `VenueMarket`'s
+        # validators reject used to raise out of here and cost the caller
+        # every other market in the listing -- on Polymarket that was
+        # ~2100 markets lost to one missing `endDate`. `get_market()`
+        # still raises, because asking for one market and getting silence
+        # is the quiet failure this repo keeps finding.
+        markets = []
+        skipped: dict[str, int] = {}
+        for item in payloads:
+            try:
+                markets.append(self._build_market(item))
+            except VenueError as exc:
+                reason = str(exc).split(":")[0][:60]
+                skipped[reason] = skipped.get(reason, 0) + 1
+        if skipped:
+            logger.warning(
+                "kalshi",
+                extra={
+                    "event": "kalshi_markets_skipped",
+                    "listed": len(payloads),
+                    "built": len(markets),
+                    "skipped": sum(skipped.values()),
+                    "reasons": skipped,
+                },
+            )
         if status is not None:
             markets = [m for m in markets if m.status == status]
         if updated_since is not None:
