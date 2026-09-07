@@ -6867,3 +6867,56 @@ guards did on real data exactly what they were built to do.
 
 **No `outcome:` lines for any of this** — orchestrator-performed, no implementer dispatch and no
 independent verification, so it is not evidence about routing.
+
+---
+
+### Economic validation, first attempt — and the three defects that made it meaningless
+
+Ran repeated LIVE Polymarket scans in paper mode against a disposable Postgres, to answer the
+question the kit had never asked: **does this find anything tradeable?** Answering it required
+fixing three defects first, because the measurement as it stood could not have meant anything.
+
+**1. Kalshi contributed nothing to any scan, ever.** `list_markets` pages at `limit=200` for up to
+50 pages as fast as the network allows; the unauthenticated limit is ~10 req/s (measured: 17 requests
+in 1.69s, 429 on the 18th, no `Retry-After`). The call then RAISED, discarding the ~3400 markets it
+had already fetched. Every pass ran Polymarket-only, so cross-venue arbitrage — the entire reason for
+scanning two venues — had never once executed. Fixed with pacing (0.10s measured sufficient: 25 paged
+requests, zero 429s) plus a bounded retry.
+
+**2. The Polymarket adapter had only ever seen 20 markets.** `_fetch_gamma_markets` sent no params
+and did not paginate; Gamma's default page is 20. `scan_top_n` (default 200) bounds a list that could
+never reach 20, so the knob did nothing, while the Kalshi adapter beside it walked 10,000. **Every
+"no opportunities found" in this repo's history was a statement about 20 arbitrary markets.** Paging
+to Gamma's own ceiling (offset 2000; 2050 returns 422) gives **1918 markets in 1.6s** — 96x.
+
+**3. One market with no `endDate` blanked the whole venue.** Invisible at 20 markets; at ~2100, 182
+of them carry no `endDate` and `_build_market` raised, aborting the entire listing. Both adapters now
+skip, count and log; `get_market()` still raises.
+
+**The measurement, once it could mean something.** 400 markets per pass, repeated:
+
+- **110 opportunities detected per pass, and 220/220 scored `fill_confidence = 0.0`**, hence
+  `composite = 0.0`. Not one was actionable.
+- **216 of 220 had identical legs: YES at `0.001`, NO at `0.5`**, across 110 DISTINCT markets. `0.001`
+  is the minimum tick and `0.5` a placeholder midpoint — the signature of a book with no real
+  liquidity, not a mispricing.
+- All 220 were `binary_complement_arbitrage`. `cross_venue_arbitrage` and
+  `multi_outcome_bundle_arbitrage` found nothing at all.
+
+**So the honest answer is: zero tradeable edges, on 400 live markets.** Two readings, and both are
+true. The scoring machinery WORKS — it detected 110 arithmetic edges and refused every one, on
+exactly the right ground (you cannot fill against an empty book). And the system has still never
+demonstrated it can find a real edge, because the one strategy that produced candidates is
+structurally the least likely to (a single venue's YES+NO is arbitraged to ~$1 by construction),
+while the cross-venue thesis remains untestable until Kalshi has credentials.
+
+**Two things worth deciding, not silently fixing.** (a) 110 rows per pass are persisted with
+`composite = 0`, so `GET /opportunities` would show 110 useless entries; filtering
+`fill_confidence == 0` before persisting is defensible but changes what the UI reports, so it is
+flagged rather than done. (b) In the DEFAULT configuration Kalshi market data comes from the DEMO
+environment (`kalshi_env="demo"`), so any cross-venue comparison is live Polymarket against synthetic
+Kalshi. Production's unauthenticated listing is no better — 0 of 1000 sampled markets carried a bid.
+**Cross-venue arbitrage cannot be validated at all without Kalshi credentials**, and that is the
+single most important blocker to answering "does this make money".
+
+**No `outcome:` lines** — orchestrator-performed, no dispatch, no independent verification.
