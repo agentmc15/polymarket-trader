@@ -1021,6 +1021,20 @@ async def scan(
     # two `list_markets` calls (one per venue today) are not the
     # rate-limit/skew problem T35 exists for; the ~800 `get_book` calls
     # below are. A venue that cannot be listed is skipped, not fatal.
+    # Market ids on APPROVED links, per venue: these are scanned whatever
+    # their volume rank (see the widening below).
+    approved_link_market_ids: dict[str, frozenset[str]] = {}
+    for link in links:
+        if link.status != "approved":
+            continue
+        for venue_name, market_id in (
+            (link.venue_a, link.market_a),
+            (link.venue_b, link.market_b),
+        ):
+            approved_link_market_ids[venue_name] = approved_link_market_ids.get(
+                venue_name, frozenset()
+            ) | {market_id}
+
     for venue, adapter in adapters.items():
         try:
             markets = await adapter.list_markets(status="open")
@@ -1037,6 +1051,43 @@ async def scan(
         top_markets = sorted(markets, key=_volume, reverse=True)[
             : settings_obj.scan_top_n
         ]
+        # ALWAYS scan a market on an APPROVED link, whatever its volume
+        # rank. Selection is top-N by volume PER VENUE and independent
+        # per venue, so a linked pair is only scannable when BOTH sides
+        # survive their own venue's cut -- and they do not.
+        #
+        # Measured on live data with 12 human-verified links: all 12
+        # Polymarket sides ranked 4-1301 (8 inside a top-400 cut), while
+        # every Kalshi side ranked 1705-4476, so ZERO pairs were ever
+        # scanned together and `cross_venue_arbitrage` could not fire
+        # even with perfect links approved. It is the same shape as this
+        # repo's headline defect: a capability that is built, tested,
+        # and structurally unreachable.
+        #
+        # Only APPROVED links widen the set. A `proposed` link is an
+        # unreviewed guess -- 6 of the top 20 candidates on live data
+        # were plain wrong, including two absurd pairings -- so honoring
+        # those here would spend the budget on noise and, worse, invite
+        # exactly the false cross-venue signal the review gate exists to
+        # stop.
+        linked_ids = approved_link_market_ids.get(venue, frozenset())
+        if linked_ids:
+            already = {m.market_id for m in top_markets}
+            extra = [
+                m for m in markets if m.market_id in linked_ids and m.market_id not in already
+            ]
+            if extra:
+                logger.info(
+                    "scanner",
+                    extra={
+                        "event": "scan_linked_markets_added",
+                        "venue": venue,
+                        "added": len(extra),
+                        "top_n": settings_obj.scan_top_n,
+                        "detail": "markets on approved links, below the volume cut",
+                    },
+                )
+                top_markets = [*top_markets, *extra]
         top_markets_by_venue[venue] = top_markets
         for market in top_markets:
             markets_by_key[(venue, market.market_id)] = market
