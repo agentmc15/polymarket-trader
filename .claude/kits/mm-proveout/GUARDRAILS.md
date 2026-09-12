@@ -72,3 +72,22 @@ its provenance labels) apply verbatim. Read that file too.
 - Commits use the message shape of the repo's recent history: a one-line imperative subject, a body
   that says what was measured and why the change follows, and the attribution trailer the session
   specifies.
+
+### 3.4 Mutation testing never targets an untracked file in place
+
+The read-only roles' standing practice is "if the tree is touched anyway, restore it
+byte-for-byte before reporting". That remedy assumes `git checkout` can restore the file. **In
+this kit it usually cannot**: nearly every file the kit produces is still untracked (nothing is
+committed yet), and `git checkout` does not restore an untracked file. A role that overwrites one
+with a mutant has destroyed the only copy, and its only fallback is reconstructing from whatever
+it happened to read earlier -- which is not a byte-for-byte guarantee.
+
+So: mutate a COPY under a different module name and import it (`importlib`), or copy the target
+to the scratchpad and mutate there. Never write a mutant over the target, tracked or not. If it
+happens anyway, say so plainly in the report as your OWN defect, and state which independent
+checks were run to establish the restore -- the orchestrator will verify rather than take it.
+
+Occurred once already: T10's test-author overwrote the untracked `app/scripts/collection_health.py`,
+could not `git checkout` it back, and reconstructed it from an earlier read. Verified intact
+independently (symbols, compile, ruff, strict `>` at the gap threshold, 25 tests) -- but that
+verification was luck's to give, not the process's.

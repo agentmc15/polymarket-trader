@@ -21,7 +21,7 @@ Dispatch notes for the orchestrator:
 ## Phase 1 — Kalshi retrospective proof-out
 
 ### T1 — Kalshi candle client with a no-look-ahead selector
-- status: pending
+- status: done
 - model: sonnet
 - independent: yes
 
@@ -68,7 +68,7 @@ cd backend && python3 -m pytest -q tests/venues/test_kalshi_candles.py && python
 ---
 
 ### T2 — The replay harness: `mm_backtest.py`
-- status: pending
+- status: done
 - model: opus
 - depends: T1
 
@@ -136,7 +136,7 @@ cd backend && python3 -m pytest -q tests/scripts/test_mm_backtest.py && python3 
 ---
 
 ### T3 — Kalshi Gate 1 at full power
-- status: pending
+- status: done
 - model: sonnet
 - depends: T2
 
@@ -160,20 +160,20 @@ numbers to `NOTES.md`.
 - `reports/kalshi-gate1.md` exists, starts with the data window, contains `fill_model=pessimistic`
   before `fill_model=optimistic`, contains exactly one `VERDICT kalshi` line, and every numeric
   block carries `terminal=settled`.
-- `n_trading` on the pessimistic test split ≥ 1,000 and on `all` ≥ 2,500 (or the report states why
+- `n_trading` on the pessimistic test split ≥ 1,000 and on `overall` ≥ 2,500 (or the report states why
   not, with the 429 rate and the sample size tried).
 - `reports/kalshi-gate1.json` parses; `backend/.cache/` is gitignored; `git status --porcelain`
   shows no cache file.
 
 **Verify.**
 ```bash
-cd backend && test -f ../.claude/kits/mm-proveout/reports/kalshi-gate1.md && grep -c "^VERDICT kalshi fill_model=pessimistic terminal=settled" ../.claude/kits/mm-proveout/reports/kalshi-gate1.md | grep -qx 1 && python3 -c "import json; d=json.load(open('../.claude/kits/mm-proveout/reports/kalshi-gate1.json')); assert d['pessimistic']['all']['n_trading']>=2500, d['pessimistic']['all']['n_trading']; print('ok')" && git -C .. check-ignore -q backend/.cache/mm/kalshi-60m.json
+cd backend && test -f ../.claude/kits/mm-proveout/reports/kalshi-gate1.md && grep -c "^VERDICT kalshi fill_model=pessimistic terminal=settled" ../.claude/kits/mm-proveout/reports/kalshi-gate1.md | grep -qx 1 && python3 -c "import json; d=json.load(open('../.claude/kits/mm-proveout/reports/kalshi-gate1.json')); assert d['pessimistic']['overall']['n_trading']>=2500, d['pessimistic']['overall']['n_trading']; print('ok')" && git -C .. check-ignore -q backend/.cache/mm/kalshi-60m.json
 ```
 
 ---
 
 ### T4 — Per-series calibration, out of sample
-- status: pending
+- status: done
 - model: sonnet
 - depends: T3
 
@@ -209,7 +209,7 @@ cd backend && python3 -m pytest -q tests/scripts/test_mm_calibrate.py tests/stra
 ---
 
 ### T5 — What hourly candles cannot see: the 1-minute sub-study
-- status: pending
+- status: done
 - model: opus
 - depends: T3
 
@@ -240,7 +240,7 @@ cd backend && test -f ../.claude/kits/mm-proveout/reports/kalshi-minute-study.md
 ---
 
 ### T6 — Stop carrying inventory into a coin flip: the taper
-- status: pending
+- status: done
 - model: sonnet
 - depends: T3
 
@@ -270,6 +270,106 @@ Write `.claude/kits/mm-proveout/reports/kalshi-taper.md`.
 cd backend && python3 -m pytest -q tests/strategies/test_market_making.py tests/scripts/test_mm_backtest.py && test -f ../.claude/kits/mm-proveout/reports/kalshi-taper.md && grep -q "taper_hours" ../.claude/kits/mm-proveout/reports/kalshi-taper.md
 ```
 
+### T18 — The clean test: score the candidate on markets that never touched its selection
+- status: done
+- model: sonnet
+- depends: T4
+
+**Brief.** T4's venue-wide candidate (`edge_fraction=0.9, min_spread=0.25, max_inventory=50`) beats
+the defaults 4.1x on temporal-test ROC and, scored through the Gate 1 verdict path, produces a
+pessimistic test CI of `[+0.4983, +1.3061]` — clear of zero where the defaults give
+`[-0.1205, +0.4507]`.
+
+**That result cannot be believed, and the reason is structural, not statistical.** The two-split rule
+uses the temporal test as one of its selection gates, so the candidate carries `temporal_win: true`
+*because it was chosen partly for winning the very split being quoted as its validation*. Every
+market in `.cache/mm/kalshi-60m.json` participated in that selection. Scoring on any of them is
+in-sample.
+
+This task runs the only test that settles it: **the same parameters on Kalshi markets that played no
+part in choosing them.**
+
+Add `--exclude-markets-from PATH` to `backend/app/scripts/mm_backtest.py`: read a cache file, collect
+its `market_id`s, and remove them from the universe *before* sampling. Then run two replays over a
+fresh sample drawn from the remaining universe (50,470 settled minus the 15,283 already collected —
+roughly 35,000 available, so a 12,000 sample is comfortable):
+
+1. defaults `0.8 / 0.10 / 20`
+2. candidate `0.9 / 0.25 / 50`
+
+Both at `--min-volume 2000 --interval 60 --days 10`, a **different seed**, a separate cache path, and
+the compliant ~70% train cutoff (`mm_calibrate.seventy_percent_cutoff()` exists for exactly this —
+use it rather than passing a date and hoping). Report both verdicts side by side.
+
+**Interpretation, fixed in advance so the result cannot be rationalised afterwards:**
+- If the candidate's pessimistic test CI clears zero on markets outside the cache, the edge is real
+  and survives honest out-of-sample scoring. That is a genuine GO signal and the strongest result the
+  project would have.
+- If it spans zero, the 4.1x ROC was selection artifact and the defaults' NO-GO stands. **That is
+  equally valuable and must be reported with the same prominence.**
+- Either way, apply T5's measured 64% CI-widening correction when stating confidence, and say the raw
+  and corrected intervals both.
+
+**Acceptance.**
+- `--exclude-markets-from` removes exactly the excluded ids; a test proves zero overlap between the
+  new sample and the excluded cache.
+- `reports/kalshi-holdout.md` states the overlap count (must be 0), both verdicts, `n_trading` and
+  `n_events_trading` for each, and the raw and 64%-widened CIs.
+- The report states plainly whether the candidate survived, in one sentence, near the top.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/scripts/test_mm_backtest.py && test -f ../.claude/kits/mm-proveout/reports/kalshi-holdout.md && grep -q "overlap=0" ../.claude/kits/mm-proveout/reports/kalshi-holdout.md
+```
+
+
+### T20 — The honest holdout: event-disjoint, stratified, 14+ days
+- status: done
+- model: opus
+- depends: T18
+
+**Brief.** The Phase 1 reviewer rejected T18's GO, and independent verification confirmed the
+rejection: 51.0% of T18's holdout markets shared an event with the tuning cache, and its
+"temporal holdout" was 1.70 days over one holiday weekend with NCAAF carrying 75.3% of test
+P&L. T20 re-runs the same question on a sample built to survive those three objections — an
+event-disjoint universe, stratified by ISO close week so the test window is not one weekend,
+and long enough to contain more than one.
+
+**Four criteria, fixed before the run:** `event_overlap=0`; test window >= 14 days;
+`n_trading >= 1000`; the two-split rule passes at 1-minute on event-disjoint halves. All four
+required. Any missing -> name which, and do not present a partial result as a pass.
+
+**Outcome: THREE of four.** `event_overlap=0` met (verified by raw load of both caches, not
+through the harness's own filter). Window 17.18 days, met. Two-split rule 59/60 plus the
+temporal test, met — the first pass of that rule anywhere in this kit. `n_trading` 919, NOT
+met. Shipped params clear zero at `[+0.0365, +0.8615]`; old defaults are decisively negative
+at `[-0.7607, -0.2473]`. See NOTES.md and `reports/kalshi-honest-holdout.json`.
+
+**Verify.**
+```bash
+cd backend && python3 -c "import json;d=json.load(open('../.claude/kits/mm-proveout/reports/kalshi-honest-holdout.json'));assert d['overlap']['event_overlap']==0;assert d['sample']['test_window_days']>=14;print('ok')"
+```
+
+### T22 — Is the edge a business or a lottery: the P&L-blind density gate
+- status: done
+- model: opus
+- depends: T20
+
+**Brief.** T20's series breakdown shows the per-market edge is strongest in the DENSEST series
+(20+ markets/series: +$1.44/market vs +$0.436 pooled), not in a thin tail. That is a hypothesis
+generated by reading test-split P&L, not a result. T22 tests the only version of it that is not
+data snooping: a gate that selects on DENSITY, which is P&L-blind, with N chosen on train and
+applied unchanged to test. Any rule naming a series is forbidden.
+
+**Acceptance.** Gated test CI, two-split rule at 1-minute, an explicit multiplicity count across
+T20+T22 against this same test split, and the capital picture. Interpretation fixed in advance;
+a negative result (quote-everything wins) is a useful result.
+
+**Verify.**
+```bash
+cd backend && test -f ../.claude/kits/mm-proveout/reports/kalshi-density-gate.json && python3 -c "import json;d=json.load(open('../.claude/kits/mm-proveout/reports/kalshi-density-gate.json'));assert 'provenance' in d;print('ok')"
+```
+
 **— end of Phase 1 —**
 
 ---
@@ -277,7 +377,7 @@ cd backend && python3 -m pytest -q tests/strategies/test_market_making.py tests/
 ## Phase 2 — Forward collection on both venues
 
 ### T7 — Collect the markets the policy would quote
-- status: pending
+- status: done
 - model: sonnet
 - independent: yes
 
@@ -314,7 +414,7 @@ cd backend && python3 -m pytest -q tests/venues/test_quotable_spread.py tests/se
 ---
 
 ### T8 — Snapshots carry volume and the fee in force
-- status: pending
+- status: done
 - model: sonnet
 - depends: T7
 
@@ -346,7 +446,7 @@ cd backend && python3 -m pytest -q tests/models/test_book_snapshot_volume_fee.py
 ---
 
 ### T9 — A beat that runs it, and a preflight that checks the field names first
-- status: pending
+- status: done
 - model: sonnet
 - depends: T8
 
@@ -379,7 +479,7 @@ cd backend && python3 -m pytest -q tests/tasks/test_collect_books_beat.py tests/
 ---
 
 ### T10 — Collection health
-- status: pending
+- status: done
 - model: sonnet
 - depends: T8
 
@@ -405,10 +505,171 @@ cd backend && python3 -m pytest -q tests/scripts/test_collection_health.py
 
 ---
 
+## Phase 2b — Remediation: what the Phase 2 review rejected
+
+The Phase 2 reviewer returned **reject** with 8 findings, 3 of them irreversible once the beat
+starts. Two decisive claims were re-verified directly by the orchestrator. These tasks are strictly
+serial on `backend/app/services/data_collector.py`; T15 must land before the beat is ever started,
+because migration 008 has not been applied to any database and that is the only moment these columns
+are free.
+
+### T15 — The columns that cannot be added later
+- status: done
+- model: sonnet
+- depends: T10
+
+**Brief.** Migration `008` is unapplied. Three findings are irreversible the moment collection
+starts, and all three are columns.
+
+**(a) The stored `volume` cannot produce the delta T11 is built on.** `_upsert_book_snapshot` writes
+`volume=venue_volume(market)`, and `venue_volume` tries `_VOLUME_KEYS` in order with the **24-hour**
+fields first (`volume_24h_fp`, `volume24hr`) — correct for ranking, which is what it was written for,
+wrong for a between-snapshot delta. Measured live 2026-09-07: Kalshi's `volume_24h_fp` did not move
+for **a single one of 6,058 actively-traded markets** over 245 seconds, because it is a periodically
+recomputed aggregate rather than a live counter, while lifetime `volume_fp` moved for 25 of them.
+Polymarket's `volume24hr` went **down** for 62 of 255 markets (24.3%) over ~28 minutes. Downstream:
+`passive_fill.py:97` raises `ValueError` on negative volume, and `:142` returns no fills at all when
+`volume <= 0.0` — **gating both fill models, not just optimistic**. So as built, three weeks of Kalshi
+collection would replay to zero fills, and a quarter of Polymarket's intervals would raise.
+
+Add a separate `volume_lifetime` column carrying the lifetime counter (Kalshi `volume_fp`, Polymarket
+`volumeNum`) and keep `volume` as the 24h ranking figure it correctly is. Do not simply swap the key
+order — the reviewer measured Gamma's lifetime `volumeNum` decreasing for 29 of 255 markets too, so a
+delta needs a monotonicity guard: a decrease means the counter was restated, which is **unknown**, not
+negative. Treat it as `None`, never as 0.0 and never as a negative passed into `TradeRange`.
+
+**(b) There is no observation time.** `BookSnapshot` records the book's `ts` and never when we looked.
+Polymarket's `ts` is CLOB book-move time and T8's same-`ts` path deliberately refreshes an old row
+rather than writing a new one, so "quiet book" and "dead collector" are permanently
+indistinguishable — `_GAP_SEMANTICS["polymarket"]` says so in as many words. Worse, the refreshed
+`volume` on a row comes from the *last* poll that saw that `ts`, so the volume channel is shifted
+forward by one dwell and partly measures activity **after** the mark (adjacent to GUARDRAILS §4.3).
+Add `observed_at` (the poll's wall clock, always set, both venues) and write it on every insert AND
+every refresh.
+
+**(c) Fee provenance is discarded.** `FeeSchedule.source` distinguishes `venue_schedule` from
+`category_table`/`settings_default`, and the category table is recorded in its own docstring as wrong
+on 82% of 1,918 live Polymarket markets. `_upsert_book_snapshot` writes the rates and drops `source`,
+and preflight cannot catch a silent fallback because a default is a perfectly good float. Add
+`fee_source`. Also add `maker_fee_rate` — D9 says "the fee in force" and the maker fee (Kalshi
+0.0175) is the one in force for a passive quoter; only the taker rate is stored today.
+
+All four columns go into migration `008` itself, which has not been applied anywhere. Confirm with
+`alembic upgrade head --sql` — **do not apply it**.
+
+**Acceptance.**
+- `tests/models/test_book_snapshot_volume_fee.py` extended: round-trip of all four new columns and of
+  them as `None`; the unique constraint is unchanged.
+- A test proves a decreasing lifetime counter yields `None`, not a negative or a zero.
+- A test proves `observed_at` is written on a same-`ts` refresh, not only on insert.
+- The offline SQL for 008 contains all four `ADD COLUMN`s and no `UPDATE`.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/models/test_book_snapshot_volume_fee.py tests/services/test_book_collection_selection.py && python3 -m alembic upgrade head --sql 2>/dev/null | grep -q "observed_at"
+```
+
+---
+
+### T16 — A pass that finishes inside its own beat, and a 404 that does not kill the venue
+- status: done
+- model: sonnet
+- depends: T15
+
+**Brief.** Two blocking defects in the collection loop, both measured live by the Phase 2 reviewer.
+
+**(a) One Kalshi pass takes ~3 hours on a 60-second beat.** `app/tasks/collection.py` discards the
+`VenueMarket` objects `list_markets` just built and passes only `market_id`s, so
+`data_collector.py:1072-1074` spends one `await adapter.get_market(market_id)` per candidate.
+Measured: Kalshi `get_market` averages 0.108s (paced by `kalshi_min_request_interval_s = 0.10`), so
+~101,045 markets is **~3.03 hours per tick**; Polymarket averages 1.603s per market, ~51 minutes. A
+full nested `/events?status=open&with_nested_markets=true` walk returns 101,045 markets in **15
+seconds**, and `quotable_spread()`/`venue_volume()` compute straight off that payload — which is
+exactly what T7 built them to do. Every one of those per-market fetches is redundant, and they cancel
+T7's stated saving entirely. Carry the listing's `VenueMarket` objects through instead of re-fetching.
+
+Note this also restores T10's Kalshi staleness threshold: `_STALENESS_MULTIPLIER["kalshi"] = 2.0`
+(120s) is justified in-file by "should lag by roughly one beat", which is off by ~90x against the
+as-built collector — `collection_health` would report `is_stale` and exit 1 permanently on a *working*
+collector. Fixing the pass makes 120s honest again. Say so in the commit body.
+
+**(b) A routine 404 kills the whole venue, silently and forever.** `raise_for_venue_error`
+(`kalshi/adapter.py:1121-1149`) maps 429 and 401/403 to `VenueError` and lets everything else through
+as `httpx.HTTPStatusError` — deliberately, per its docstring. But `collect_books`' per-market catch at
+line 1075 is `except VenueError`, so a 404 escapes to the venue-level `except Exception` at 1119 and
+takes the entire venue's tick with it. **3 of 5 real tickers sampled from the open listing returned
+404 on `/markets/{ticker}`** — this is the ordinary case, not a hypothetical, and over a long pass at
+least one is certain every tick. Verified directly by the orchestrator. Catch per-market transport
+and status faults at the market level so one dead market costs one market.
+
+Also: `collect_books` returns a bare `int` and `run_collect_books` returns the venues that produced
+*candidates*, not the venues that *wrote*. No caller can detect a dead venue without parsing logs.
+Return per-venue written counts so a caller can.
+
+**(c) Record selection membership.** Measured on Kalshi over 5 minutes: quotable held at 684 and
+selected at 500, but **20 markets (4.0%) left the set and 20 entered** — all 20 departures had lost
+quotability, none were pushed out by the cap. Over three weeks any given market's series will be full
+of holes, and a hole is indistinguishable from a collector fault. Persist which markets were selected
+per tick (a small table or a column) so T11 can tell "not selected" from "not collected".
+
+**Acceptance.**
+- A test proves the candidate path performs **no** `get_market` call when the listing already carried
+  the market (assert on a fake adapter's call count).
+- A test proves a market raising `httpx.HTTPStatusError` (404) costs only that market: the other
+  markets in the same venue are still written.
+- A test proves the per-venue written counts are returned and distinguish "no candidates" from
+  "candidates but zero written".
+- Selection membership is persisted and a test round-trips it.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/services/test_book_collection_selection.py tests/tasks/test_collect_books_beat.py
+```
+
+---
+
+### T17 — Run the guards that already exist
+- status: done
+- model: sonnet
+- depends: T16
+
+**Brief.** PLAN "Done looks like #2" requires "a preflight that checks live field names **before every
+run**". Nothing calls it: `grep -rn preflight app/ --include='*.py'` outside the script returns two
+comments in `config.py`, `run_collect_books()` calls no check, and `collection_health` appears only in
+docstrings. So D8's guard is now genuinely fallible after T9's retry — and nothing invokes it. A venue
+rename over three weeks yields `quotable=0`, zero rows, an exit-0 beat and no alarm.
+
+Also: migration 008 is unapplied and nothing gates the beat on it. If the beat starts against 007
+every insert raises `UndefinedColumn`, the per-venue `except Exception` swallows it, both venues die
+every tick, and the only detector is unscheduled. `preflight` **already** checks the head revision
+(`_expected_head_revision`, `_database_group`) — the right guard exists and is simply never run.
+
+Wire it: run the collection preflight (including the migration-head check) before a collection run
+starts and refuse to start on failure; schedule `collection_health.py` on its own beat; and make a
+venue that writes zero rows for N consecutive ticks produce something louder than a `logger.exception`
+line. Choose N and justify it. This is the orchestrator's deferred deliverable, not a "later" —
+acceptance was written as "`--check-collection` exits 0 live", which tested the CLI rather than the
+gate.
+
+**Acceptance.**
+- A test proves the beat refuses to run when the collection preflight fails.
+- A test proves the beat refuses to run when the DB head revision is behind.
+- `collection_health` has a beat entry sourced from settings.
+- A test proves N consecutive zero-write ticks for a venue escalates beyond a per-tick log line.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/tasks/ tests/scripts/test_preflight_collection.py
+```
+
+**— end of Phase 2b —**
+
+---
+
 ## Phase 3 — Polymarket forward proof-out (build now, verdict when the data exists)
 
 ### T11 — Replay from snapshots, both venues, same report
-- status: pending
+- status: done
 - model: sonnet
 - depends: T2, T8
 
@@ -416,14 +677,36 @@ cd backend && python3 -m pytest -q tests/scripts/test_collection_health.py
 over `--from/--to`, group by (market, outcome=YES), sort by `ts`, and build the same
 `(quote, fill, mark)` triples T2 uses from consecutive snapshots: quote from snapshot i's best
 bid/ask; the pessimistic `TradeRange` from snapshot i+1 as `low = best_bid_{i+1}`, `high =
-best_ask_{i+1}`, `volume = (volume_{i+1} - volume_i) if both non-null else 1.0` — so the
-pessimistic model fills when the touch moved THROUGH the quote, and the optimistic model is only
-computed when a real volume delta exists (report "optimistic: n/a — no volume field" otherwise);
-mark at snapshot i+2's mid. Settle terminal inventory at the venue result fetched at analysis time
+best_ask_{i+1}`, and the volume from **`volume_lifetime`**, NOT `volume` — see the correction
+below; mark at snapshot i+2's mid. Settle terminal inventory at the venue result fetched at analysis time
 (`list_markets(status="resolved")` on the venue; a market not yet resolved is reported as
 `unsettled` and excluded from the verdict). Reuse T2's `replay()`/`report()` by adapting rows into
 its candle shape — do not write a second report. Fees per snapshot from T8's columns; rebate as the
 separate line (GUARDRAILS §2.3). Report header states the data window and n.
+
+**CORRECTION to this brief, from the Phase 2 review and T15 (read before starting).** This brief
+originally said `volume = (volume_{i+1} - volume_i) if both non-null else 1.0`, reading the `volume`
+column. Both halves of that were wrong:
+
+1. **Wrong column.** `volume` holds `venue_volume(market)`, which reads the 24-HOUR rolling fields
+   first by design. Measured live: Kalshi's `volume_24h_fp` did not move for one of 6,058 actively
+   traded markets over 245s. Its delta is always 0. T15 added **`volume_lifetime`** (Kalshi
+   `volume_fp`, Polymarket `volumeNum`) for exactly this purpose — use it.
+2. **`else 1.0` fabricates evidence.** `volume_lifetime` is `None` when it was never populated or
+   when T15's monotonicity guard caught a restatement (Polymarket's lifetime counter decreased for 29
+   of 255 markets in ~28 minutes). `None` means UNKNOWN. Substituting `1.0` asserts a trade occurred,
+   and since `passive_fill.py:142` gates on `volume <= 0.0`, that is the difference between a fill and
+   no fill — an optimistic bias in the one number meant to be conservative. **An interval whose volume
+   delta is unknown must be counted and excluded, never defaulted.** Report the excluded count in the
+   header beside `n`, the same way T2 reports `n_unmarkable_intervals`.
+
+Note `passive_fill`'s volume gate applies to BOTH fill models, not only optimistic, so an unknown
+volume excludes the interval from both — do not report a pessimistic number computed as if the gate
+were price-only.
+
+Also use `observed_at` (T15) rather than `ts` when reasoning about how long an interval actually
+lasted: on Polymarket `ts` is book-move time, so consecutive snapshots can be seconds or days apart,
+and a refreshed row's volume comes from the last poll that saw that `ts`.
 
 **Acceptance.**
 - `tests/scripts/test_mm_replay_snapshots.py` (SQLite, seeded snapshots): the through-model fills
@@ -469,7 +752,7 @@ cd backend && python3 -m pytest -q tests/scripts/test_mm_calibrate.py && test -f
 ---
 
 ### T13 — Go / no-go
-- status: pending
+- status: done
 - model: opus
 - depends: T3, T4, T5, T6, T12
 
@@ -503,7 +786,7 @@ cd backend && test -f ../.claude/kits/mm-proveout/reports/go-no-go.md && test "$
 ## Phase 4 — Gate 2, designed and not executed
 
 ### T14 — The smallest real-money test that answers what paper cannot
-- status: pending
+- status: done
 - model: opus
 - depends: T13
 
