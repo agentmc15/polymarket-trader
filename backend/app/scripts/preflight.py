@@ -75,6 +75,9 @@ from sqlalchemy.pool import NullPool
 
 from app.config import Settings, get_settings
 from app.execution.fences import LIVE_TRADING_CONFIRMATION_PHRASE
+from app.services.data_collector import select_quotable_markets
+from app.venues.base import MarketDataAdapter
+from app.venues.types import VenueId, venue_volume
 
 Status = Literal["pass", "warn", "fail"]
 
@@ -735,6 +738,104 @@ def _venue_group(venue_checks: Sequence[VenueCheck]) -> CheckGroup:
     return CheckGroup("Venue reachability (public endpoints, no credentials sent)", checks)
 
 
+@dataclass(frozen=True)
+class CollectionCheck:
+    """One venue's fixture-versus-reality result for `--check-collection`
+    (mm-proveout T9, PLAN.md D8).
+
+    `DataCollector.collect_books` (T7/T8) is about to run unattended, on
+    a beat, for weeks (`app.tasks.collection`). Every field it depends on
+    -- `quotable_spread`, `venue_volume`, `FeeSchedule.taker_rate`, and
+    `get_book` returning a two-sided book -- was already exercised
+    against a HAND-WRITTEN fixture in `tests/`, and PLAN.md's own
+    tripwire is that a fixture agreeing with the code proves nothing
+    about whether a venue's payload has since renamed a field. This
+    result carries what a live sample against `venue` found.
+
+    Attributes:
+        venue: Venue label, for the report.
+        sampled: How many quotable markets were actually checked for
+            `fee.taker_rate`/`get_book` (`0` when none could be found, or
+            the venue could not even be listed -- see `error`).
+        failures: One human-readable line per violated assertion. Empty
+            means everything checked passed.
+        error: Set instead of (never alongside) sampling when the venue
+            could not be listed at all (e.g. `list_markets` raised) --
+            distinct from "listed fine, but nothing quotable was found",
+            which is `sampled == 0` with `error is None`.
+        listed: How many markets `list_markets(status="open")` returned
+            in total (`0` on an `error`). The denominator for
+            `two_sided`/`volume_positive` below -- see
+            `check_collection_for_venue`'s docstring for why the
+            spread/volume field checks are re-derived against this
+            UNFILTERED population rather than the `sampled` set (mm-
+            proveout T9 retry: the per-market checks against `sampled`
+            were provably unable to fail, since `sampled` is drawn from
+            `select_quotable_markets`'s `quotable`, which is itself
+            DEFINED by those same predicates).
+        two_sided: Of `listed`, how many have `quotable_spread(m) is not
+            None`.
+        volume_positive: Of `listed`, how many have `venue_volume(m) >
+            0`.
+    """
+
+    venue: str
+    sampled: int
+    failures: list[str] = field(default_factory=list)
+    error: str | None = None
+    listed: int = 0
+    two_sided: int = 0
+    volume_positive: int = 0
+
+
+def _collection_group(collection_checks: Sequence[CollectionCheck]) -> CheckGroup:
+    """Render the opt-in `--check-collection` field-name/reality probes."""
+    checks: list[Check] = []
+    for cc in sorted(collection_checks, key=lambda c: c.venue):
+        if cc.error is not None:
+            checks.append(
+                Check(
+                    "fail",
+                    f"{cc.venue}: could not be probed -- {cc.error}. Collection "
+                    "would run and write nothing for this venue right now.",
+                )
+            )
+        elif cc.sampled == 0:
+            checks.append(
+                Check(
+                    "fail",
+                    f"{cc.venue}: no quotable market was found to sample -- "
+                    "either this venue genuinely has nothing quotable right "
+                    "now, or quotable_spread()/venue_volume() (app.venues."
+                    "types) is silently rejecting every candidate because a "
+                    "field was renamed. Cross-check with "
+                    "`python3 -m app.scripts.probe_quotable`.",
+                )
+            )
+        elif cc.failures:
+            for failure in cc.failures:
+                checks.append(Check("fail", f"{cc.venue}: {failure}"))
+        else:
+            two_sided_pct = (cc.two_sided / cc.listed) if cc.listed else 0.0
+            volume_pct = (cc.volume_positive / cc.listed) if cc.listed else 0.0
+            checks.append(
+                Check(
+                    "pass",
+                    f"{cc.venue}: {cc.sampled} quotable market(s) sampled live -- "
+                    "fee.taker_rate parsed on each, and one get_book() call "
+                    "returned a two-sided book. Separately, across the full "
+                    f"{cc.listed}-market listing (not just the sample above): "
+                    f"{cc.two_sided}/{cc.listed} ({two_sided_pct:.0%}) parse a "
+                    f"two-sided quotable_spread() (floor {_MIN_TWO_SIDED_FRACTION:.0%}) "
+                    f"and {cc.volume_positive}/{cc.listed} ({volume_pct:.0%}) parse "
+                    f"venue_volume() > 0 (floor {_MIN_VOLUME_POSITIVE_FRACTION:.0%}).",
+                )
+            )
+    return CheckGroup(
+        "Collection field-name/reality check (--check-collection, PLAN.md D8)", checks
+    )
+
+
 def build_report(
     settings_obj: Settings,
     *,
@@ -743,6 +844,7 @@ def build_report(
     expected_head_revision: str | None,
     env: Mapping[str, str],
     venue_checks: Sequence[VenueCheck] | None = None,
+    collection_checks: Sequence[CollectionCheck] | None = None,
 ) -> PreflightReport:
     """Assemble the full report from already-resolved inputs.
 
@@ -765,6 +867,11 @@ def build_report(
             revision, or `None` if it could not be determined.
         env: The environment mapping to scan for inert-setting
             patterns -- the real CLI passes `os.environ`.
+        venue_checks: Pre-computed `--check-venues` reachability results,
+            or `None` (default) to leave that group out entirely.
+        collection_checks: Pre-computed `--check-collection` field-name/
+            reality results (mm-proveout T9), or `None` (default) to
+            leave that group out entirely.
 
     Returns:
         PreflightReport: Every group, plus the fixed `NOT_CHECKED` list.
@@ -777,18 +884,23 @@ def build_report(
         _inert_settings_group(settings_obj, env),
     ]
     not_checked = list(NOT_CHECKED)
+    venue_contacted = venue_checks is not None or collection_checks is not None
     if venue_checks is not None:
         groups.append(_venue_group(venue_checks))
-        # Reachability WAS checked, so that line would now be false. The
-        # credential-validity line stays: a public probe sends no key.
+    if collection_checks is not None:
+        groups.append(_collection_group(collection_checks))
+    if venue_contacted:
+        # Reachability WAS checked (by one probe or the other, or both),
+        # so that blanket line would now be false. The credential-
+        # validity line stays: neither probe sends a key.
         not_checked = [
             item for item in not_checked if not item.startswith("Venue connectivity")
         ]
         not_checked.insert(
             0,
-            "Venue AUTHENTICATION -- the probe above is a public endpoint and sends "
-            "no credential, so a reachable venue still says nothing about whether "
-            "your API key is accepted.",
+            "Venue AUTHENTICATION -- the probe(s) above are public endpoints and "
+            "send no credential, so a reachable venue still says nothing about "
+            "whether your API key is accepted.",
         )
     return PreflightReport(groups=groups, not_checked=not_checked)
 
@@ -964,6 +1076,219 @@ def default_check_venues(settings_obj: Settings, timeout_s: float = 8.0) -> list
     return checks
 
 
+#: Minimum share of a venue's FULL open-market listing (`markets` --
+#: never `two_sided` or `quotable`, both of which are already filtered
+#: by this exact predicate) that must have a readable two-sided spread
+#: (`quotable_spread(m) is not None`) for `--check-collection` to call
+#: the spread field names healthy (mm-proveout T9 retry).
+#:
+#: Measured LIVE 2026-09-07 against both real venues
+#: (`get_market_data_adapters`, read-only `list_markets(status="open")`):
+#: Kalshi 61,347/98,817 = 62.1% two-sided, Polymarket 1,654/1,918 = 86.2%
+#: (matches the same-day 62.8%/86.3% snapshot recorded in this kit's
+#: NOTES.md from a slightly earlier listing -- venue listings drift
+#: minute to minute, which is itself why this floor needs margin rather
+#: than an exact pin). `0.20` sits more than 3x below the TIGHTER
+#: venue's measured rate -- room for a quiet session on either venue --
+#: while a renamed `yes_bid_dollars`/`yes_ask_dollars`/`bestBid`/
+#: `bestAsk` key collapses the fraction to EXACTLY `0.0` (every market
+#: loses both keys simultaneously; `quotable_spread` returns `None`
+#: whenever either key is absent), tripping this floor unconditionally.
+_MIN_TWO_SIDED_FRACTION = 0.20
+
+#: Minimum share of a venue's FULL open-market listing with
+#: `venue_volume(m) > 0` -- i.e. `_VOLUME_KEYS` parses to a positive
+#: number at all, independent of `book_collection_min_volume`'s 100.0
+#: ranking floor. Measured LIVE 2026-09-07 (same probe as above):
+#: Polymarket 1,874/1,918 = 97.7%, but Kalshi only 16,582/98,817 = 16.8%
+#: -- Kalshi's open listing carries thousands of freshly-created markets
+#: whose `volume_fp` genuinely, correctly parses to `"0.00"` (a true
+#: zero, not a broken field). `0.05` sits below EVEN Kalshi's measured
+#: rate with more than 3x margin, while a renamed `volume_fp`/
+#: `volume_24h_fp`/`volume24hr`/`volume`/`volumeNum` still collapses the
+#: fraction to `0.0` (nothing parses at all, which is a different result
+#: from parsing to a true zero) and trips this floor unconditionally.
+_MIN_VOLUME_POSITIVE_FRACTION = 0.05
+
+
+async def check_collection_for_venue(
+    venue: VenueId, adapter: MarketDataAdapter, *, sample_n: int = 5
+) -> CollectionCheck:
+    """Verify the exact fields `DataCollector.collect_books`
+    (mm-proveout T7/T8) depends on parse successfully against TODAY's
+    LIVE payload (PLAN.md D8) -- not merely a fixture that once agreed
+    with the code. Takes `adapter` as a parameter (rather than
+    constructing one itself) so a test can inject a `FixtureAdapter` and
+    exercise this exact logic with no network at all; `default_check_
+    collection` below is the only real, network-touching caller.
+
+    THE FIX THIS FUNCTION IS ON ITS SECOND VERSION OF (mm-proveout T9
+    retry). The first version sampled `select_quotable_markets(markets)`'s
+    `quotable` set and asserted, per sampled market, `quotable_spread(m)
+    is not None` and `venue_volume(m) > 0`. Both assertions were
+    UNCONDITIONALLY UNREACHABLE: `quotable` is a subset of `two_sided`
+    (itself defined as "`quotable_spread` did not reject"), and
+    `quotable` additionally requires `venue_volume(m) >=
+    settings.book_collection_min_volume` (100.0 by default) before a
+    market is even eligible -- so both predicates were already
+    guaranteed true, by construction, of every element of `quotable`,
+    on the SAME immutable `market.raw` the check re-read. Proven
+    directly in `tests/scripts/test_preflight_collection.py::
+    test_the_spread_and_volume_field_checks_can_never_fail_given_how_
+    sample_is_selected`, which still stands (documenting the OLD
+    per-sample logic's tautology, not this function's current
+    behaviour). A total field rename still shrank `quotable` toward
+    zero and the `sampled == 0` path below still fired -- but the
+    `[PASS]` line lied about having verified two checks it had not, and
+    a PARTIAL rename (most of the listing broken, a handful of markets
+    coincidentally still parsing) produced a clean, misleading `[PASS]`
+    with `sampled > 0` and no failures, because the small `quotable`
+    sample can never contain a market the predicates themselves reject.
+
+    This version fixes that by re-deriving the spread/volume checks from
+    the FULL, UNFILTERED listing (`markets`) rather than from `quotable`:
+    a market cannot land in `markets` "because it passed" anything, so
+    the fraction that DOES parse is real evidence, not tautology.
+
+    Checks:
+      - `two_sided / listed >= _MIN_TWO_SIDED_FRACTION`: enough of the
+        FULL listing has a readable two-sided spread. The threshold is
+        a fraction, not "all" or "one" -- see `_MIN_TWO_SIDED_FRACTION`'s
+        docstring for the live measurements it is set against. A single
+        thin/crossed/one-sided market failing this on its own is
+        expected and NOT a failure; the whole venue's fraction
+        collapsing toward zero is.
+      - `volume_positive / listed >= _MIN_VOLUME_POSITIVE_FRACTION`:
+        same shape, for `venue_volume(m) > 0` (see that constant's
+        docstring -- Kalshi's real healthy rate is far lower than
+        Polymarket's, because Kalshi lists many genuinely-zero-volume
+        markets, which is why this floor is much lower than the spread
+        one).
+      - `market.fee.taker_rate` is a `float`, for each of up to
+        `sample_n` markets from `quotable` -- `FeeSchedule` construction
+        (GUARDRAILS.md §1.5) produced a real number, not `None` or a
+        non-numeric placeholder. This one IS exercisable against
+        `quotable` (unlike the two above): nothing in
+        `select_quotable_markets` filters on `fee.taker_rate`'s type, so
+        a market can be genuinely quotable while carrying an `int` rate
+        (`FeeSchedule(taker_rate=0, ...)` builds and validates cleanly --
+        `math.isfinite(0)` is `True`, `isinstance(0, float)` is `False`).
+        Confirmed by `tests/scripts/test_preflight_collection.py::
+        test_fails_when_a_quotable_markets_fee_taker_rate_is_not_a_float`.
+      - Once, on the FIRST sampled market's first outcome:
+        `adapter.get_book(...)` returns an `OrderBook` with at least one
+        bid AND one ask -- the BOOK endpoint itself (not only the
+        listing payload's inline bid/ask) still returns a two-sided
+        book. Also genuinely exercisable: the listing payload and the
+        book payload are two different venue endpoints that can disagree.
+      - `sampled == 0`: no quotable market could be found at all
+        (`quotable` empty) -- the one failure mode the OLD version could
+        already reach, kept unchanged.
+
+    A venue that cannot even be listed (`list_markets` raises) is
+    reported via `CollectionCheck.error`, never by letting the exception
+    propagate — the same "this venue's trouble does not abort the
+    other's check" shape every other opt-in probe in this file already
+    uses.
+
+    Args:
+        venue: Venue label, for the report.
+        adapter: A READ adapter (live `get_read_adapter` result, or a
+            `FixtureAdapter` in a test) — never one that can place an
+            order (GUARDRAILS.md §1.1).
+        sample_n: How many quotable markets to sample for the
+            `fee.taker_rate`/`get_book` checks.
+
+    Returns:
+        CollectionCheck: `sampled`, `failures` (one line per violation),
+            `listed`/`two_sided`/`volume_positive` for the report's
+            `[PASS]` line, or `error` set instead if the venue could not
+            be listed.
+    """
+    try:
+        markets = await adapter.list_markets(status="open")
+    except Exception as exc:  # noqa: BLE001 - report, never crash the run
+        return CollectionCheck(venue=venue, sampled=0, error=f"{type(exc).__name__}: {exc}")
+
+    two_sided, quotable, _ = select_quotable_markets(markets)
+    sample = quotable[:sample_n]
+
+    failures: list[str] = []
+    listed = len(markets)
+    n_two_sided = len(two_sided)
+    n_volume_positive = sum(1 for m in markets if venue_volume(m) > 0)
+
+    if listed:
+        two_sided_fraction = n_two_sided / listed
+        if two_sided_fraction < _MIN_TWO_SIDED_FRACTION:
+            failures.append(
+                f"only {n_two_sided}/{listed} ({two_sided_fraction:.1%}) of the FULL "
+                f"listing has a readable two-sided quotable_spread(), below the "
+                f"{_MIN_TWO_SIDED_FRACTION:.0%} floor -- check app.venues.types."
+                f"_QUOTE_KEYS against today's live {venue} payload for a renamed "
+                "bid/ask field"
+            )
+        volume_fraction = n_volume_positive / listed
+        if volume_fraction < _MIN_VOLUME_POSITIVE_FRACTION:
+            failures.append(
+                f"only {n_volume_positive}/{listed} ({volume_fraction:.1%}) of the "
+                f"FULL listing has venue_volume() > 0, below the "
+                f"{_MIN_VOLUME_POSITIVE_FRACTION:.0%} floor -- check app.venues.types."
+                f"_VOLUME_KEYS against today's live {venue} payload for a renamed "
+                "volume field"
+            )
+
+    for market in sample:
+        if not isinstance(market.fee.taker_rate, float):
+            failures.append(
+                f"{market.market_id}: fee.taker_rate is {market.fee.taker_rate!r}, "
+                "not a float"
+            )
+
+    if sample:
+        first = sample[0]
+        try:
+            book = await adapter.get_book(first.market_id, first.outcomes[0])
+        except Exception as exc:  # noqa: BLE001 - report, never crash the run
+            failures.append(
+                f"{first.market_id}: get_book failed: {type(exc).__name__}: {exc}"
+            )
+        else:
+            if not (book.bids and book.asks):
+                failures.append(f"{first.market_id}: get_book returned a one-sided book")
+
+    return CollectionCheck(
+        venue=venue,
+        sampled=len(sample),
+        failures=failures,
+        listed=listed,
+        two_sided=n_two_sided,
+        volume_positive=n_volume_positive,
+    )
+
+
+def default_check_collection(sample_n: int = 5) -> list[CollectionCheck]:
+    """Probe both venues' LIVE, quotable markets. Not used by tests.
+
+    Opt-in only (`--check-collection`), same reasoning as
+    `default_check_venues`: the default report promises it contacts no
+    venue, and this one genuinely does (read-only `list_markets`/
+    `get_book` calls, never a credentialed or order-placing one —
+    `get_market_data_adapters` routes through `get_read_adapter`,
+    GUARDRAILS.md §1.1).
+    """
+    from app.api.deps import get_market_data_adapters
+
+    async def _run() -> list[CollectionCheck]:
+        adapters = await get_market_data_adapters()
+        return [
+            await check_collection_for_venue(venue, adapter, sample_n=sample_n)
+            for venue, adapter in adapters.items()
+        ]
+
+    return asyncio.run(_run())
+
+
 def main() -> int:
     """Real CLI entry point: checks the process-wide `Settings`.
 
@@ -972,10 +1297,18 @@ def main() -> int:
     venue at all, and even with it the report still says authentication
     was not checked — the probe sends no credential.
 
+    `--check-collection` (mm-proveout T9, PLAN.md D8) additionally
+    samples up to 5 quotable markets per venue LIVE and verifies the
+    exact fields `DataCollector.collect_books` depends on still parse —
+    the fixture-versus-reality guard meant to run before a collection
+    run starts, catching a venue that renamed a field before the beat
+    silently writes nothing for weeks.
+
     Returns:
         int: The process exit code (`PreflightReport.exit_code`).
     """
     check_venues = "--check-venues" in sys.argv[1:]
+    check_collection = "--check-collection" in sys.argv[1:]
     try:
         settings_obj = get_settings()
     except Exception as exc:
@@ -1010,6 +1343,7 @@ def main() -> int:
         expected_head_revision=expected_head,
         env=os.environ,
         venue_checks=default_check_venues(settings_obj) if check_venues else None,
+        collection_checks=default_check_collection() if check_collection else None,
     )
     print(report.render())
     return report.exit_code

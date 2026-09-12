@@ -8,6 +8,7 @@ from app.models.intent import IntentRecord
 from app.models.market import Market, MarketPrice
 from app.models.position import Position
 from app.models.price_history import PriceHistory
+from app.models.selection_membership import SelectionMembership
 from app.models.strategy import Strategy
 from app.models.trade import Order, Trade
 from app.models.trade_history import TradeHistory, TradeOutcome, TradeSide
@@ -29,6 +30,8 @@ __all__ = [
     # Recorded order-book depth (PLAN.md D6/D10, T21)
     "BookSnapshot",
     "BookSnapshotDepthSource",
+    # Book-collection selection membership (mm-proveout T16)
+    "SelectionMembership",
     # Backtesting models
     "PriceHistory",
     "TradeHistory",

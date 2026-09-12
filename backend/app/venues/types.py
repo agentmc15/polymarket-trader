@@ -568,6 +568,78 @@ def venue_volume(market: "VenueMarket") -> float:
     return 0.0
 
 
+#: Per-venue payload keys carrying top-of-book bid/ask, read from the
+#: LISTING payload -- never `get_book` -- so `quotable_spread` costs no
+#: extra request beyond the listing fetch every candidate already paid
+#: for (mm-proveout T7, PLAN.md D1).
+#:
+#: THESE ARE THE LIVE NAMES, same rule as `_VOLUME_KEYS` above: Kalshi's
+#: `/events` listing sends `yes_bid_dollars`/`yes_ask_dollars` as
+#: dollar-STRINGS (e.g. `"0.40"`, confirmed live 2026-09-06 --
+#: mm-proveout PLAN.md, market-edge NOTES.md); Polymarket's Gamma
+#: listing sends `bestBid`/`bestAsk`.
+_QUOTE_KEYS: dict[VenueId, tuple[str, str]] = {
+    "kalshi": ("yes_bid_dollars", "yes_ask_dollars"),
+    "polymarket": ("bestBid", "bestAsk"),
+}
+
+
+def quotable_spread(market: "VenueMarket") -> float | None:
+    """Return `ask - bid` from the listing payload, or `None` if unquotable.
+
+    mm-proveout PLAN.md D1: selecting `DataCollector.collect_books`'
+    candidates by volume alone concentrates on the TIGHTEST books --
+    measured live, the top 50 Kalshi/Polymarket markets by volume held
+    only 2 and 0 markets respectively with spread `>= 0.10`, which at
+    the time was the exact floor `MarketMaker`'s calibrated `min_spread`
+    refused to quote inside of. `MarketMaker`'s calibrated `min_spread`
+    has since moved to 0.25 (the 1-minute Kalshi holdout,
+    `app/strategies/market_making.py`); `settings.book_collection_min_spread`
+    deliberately stays at 0.10 so collection keeps gathering a superset
+    of what the strategy currently quotes. Selection by quotability
+    needs the spread BEFORE
+    ranking, and this reads it off the same listing payload
+    `venue_volume` reads volume from (`_QUOTE_KEYS` above), so checking
+    -- and rejecting -- an unquotable candidate never costs an extra
+    `get_book` call.
+
+    Returns `None` (never raises) rather than a spread when:
+      - `market.venue` has no entry in `_QUOTE_KEYS`;
+      - either side is absent from `market.raw` (one-sided or unlisted);
+      - either side does not parse to a finite float (a venue payload
+        can carry `null`, `""`, a list, or another non-numeric value);
+      - the pair is not `0 < bid < ask < 1` -- a crossed/locked book
+        (`bid >= ask`) or a value outside the open probability range is
+        not a book this policy could quote against either.
+
+    Args:
+        market: The market to check, using its listing `raw` payload.
+
+    Returns:
+        float | None: `ask - bid`, always `> 0` when not `None`.
+    """
+    keys = _QUOTE_KEYS.get(market.venue)
+    if keys is None:
+        return None
+    bid_key, ask_key = keys
+    if bid_key not in market.raw or ask_key not in market.raw:
+        return None
+    bid_raw = market.raw[bid_key]
+    ask_raw = market.raw[ask_key]
+    if isinstance(bid_raw, bool) or isinstance(ask_raw, bool):
+        return None
+    try:
+        bid = float(bid_raw)  # type: ignore[arg-type]
+        ask = float(ask_raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(bid) and math.isfinite(ask)):
+        return None
+    if not (0.0 < bid < ask < 1.0):
+        return None
+    return ask - bid
+
+
 @dataclass(frozen=True)
 class OrderRequest:
     """A normalized order to place on one venue.

@@ -22,6 +22,7 @@ celery_app = Celery(
         "app.tasks.execution",
         "app.tasks.scanner",
         "app.tasks.matching",
+        "app.tasks.collection",
     ],
 )
 
@@ -133,5 +134,55 @@ celery_app.conf.beat_schedule = {
     "propose-event-links": {
         "task": "app.tasks.matching.propose_event_links",
         "schedule": settings.link_proposal_interval_s,
+    },
+    # mm-proveout T9 (PLAN.md D2/D8/D9): `DataCollector.collect_books`
+    # (T7/T8) recorded real, full order-book depth on both venues but had
+    # NO periodic caller at all -- only the manual
+    # `python -m app.scripts.collect_prices --books` CLI loop, which
+    # nobody runs unattended for weeks. Kalshi's Gate 1 is retrospective
+    # (settled candle history); Polymarket exposes no history
+    # whatsoever (`/prices-history` carries no bid/ask/volume), so
+    # forward collection running on a clock is the ONLY path to a
+    # Polymarket verdict (T11-T13). This is that clock. Its own
+    # `settings.book_collection_interval_s` (180s by default -- see
+    # `app/config.py` for the 2026-09-07 measurement it is derived from)
+    # rather than a reuse of any scan interval above: a different candidate set
+    # (`select_quotable_markets`), a different call
+    # (`DataCollector.collect_books`, one `get_book` per outcome), and a
+    # different cost.
+    #
+    # Per-venue isolation for a write-time failure (a `VenueError`, or a
+    # plain unwrapped exception -- confirmed live by T9's red-team to
+    # otherwise blank out BOTH venues, see `DataCollector.collect_books`'s
+    # own docstring for the full defect and fix) lives inside
+    # `collect_books` itself, not here -- the same "isolate at the
+    # narrowest correct layer" shape `app.tasks.execution.reconcile_venues`
+    # already uses for reconciliation.
+    "collect-books": {
+        "task": "app.tasks.collection.collect_books",
+        "schedule": settings.book_collection_interval_s,
+    },
+    # mm-proveout T10's follow-on: `app.scripts.collection_health` (T10)
+    # already existed as a hand-run CLI (`python -m app.scripts.
+    # collection_health`) with no scheduled caller at all -- the exact
+    # gap `collect-books` above used to have before T9. This is that
+    # caller (`app.tasks.collection.run_collection_health`).
+    #
+    # Its OWN interval (`settings.collection_health_interval_s`, 1800s
+    # default), deliberately well above `book_collection_interval_s`
+    # (10x the 180.0 default) rather than the same clock: a gap or
+    # staleness pattern worth alerting on only shows up over several
+    # missed collection ticks, so checking on every collection tick
+    # would be pure overhead with nothing new to report each time. This
+    # is also NOT the per-tick collection preflight gate
+    # (`app.tasks.collection.run_collection_preflight`, run synchronously
+    # inside every `collect-books` tick) -- that gate blocks a single
+    # tick's own collection on a live field-name/DB-head check; this is
+    # a much less frequent, retrospective read over the last 24h of
+    # already-written `book_snapshots` rows, meant to catch a slower-
+    # forming gap or staleness pattern the single-tick gate cannot see.
+    "check-collection-health": {
+        "task": "app.tasks.collection.run_collection_health",
+        "schedule": settings.collection_health_interval_s,
     },
 }

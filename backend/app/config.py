@@ -619,13 +619,124 @@ class Settings(BaseSettings):
     # at all), the replayer falls back to `synthesize_book` (T07) and the
     # result is labeled `depth_source="synthetic"`/`"mixed"` accordingly.
     # `book_collection_top_n` bounds how many markets, PER VENUE,
-    # `DataCollector.collect_books` fetches a book for per call — the
-    # same "don't walk a book for every market nobody trades" rationale
-    # `scan_top_n` documents above, ranked by the identical volume proxy
-    # (`VenueMarket.raw["volume"]`, `app.services.scanner._volume`'s
-    # convention).
+    # `DataCollector.collect_books` fetches a book for per call, ranked
+    # by volume WITHIN the quotable set the two settings below define
+    # (mm-proveout T7, PLAN.md D1) -- not by volume alone. Raised from
+    # 50 to 500: at 50, volume-only ranking selected only 2 Kalshi and 0
+    # Polymarket markets with spread `>= 0.10` out of 50 (measured
+    # live), because volume concentrates on the TIGHTEST books, which is
+    # exactly what `MarketMaker`'s current `min_spread=0.25` (changed
+    # 2026-09-08 from 0.10; NOT yet certified by the kit's two-split
+    # rule -- see `app.strategies.market_making`'s module docstring)
+    # also refuses to quote. 500 gives the filtered, quotable set room
+    # to fill before the volume cut binds.
+    #
+    # MUST BE `> 0` (mm-proveout T7 retry, `_reject_non_positive_top_n`
+    # below enforces this at construction). `select_quotable_markets`
+    # (`app.services.data_collector`) uses this value as a slice stop:
+    # `sorted(quotable, ...)[:book_collection_top_n]`. Python slice
+    # stops have no "invalid count" for a negative integer -- it is a
+    # legal index counted from the END of the list -- so an operator
+    # typo of `-500` for `500` does not fail loudly. It silently
+    # reinterprets the cap as "drop the last |N| quotable markets" (or,
+    # once `|N| >= len(quotable)`, drops ALL of them), while
+    # `app.scripts.probe_quotable`'s health check keyed only on
+    # `quotable == 0` -- a count taken BEFORE this cap is applied -- so
+    # it printed a healthy-looking `quotable=5 selected=0` and exited 0.
+    # Phase 2 of this kit exists to run collection unattended for weeks;
+    # this was that exact blackout, one config typo away and invisible
+    # to every health signal. `0` is refused for a simpler reason with
+    # no negative-slice trick involved: there is no steady state in
+    # which "collect the top 0 markets, forever" is intended, so it is
+    # refused at startup rather than discovered several weeks later as
+    # an empty `BookSnapshot` table.
+    #
+    # `book_collection_min_spread`/`book_collection_min_volume`: the
+    # quotability floor applied BEFORE the top-N-by-volume cut above. A
+    # candidate must be two-sided (`app.venues.types.quotable_spread`,
+    # read from the LISTING payload -- Kalshi `yes_bid_dollars`/
+    # `yes_ask_dollars`, Polymarket `bestBid`/`bestAsk` -- never an extra
+    # `get_book` call) with `ask - bid >= book_collection_min_spread`
+    # AND `venue_volume >= book_collection_min_volume` to be considered
+    # at all. `min_spread` is 0.10 -- `MarketMaker`'s ORIGINAL calibrated
+    # `min_spread` (`app/strategies/market_making.py`), not its current
+    # one (0.25 as of 2026-09-08, the 1-minute Kalshi holdout). This is
+    # deliberate, not stale: collection is meant to gather a SUPERSET of
+    # what the strategy currently quotes, so a future recalibration that
+    # moves `MarketMaker`'s default again still has data to work with.
+    # Narrowing this to 0.25 would discard exactly the 0.10-0.25 band a
+    # later calibration might need. `min_volume` is a floor against a
+    # market that is two-sided purely because nobody has traded it, not
+    # because it is liquid.
+    #
+    # NEITHER carries `book_collection_top_n`'s negative-slice hazard
+    # and neither gets the same hard construction-time bound (checked
+    # for mm-proveout T7 retry, deliberately not applied): both are
+    # plain `>=` comparisons against `quotable_spread`/`venue_volume`,
+    # never a slice index, so a negative value only WEAKENS the filter
+    # (it is `>= a smaller-than-intended floor`, i.e. more permissive,
+    # never a silent reinterpretation to "select fewer" or "select from
+    # the end"). An extreme value that DOES zero out the result (e.g.
+    # `min_spread=5.0`, impossible since `quotable_spread` is always
+    # `< 1`) shows up as `quotable == 0`, which
+    # `app.scripts.probe_quotable` already fails loudly on -- unlike
+    # `top_n`, which acts strictly AFTER `quotable` is counted and so
+    # was invisible to that same check. Adding a matching hard bound
+    # here would be a redundant guard against a hazard that does not
+    # exist for these two fields.
     book_match_window_s: float = Field(default=120.0, alias="BOOK_MATCH_WINDOW_S")
-    book_collection_top_n: int = Field(default=50, alias="BOOK_COLLECTION_TOP_N")
+    book_collection_top_n: int = Field(default=500, alias="BOOK_COLLECTION_TOP_N")
+    book_collection_min_spread: float = Field(
+        default=0.10, alias="BOOK_COLLECTION_MIN_SPREAD"
+    )
+    book_collection_min_volume: float = Field(
+        default=100.0, alias="BOOK_COLLECTION_MIN_VOLUME"
+    )
+
+    # `book_collection_interval_s` is the Celery beat period for
+    # `app.tasks.collection.collect_books` (mm-proveout T9), the
+    # production caller `DataCollector.collect_books`/
+    # `select_quotable_markets` (T7/T8) never had outside the manual
+    # `python -m app.scripts.collect_prices --books` CLI loop. Polymarket
+    # cannot be backtested retrospectively (PLAN.md: `/prices-history`
+    # carries no bid/ask/volume) -- forward collection running
+    # unattended for weeks is the ONLY path to a Polymarket verdict
+    # (T11-T13), so this beat is what makes that clock start.
+    #
+    # Measured 2026-09-07: a full Kalshi candidate pass is ~110-125s (the
+    # listing walk is ~10-15s, but `get_book` is called once per outcome
+    # and Kalshi markets always carry `("YES","NO")`, so 500 selected
+    # markets cost ~1,000 paced calls at ~0.1s each). The prior 60.0
+    # default (matching `app.scripts.collect_prices --interval`'s own
+    # default) was an unmeasured assumption and is roughly HALF the
+    # measured worst case, i.e. a pass would still be running when the
+    # next beat tick fired. Raised to 180.0: 125s (worst measured) plus
+    # ~55s (~44%) margin for pacing/listing-walk variance, so a pass
+    # finishes with real headroom before the next tick rather than
+    # overlapping it. A THIRD standalone interval setting rather than a
+    # reuse of `scan_interval_s`/`near_resolution_scan_interval_s` above,
+    # for the same reason those two are not aliases of each other: this
+    # beat reads a different candidate set (quotable markets,
+    # `select_quotable_markets`) through a different call
+    # (`DataCollector.collect_books`, one `get_book` per outcome) at a
+    # different cost, and coupling its schedule to an unrelated pass's
+    # tuning would move both whenever only one needed to change.
+    book_collection_interval_s: float = Field(
+        default=180.0, alias="BOOK_COLLECTION_INTERVAL_S"
+    )
+
+    # Celery beat period for `app.tasks.collection.run_collection_health`
+    # (mm-proveout T9's follow-on: `app.scripts.collection_health` gets a
+    # scheduled caller of its own, not just the manual CLI it already
+    # has). Deliberately well above `book_collection_interval_s` (10x
+    # the 180.0 default): a gap or staleness pattern worth alerting on
+    # only shows up over several missed collection ticks, so checking on
+    # every tick would be pure overhead with nothing new to report; 30
+    # minutes still catches a sustained failure well within the hour
+    # instead of leaving it undetected for a full day.
+    collection_health_interval_s: float = Field(
+        default=1800.0, alias="COLLECTION_HEALTH_INTERVAL_S"
+    )
 
     @classmethod
     def settings_customise_sources(
@@ -737,6 +848,60 @@ class Settings(BaseSettings):
                 "rather than the InsufficientCapital the order router handles"
             )
         return normalized
+
+    @field_validator("book_collection_top_n")
+    @classmethod
+    def _reject_non_positive_top_n(cls, value: int) -> int:
+        """Refuse `book_collection_top_n <= 0` at construction (mm-proveout T7 retry).
+
+        `app.services.data_collector.select_quotable_markets` uses this
+        value as a slice stop: `sorted(quotable, ...)[:top_n]`. Python
+        has no "invalid count" error for a negative slice stop -- it is
+        a legal index counted from the END of the sequence -- so a
+        negative value does not fail loudly, it silently reinterprets
+        the cap. Measured directly against the real function with five
+        quotable markets on each of two venues:
+
+            top_n=  500 -> selected=['m5','m4','m3','m2','m1']  (all 5, capped high)
+            top_n=    2 -> selected=['m5','m4']                  (capped, expected)
+            top_n=    0 -> selected=[]                           (see below)
+            top_n=   -1 -> selected=['m5','m4','m3','m2']        (drops the LAST market)
+            top_n=  -10 -> selected=[]                           (collects NOTHING)
+
+        And `app.scripts.probe_quotable`'s exit code could not see it:
+        it keyed on `quotable == 0`, a count taken BEFORE this cap is
+        applied, so `top_n=-10` printed a healthy `quotable=5
+        selected=0` for both venues and exited `0` anyway. Phase 2 of
+        this kit runs collection unattended for weeks -- an indefinite,
+        every-health-signal-green blackout one config typo away is
+        exactly the failure mode that phase exists to avoid, so the
+        value is rejected here instead of reinterpreted at slice time.
+
+        `0` is refused too, for an unrelated, simpler reason -- it
+        never hits the negative-slice trick above, it just always
+        collects nothing. There is no steady state in which "collect
+        the top 0 markets, forever" is an intended configuration, so
+        refusing it at startup turns a silent no-op into an immediate,
+        loud error instead of a several-week-old empty `BookSnapshot`
+        table.
+
+        Args:
+            value: The raw `BOOK_COLLECTION_TOP_N` value.
+
+        Returns:
+            int: `value`, unchanged, when `> 0`.
+
+        Raises:
+            ValueError: If `value <= 0`.
+        """
+        if value <= 0:
+            raise ValueError(
+                f"book_collection_top_n must be > 0, got {value!r}. A zero cap "
+                "collects nothing; a negative cap is silently reinterpreted by "
+                "Python's slice semantics as 'drop the last |N| quotable "
+                "markets' instead of raising -- see this validator's docstring."
+            )
+        return value
 
     @property
     def kalshi_api_base_url(self) -> str:

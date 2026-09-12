@@ -214,7 +214,12 @@ async def test_collect_books_writes_rows_and_is_idempotent_on_rerun(
         venue="polymarket",
         market_id="PM-1",
         outcomes=("YES", "NO"),
-        raw={"volume": 50_000.0},
+        # T7 (PLAN.md D1): `collect_books` only fetches a book for a
+        # market `quotable_spread` (app.venues.types) can read a
+        # `>= 0.10` spread from off the LISTING payload -- bestBid/
+        # bestAsk here are independent of the YES/NO order books below
+        # (which is what the fills in this test actually walk).
+        raw={"volume": 50_000.0, "bestBid": 0.30, "bestAsk": 0.45},
     )
     yes_book = make_book(
         bids=[(0.44, 100.0)], asks=[(0.46, 100.0)], market_id="PM-1", outcome="YES"

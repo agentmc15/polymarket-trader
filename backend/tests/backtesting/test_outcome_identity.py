@@ -497,7 +497,11 @@ async def test_defect_6_collect_books_dedupes_every_spelling_of_one_outcome(
             venue="polymarket",
             market_id="PM-1",
             outcomes=(named, binary),
-            raw={"volume": 50_000.0},
+            # T7 (PLAN.md D1): `collect_books` only fetches a book for a
+            # market `quotable_spread` can read a `>= 0.10` spread from
+            # off the LISTING payload -- independent of the per-outcome
+            # order books set below.
+            raw={"volume": 50_000.0, "bestBid": 0.30, "bestAsk": 0.45},
         )
         adapter = (
             FixtureAdapter("polymarket")

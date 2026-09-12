@@ -69,6 +69,142 @@ check-then-insert (query the natural key, skip if present) rather than a
 database-native `ON CONFLICT` clause, so the same code path is correct
 on SQLite (tests) and Postgres (production) without a dialect branch —
 see that method's docstring for why.
+
+`volume`/`taker_fee_rate`/`maker_rebate_rate` (mm-proveout T8, PLAN.md
+D9, migration `008`) exist because a book alone cannot answer "was
+anything happening here" or "what did crossing this cost, right then":
+
+- `volume`: `app.venues.types.venue_volume(market)` on the LISTING
+  payload at collection time. Kalshi's `PriceHistory` volume series is
+  Polymarket-only (`DataCollector.collect_price_snapshot` never writes a
+  Kalshi row), so the delta between two consecutive snapshots' `volume`
+  is the ONLY activity signal a Kalshi `BookSnapshot` can carry — the
+  same role `app.venues.kalshi.candles.Candle.volume` plays for the
+  retrospective replay, needed here for the optimistic fill model
+  (`app.scripts.mm_replay_snapshots`, T11).
+- `taker_fee_rate`/`maker_rebate_rate`: `market.fee.taker_rate`/
+  `market.fee.maker_rebate_rate` — `app.venues.types.FeeSchedule`,
+  GUARDRAILS.md §1.5's one sanctioned source of a fee. Polymarket's
+  per-market `feeSchedule` changes over time
+  (`source="venue_schedule"`), so the fee IN FORCE has to travel with
+  the row rather than being re-looked-up later against whatever the
+  schedule has since become. `maker_rebate_rate` is data only:
+  GUARDRAILS.md §2.3/D6 still forbid `FeeModel.fee()` from ever
+  crediting it, and nothing here changes that.
+
+"THE FEE IN FORCE" MEANS THE LATEST OBSERVED FEE FOR THIS ROW'S `ts`,
+NOT THE FIRST ONE (T8 red-team retry): `ts` is the BOOK's own identity
+(when it last moved), not a guarantee that the market's volume or fee
+schedule was unchanged since the row was first written.
+`DataCollector._upsert_book_snapshot` refreshes `volume`/
+`taker_fee_rate`/`maker_rebate_rate` in place whenever a later
+`collect_books` poll reports the SAME `(venue, market_id, outcome, ts)`
+but a DIFFERENT `venue_volume`/`market.fee` — which happens on
+Polymarket specifically because `OrderBook.ts` is the time the book
+last moved, not poll time, so a quiet market can report the identical
+`ts` for many polls while its `feeSchedule` changes underneath. A row's
+`taker_fee_rate` therefore means "the taker rate as of the most recent
+poll that observed this book", and a reader (`mm_replay_snapshots`,
+T11) computing P&L from it is using the latest known rate for that
+quote, never a value frozen at first sight. `bids`/`asks`/`tick_size`/
+`min_size` are NOT refreshed this way: an unchanged `ts` means the book
+itself has not moved (if it had, `ts` would differ and a new row would
+be written), so there is never new depth to write in place.
+
+All three are NULLABLE with no backfill (migration `008`): every row
+collected before this migration has no venue call this migration could
+make to reconstruct a historical volume or fee schedule, so `NULL` here
+means "collected before T8", never `0.0` — a reader (`mm_replay_snapshots`)
+must treat it as missing, not as a zero rate or zero volume.
+
+`volume_lifetime`/`observed_at`/`fee_source`/`maker_fee_rate` (mm-proveout
+T15, migration `008` -- same migration as the three columns above, because
+it has not been applied to any database and this is the only window in
+which adding a column is free) exist because the Phase 2 review found
+three of the above four IRREVERSIBLE the moment collection starts -- all
+three are missing columns, and a column cannot be added to data already
+collected without one:
+
+- `volume_lifetime`: `venue_volume(market)` is not a between-snapshot
+  delta signal. It tries the 24-HOUR fields first (`volume_24h_fp`,
+  `volume24hr`) because it is written for RANKING -- correct for that,
+  wrong here. Measured live 2026-09-07: Kalshi's `volume_24h_fp` did not
+  move for a single one of 6,058 actively-traded markets over 245
+  seconds (it is a periodically recomputed aggregate, not a live
+  counter), while lifetime `volume_fp` moved for 25 of the same 6,058.
+  `passive_fill.py:142` returns no fills at all when `volume <= 0.0`, and
+  `:97` raises on a negative -- gating BOTH fill models -- so a volume
+  channel that never moves silently replays to zero fills forever. This
+  column carries the LIFETIME counter instead (Kalshi `volume_fp`,
+  Polymarket `volumeNum`), read by
+  `app.services.data_collector._raw_lifetime_volume`.
+
+  NOT SIMPLY THE LIFETIME KEY, UNGUARDED: Gamma's (Polymarket's) lifetime
+  `volumeNum` was measured DECREASING for 29 of 255 markets over ~28
+  minutes -- a lifetime counter can still be restated. A decrease is
+  therefore stored as `None`, never the smaller value and never clamped
+  to `0.0`: `0.0` would assert "nothing traded" (a claim `passive_fill.py`
+  treats as a hard gate) and a negative would raise inside `TradeRange`.
+  `None` is the only value that means "unknown, because the counter moved
+  backwards." See `app.services.data_collector._monotonic_lifetime_volume`
+  for the guard -- it compares only against the immediately preceding
+  known value for this `(venue, market_id, outcome)`, not the deepest
+  historical one, so one restatement resets the baseline rather than
+  permanently vetoing every later, legitimately smaller-than-ancient
+  reading.
+
+- `observed_at`: the poll's own wall-clock time (`app.utils.time.utcnow()`),
+  NOT `ts` -- `ts` is the book's own identity (when it last moved), and
+  Polymarket's same-`ts` refresh path (see "THE FEE IN FORCE" above) means
+  a row's `ts` can be far older than the moment it was last confirmed
+  alive. Without this column, "the book has been quiet" and "the
+  collector died" are permanently indistinguishable
+  (`_GAP_SEMANTICS["polymarket"]` says so explicitly). Written on EVERY
+  insert AND EVERY refresh -- not only when `volume`/fee actually changed
+  -- because its job is to answer "when did we last confirm this row is
+  still current", which a content-gated write cannot answer for a market
+  that is genuinely unchanged for many polls in a row.
+
+  THE SHIFT THIS COLUMN LETS T11 CORRECT FOR: a same-`ts` refresh
+  overwrites `volume`/`taker_fee_rate`/`maker_rebate_rate`/
+  `volume_lifetime` in place, so those columns on a refreshed row hold the
+  values as of the LAST poll that saw this `ts` -- a moment close to the
+  NEXT distinct snapshot's `ts`, not this one's. The volume channel is
+  therefore shifted forward by roughly one collection dwell and partly
+  measures activity AFTER this row's own mark (adjacent to a look-ahead,
+  GUARDRAILS.md §4.3). A reader comparing `observed_at` to the next row's
+  `ts` can detect and bound this shift; a reader with only `ts` cannot.
+
+- `fee_source`: mirrors `market.fee.source` (`FeeSchedule.source`) -- the
+  SAME field `taker_fee_rate`/`maker_rebate_rate` above already read from
+  `market.fee`, just not previously carried. `_published_fee_schedule`
+  (Polymarket) returns `None` for a payload it cannot honour and the
+  caller falls back to `category_fee_schedule` -- a table its own
+  docstring records as wrong on 82% of 1,918 live Polymarket markets.
+  Preflight cannot catch that fallback: its check is
+  `isinstance(market.fee.taker_rate, float)`, and a wrong default is a
+  perfectly good float. Without `fee_source`, a silent fallback is
+  undetectable both live and after the fact; with it, a reader (T12) can
+  tell "the venue's own published rate" (`"venue_schedule"`) from a guess
+  (`"category_table"`/`"settings_default"`) and label the rebate line's
+  provenance accordingly.
+- `maker_fee_rate`: `market.fee.maker_rate` -- the other rate on the same
+  `FeeSchedule` `taker_fee_rate` already reads. D9 says "the fee in
+  force"; for a PASSIVE quoter (this whole kit) the maker rate, not the
+  taker rate, is the one actually paid on every resting fill, and only
+  the taker rate was stored before this column existed. Kalshi's is
+  `settings.kalshi_maker_fee_rate` (0.0175, confirmed against Kalshi's
+  published schedule) as read through `market.fee` -- never a literal in
+  `data_collector.py` (GUARDRAILS.md §1.5); Polymarket's is `0.0` for the
+  same reason `taker_fee_rate` can be there -- makers pay nothing on that
+  venue.
+
+All four are NULLABLE with no backfill, same reasoning as the three
+above: no venue call run offline can reconstruct a historical lifetime
+counter, poll time, fee source or maker rate for a row already observed.
+`NULL` here means "collected before T15" (or, for `volume_lifetime`
+specifically, "the counter went backwards on this poll") -- never `0.0`,
+never a negative.
 """
 from datetime import datetime
 from typing import Literal
@@ -123,6 +259,43 @@ class BookSnapshot(Base):
         depth_source: See `BookSnapshotDepthSource` and the module
             docstring's "WHY `depth_source` EXISTS" section. Every row
             `collect_books` writes sets this to `"recorded"`.
+        volume: The listing's `venue_volume` as of the MOST RECENT
+            `collect_books` poll that observed this row's `ts`, or
+            `None` for a row collected before migration `008`. Refreshed
+            in place on a later poll of the same `ts` if it changed —
+            see the module docstring's "THE FEE IN FORCE" section.
+        taker_fee_rate: `market.fee.taker_rate` as of the most recent
+            poll of this row's `ts`, or `None` for a row collected
+            before migration `008`. Refreshed in place, same as
+            `volume`.
+        maker_rebate_rate: `market.fee.maker_rebate_rate` as of the most
+            recent poll of this row's `ts`, or `None` for a row
+            collected before migration `008`. Refreshed in place, same
+            as `volume`. Data only — never credited by `FeeModel.fee()`
+            (GUARDRAILS.md §2.3/D6).
+        volume_lifetime: The venue's LIFETIME volume counter (Kalshi
+            `volume_fp`, Polymarket `volumeNum`) as of the most recent
+            poll, monotonicity-guarded — `None` if that counter decreased
+            since the last known reading (a restatement, not a real
+            decrease) as well as for a row collected before migration
+            `008`. Never `0.0` for "no volume" and never negative. See
+            the module docstring's `volume_lifetime` section and
+            `app.services.data_collector._monotonic_lifetime_volume`.
+        observed_at: The poll's own wall-clock time
+            (`app.utils.time.utcnow()`), `None` only for a row collected
+            before migration `008`. Written on every insert AND every
+            refresh, regardless of whether any other column changed —
+            see the module docstring's `observed_at` section for why a
+            large `observed_at - ts` gap is meaningful, not an error.
+        fee_source: `market.fee.source` as of the most recent poll of
+            this row's `ts` (e.g. `"venue_schedule"`, `"category_table"`,
+            `"settings"`, `"fee_waiver"`), or `None` for a row collected
+            before migration `008`. Refreshed in place, same as `volume`.
+        maker_fee_rate: `market.fee.maker_rate` as of the most recent
+            poll of this row's `ts`, or `None` for a row collected before
+            migration `008`. Refreshed in place, same as `volume`. The
+            fee in force for a PASSIVE quoter (D9), as opposed to
+            `taker_fee_rate`.
     """
 
     __tablename__ = "book_snapshots"
@@ -144,6 +317,15 @@ class BookSnapshot(Base):
         server_default="recorded",
         nullable=False,
     )
+    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    taker_fee_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    maker_rebate_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volume_lifetime: Mapped[float | None] = mapped_column(Float, nullable=True)
+    observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    fee_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    maker_fee_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
