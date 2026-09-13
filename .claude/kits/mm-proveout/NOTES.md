@@ -1385,7 +1385,7 @@ Two things keep this from being a GO beyond the n_trading miss:
 
 What genuinely improved over the rejected Phase 1 holdout: dispersion. Top series is 14.4%
 of P&L here versus NCAAF's 75.3% there, across 401 series. And the power table is not
-forced: p_profit is 0.974 at a 500-market portfolio and 0.986 at 1000, not 1.0000 — the
+forced: p_profit is 0.954 at a 500-market portfolio and 0.998 at 1000 (TEST split; this line read 0.974/0.986 until a Phase 3/4 review caught them as the OVERALL sample's values, pool 990 -- the fourth instance of that error class in this kit), not 1.0000 — the
 pool is not all-positive, so the statistic can fail and did not.
 
 Note on criterion 3, recorded as an observation and NOT as a re-score: n_trading was a
@@ -1497,7 +1497,7 @@ ungated [+0.0365, +0.8615]) and ROC falls +5.10% -> +2.86%.
 `KXITFMATCH` (33 markets) and `KXITFWMATCH` (25) — both ITF tennis. A gate built to be
 P&L-blind lands on precisely the set a forbidden series-naming rule would have named. The
 "densest series are strongest" structure in T20's table was two tennis series wearing a
-density costume. Confirms it: remove either and it stops clearing zero, and the optimistic
+density costume. Partly confirms it: removing KXITFWMATCH stops it clearing zero ([-0.8469, +2.7565]) but removing KXITFMATCH does NOT ([+0.1742, +3.9633]) -- 'remove either' overstates it, and the density-gate JSON's own headline says 'either one' against its own fragility rows, and the optimistic
 fill model does NOT clear zero at N>=20 ([-0.1923, +2.5620]) while pessimistic does — two fill
 models disagreeing about significance on identical rows.
 
@@ -1686,3 +1686,86 @@ TASKS.md — the file was created by T11. Provenance label only; the code is as 
 defect: T14 kind=false-independence-claim
 outcome: T14 model=opus attempts=1 result=pass review=none run=2026-09-12-3e71
 agent: T14 id=abb0ea98e1573f15e role=implementer model=opus findings=5 confirmed=5 result=accepted
+
+## Phase 3/4 review — REJECT, and it was right
+
+Final reviewer verdict on Phases 3 and 4 as a unit: **REJECT**. The substance held —
+the reviewer reproduced the entire T20 headline bit-for-bit through the committed harness
+(n_trading 919, ci [0.03651241534988742, 0.8615392781316351], window 17.18109953703704d,
+held 805, markout 0.6280957562568009) and independently confirmed `event_overlap=0` by raw
+`json.load` of both caches. Nothing was fabricated. The rejection is about the correction
+chain and one post-hoc criterion, both of which reached the verdict line.
+
+### The four findings I verified myself and fixed
+
+1. **A FOURTH instance of the kit's signature error, in shipped code.** `market_making.py`'s
+   holdout table gave the old defaults' mean as `-0.5507` — the OVERALL sample's value, pool
+   1,546 — in a row whose other three cells are test values. Test is **-0.5170**, pool 1,448.
+   Verified against the JSON. It was written in the SAME editing pass that corrected the
+   sibling power-table instance eight lines above. Fixed.
+2. **A post-hoc criterion in the verdict line.** `TASKS.md` T20 pre-committed FOUR criteria;
+   `NOTES.md` says "Four criteria were fixed in advance... THREE of four met".
+   `go-no-go.md` listed FIVE, adding "the CI clears zero" as condition 1 — while citing the
+   passage that says four — and carried "criterion 4 of 5 FAILED" into the VERDICT line. The
+   added condition is the one that PASSED, and it is an outcome rather than a precondition.
+   3-of-4 became 4-of-5 in the most-read line in the kit. Fixed at all three sites.
+3. **The same error class misfiled as bootstrap noise, inside the newest report.**
+   `go-no-go.md` reported the +$89.21/0.986/0.974 figures as a NOTES-vs-JSON conflict and
+   concluded "most likely bootstrap re-runs". They are exactly the OVERALL power table.
+   Calling it reproducibility noise disarms the next reader. Fixed, and the citation
+   corrected (`:1388` is the residue, `:1393` holds the correct test values).
+4. **$959 attributed to the wrong gate.** go-no-go said N>=1 ties "$959 of collateral"; N>=1
+   is **$6,941.21** and $958.75 is N>=20's — wrong by 7x about the gate it names. Fixed.
+
+Also fixed: both surviving "settlement-independent `markout_pnl`" claims in go-no-go (the
+correction had been made in three other files but never here), and the density-gate claim
+that removing "either one" of the two ITF series breaks the N>=20 interval — removing
+`KXITFWMATCH` does ([-0.8469, +2.7565]), removing `KXITFMATCH` does NOT
+([+0.1742, +3.9633], lower bound above zero). The JSON's own `strict_gate_fragility` rows
+contradict its own headline.
+
+### The finding that most changes what the headline is worth
+
+The reviewer measured the BOOTSTRAP's own Monte-Carlo error, which no report had stated. I
+reproduced it independently on the same 919 rows through the committed harness:
+
+    replicates   mean lower bound     sd      min       max      seeds with low <= 0
+    500 (shipped)     +0.0359       0.0221   -0.0150   +0.0885        2 of 40
+    5,000             +0.0414       0.0085   +0.0227   +0.0553        0 of 40
+    50,000            +0.0396       0.0028   +0.0363   +0.0428        0 of 5
+
+The shipped seed reproduces `[0.03651241534988742, 0.8615392781316351]` exactly. But at
+`BOOTSTRAP_REPLICATES = 500`, **"the CI clears zero" flips on ~5% of bootstrap seeds.** The
+headline is quoted to four decimals with an MC sd of 0.022 — a precision two orders of
+magnitude finer than the statistic supports. Raising replicates converges the bound upward
+to roughly +0.040 and away from zero, so the substantive answer HOLDS and +0.0365 is an
+unlucky draw on the right side of it. Recorded in `market_making.py` too.
+
+This also retires §8's "reproducibility, measured rather than asserted" claim: `_block`
+calls `random.seed(seed)` immediately before each `cluster_bootstrap`, so four identical
+runs of a seeded pipeline could not have come out otherwise. That was a determinism check
+wearing a reproducibility label — an eighth "check that cannot fail".
+
+### Accepted and NOT fixed, recorded instead
+
+- **The multiplicity count of 33 is an UNDERCOUNT** (~45 raw / ~28 distinct): 12
+  leave-one-out and cumulative-removal CIs against this split where the JSON allots 8, 8
+  optimistic-fill gated CIs enumerated nowhere, and 5 counted "evaluations" that admit zero
+  markets and produce no interval. It errs AGAINST the author's own interest — it understates
+  the warning — so the conclusion it supports only gets stronger. Left as-is with this note
+  rather than rewritten, because re-deriving it needs the generator that does not exist.
+- **"P&L-blind" is blind to DOLLARS only.** T22's primary density window is the scored split,
+  which the JSON itself concedes is "CONTEMPORANEOUS, not causal". Density counts TRADING
+  markets — an output of the simulation being scored. The causal variant is empty (0 markets
+  at N>=20), so the two-ITF-series finding exists only under test-window density. The JSON
+  says this; go-no-go's unqualified "P&L-blind" does not.
+- **T22 is unreproducible.** Its generator script was never committed — no
+  `choosing_N_on_train` code exists anywhere in the repo — so a 145 KB artifact carrying ~45
+  bootstrap CIs cannot be re-derived or audited. T20 has the same gap but discloses it;
+  T22 does not. T22's verify command (`assert 'provenance' in d`) asserts a file the task
+  wrote contains a key the task wrote, and touches none of its acceptance criteria: a ninth
+  check that cannot fail.
+
+reviewer: P3-P4 model=opus findings=19 confirmed=19 result=accepted
+defect: T22 kind=tautological-verify
+defect: T13 kind=post-hoc-criterion

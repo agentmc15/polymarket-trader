@@ -24,14 +24,26 @@ line and is in no P&L figure. Per §2.4 every interval is clustered by event.
 policy makes money on either venue — evidence strong enough that the next step
 is a decision about real capital rather than a decision about more measurement?**
 
-The kit's own pre-committed bar, fixed before any of the results below were seen
-(`kalshi-honest-holdout.md` §6, `NOTES.md:1357-1367`), is five conditions:
+The kit's own pre-committed bar, fixed before any of the results below were
+seen, is **FOUR** conditions. `TASKS.md` T20 states them verbatim -- "Four
+criteria, fixed before the run: `event_overlap=0`; test window >= 14 days;
+`n_trading >= 1000`; the two-split rule passes at 1-minute on event-disjoint
+halves" -- and `NOTES.md:1351-1365` agrees ("Four criteria were fixed in
+advance... Result: THREE of four met"):
 
-1. the candidate's pessimistic test CI clears zero;
-2. on an event-disjoint sample;
-3. over a test window of at least 14 days;
-4. at `n_trading >= 1000`;
-5. and the two-split tuning rule passes.
+1. an event-disjoint sample (`event_overlap=0`);
+2. a test window of at least 14 days;
+3. `n_trading >= 1000`;
+4. the two-split tuning rule passes.
+
+**An earlier version of this document listed FIVE**, adding "the candidate's
+pessimistic test CI clears zero" as condition 1 while citing the passage that
+says four. That is a defect of exactly the class this kit exists to police, and
+it ran in the flattering direction twice over: the added condition is the one
+that PASSED, it is an outcome rather than a precondition (a bar you can only
+score after the run is not a bar), and it converted a 3-of-4 record into
+4-of-5 in the most-read line of the kit. The verdict is unchanged; how
+disciplined and how close it looks is not.
 
 The document answers that question per venue, states the residual risk paper
 cannot retire, and says what would change each verdict.
@@ -179,7 +191,9 @@ earned $22–28 on three to five fills, which is inventory carried into a
 favourable settlement, not spread capture (`kalshi-honest-holdout.md` §4.2).
 
 The aggregate moderates that last point without retiring it, and the correction
-is on the record: on the same 919 test markets the settlement-independent
+is on the record: on the same 919 test markets the (NOT settlement-independent -- `mm_backtest.replay()` adds
+`inventory * (settle - last_mid)` to markout too, and 805 of these 919
+markets held inventory into settlement)
 `markout_pnl` mean is **+$0.6281** against the cash mean **+$0.4360**
 (`kalshi-honest-holdout.json → …pessimistic.test.mean_markout_pnl_per_trading_market`
 = 0.6280957562568009, `markout_basis=marked_at_i_plus_2`). So carrying inventory
@@ -373,7 +387,7 @@ landed on precisely the set a forbidden series-naming rule would have named
 the two-split rule head-to-head is N>=1 at 55/60, and it moves P&L by exactly
 $0.00, because a market that fills makes its own series dense enough to admit
 itself (`headline.the_one_gate_that_passes_changes_no_pnl`). Its prettier ROC
-buys a better percentage of a smaller business: $959 of collateral against $7,858
+buys a better percentage of a smaller business: $6,941 of collateral against $7,858 (the $959 figure is N>=20's, not N>=1's)
 (`capital_picture.blocks`). **T22 shipped nothing** (`NOTES.md:1535-1536`).
 
 ---
@@ -648,11 +662,19 @@ spot-check knows where to look:**
 **Two conflicts found between `NOTES.md` and the authoritative JSON. The report
 wins in both, and §3 uses the report's figures:**
 
-- Power at a 1,000-market portfolio. `NOTES.md:1393` records
+- Power at a 1,000-market portfolio. `NOTES.md:1388` records
   `5th-percentile total P&L = +$89.21, p_profit 0.986` and `p_profit 0.974` at
   500. `kalshi-honest-holdout.json → …power` gives **+$93.24 / 0.998** at 1,000
-  and **+$6.47 / 0.954** at 500. Most likely bootstrap re-runs; the JSON is the
-  artifact.
+  and **+$6.47 / 0.954** at 500.
+  **This is NOT bootstrap noise, and an earlier version of this document
+  misfiled it as "most likely bootstrap re-runs".** The three NOTES values are
+  exactly `policies.candidate.pessimistic.**overall**.power.{500,1000}` — the
+  OVERALL sample's table, pool 990 — quoted inside a section about the TEST
+  split, pool 919. It is the kit's signature defect (reading a number without
+  checking which sample produced it), not a reproducibility wobble, and calling
+  it noise disarms the next reader. The correct test figures appear five lines
+  later at `NOTES.md:1393`; `:1388` is the uncorrected residue. The JSON is the
+  artifact and §3 uses the test table.
 - Multiplicity. `NOTES.md:1511-1514` says 33 looks give 58%.
   `kalshi-density-gate.json → multiplicity.what_it_does_to_a_hairline_ci.p_at_least_one_spurious_clear_over_all_ci_looks`
   = **0.5663**. §3.3 uses 0.5663.
@@ -666,14 +688,15 @@ every figure that carries P&L. **The Polymarket line carries no `fill_model` or
 `terminal` label because it quotes no P&L, ROC or measured spread figure — none
 was ever measured on that venue.**
 
-VERDICT kalshi market-making fill_model=pessimistic terminal=settled split=temporal-test policy=shipped(0.90/0.25/50.0) window=17.18d ci95_clustered_by_event=[+0.0365,+0.8615] mean=+$0.4360/mkt roc=+5.10% n_trading=919 n_events_trading=789 vs_precommitted_floor=1000 (criterion 4 of 5 FAILED; CI fails on removal of any one of three series; 39.95% of P&L in five markets; 33 CI evaluations of this one split) -> NO-GO
+VERDICT kalshi market-making fill_model=pessimistic terminal=settled split=temporal-test policy=shipped(0.90/0.25/50.0) window=17.18d ci95_clustered_by_event=[+0.0365,+0.8615] mean=+$0.4360/mkt roc=+5.10% n_trading=919 n_events_trading=789 vs_precommitted_floor=1000 (criterion 3 of 4 FAILED; CI fails on removal of any one of three series; 39.95% of P&L in five markets; 33 CI evaluations of this one split) -> NO-GO
 
 VERDICT polymarket market-making no_pnl_ever_measured (zero forward snapshots; migrations 008/009 deliberately unapplied per GUARDRAILS §2) quotable_cohort=130mkt/53events at min_spread>=0.10 and 75mkt/32events at min_spread>=0.25 (2026-09-12) needs 1000 more trading markets to reach this kit's own power floor, time_to_power ~2.4yr at 0.10 / ~4.2yr at 0.25 under the optimistic scenario -> UNDERPOWERED
 
 Read literally:
 
 - **Kalshi is a NO-GO by the kit's own pre-committed rule**, and not by a close
-  call about it. Four of five conditions were met; the fifth, `n_trading >= 1000`,
+  call about it. THREE of the four pre-committed conditions were met; the fourth,
+  `n_trading >= 1000`,
   was missed at 919, and the condition that *was* met — the CI clearing zero — is
   itself fragile to three independent single-series removals. The kit declined to
   collect the ~2,000 additional markets that would very likely have made `n`
@@ -720,7 +743,9 @@ on it adds to that count. A verdict that changes on the *same* split is worth le
 than the count implies; a verdict on a *new* split starts the count at one.
 
 **The mechanism question, which `markout_pnl` can discriminate.** If the edge is
-settlement luck rather than spread capture, the settlement-independent
+settlement luck rather than spread capture, the (NOT settlement-independent -- `mm_backtest.replay()` adds
+`inventory * (settle - last_mid)` to markout too, and 805 of these 919
+markets held inventory into settlement)
 `markout_pnl` is the statistic that separates them (`NOTES.md:1435-1439`). On the
 test split it currently reads **+$0.6281/market against cash's +$0.4360**
 (`fill_model=pessimistic`, `markout_basis=marked_at_i_plus_2`), which is the

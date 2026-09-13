@@ -86,8 +86,27 @@ cache files directly rather than through the harness's own exclusion
 filter, because a filter is not evidence about itself.
 
     policy                       test CI (pessimistic)   mean/mkt   n_trading   ROC
-    old (0.80/0.10/20.0)         [-0.7607, -0.2473]       -0.5507     1,448     -6.20%
+    old (0.80/0.10/20.0)         [-0.7607, -0.2473]       -0.5170     1,448     -6.20%
     shipped (0.90/0.25/50.0)     [+0.0365, +0.8615]       +0.4360       919     +5.10%
+
+(That `-0.5170` was `-0.5507` until a Phase 3/4 review caught it: the
+overall sample's mean, pool 1,546, sitting in a row of test values. It
+was the FOURTH instance in this kit of one error — reading a number
+without checking which sample produced it — and the third to reach
+shipped text, in the same editing pass that fixed the sibling instance
+eight lines above. The class is now the kit's most reliable defect.)
+
+HOW PRECISE IS `+0.0365`? Not to four decimals. `cluster_bootstrap` runs
+at `BOOTSTRAP_REPLICATES = 500`, and re-running it across 40 bootstrap
+seeds on these same 919 rows gives the lower bound a Monte-Carlo
+sd of **0.0221** (min -0.0150, max +0.0885): **2 of 40 seeds put it at
+or below zero.** So "the CI clears zero" is itself seed-dependent at the
+shipped replicate count. It is not a coin flip — raising replicates
+converges the bound upward and away from zero (5,000 reps: mean +0.0414,
+sd 0.0085, 0 of 40 below zero; 50,000 reps: mean +0.0396, sd 0.0028) —
+so the substantive answer holds and `+0.0365` is an unlucky draw on the
+right side of it. But any reading of this interval that leans on its
+first two decimals is leaning on bootstrap noise.
 
 Four criteria were fixed in advance; THREE were met. `event_overlap=0`
 met; test window 17.18 days (>= 14) met; the two-split rule met — 59 of
