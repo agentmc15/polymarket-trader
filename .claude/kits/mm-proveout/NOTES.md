@@ -1954,3 +1954,73 @@ than not. The settlement term consumed ~73% of the captured spread. Three conseq
 
 outcome: T27 model=opus attempts=1 result=pass review=none run=2026-09-13-4c1d
 outcome: T26 model=opus attempts=1 result=pass review=none run=2026-09-13-4c1d
+
+## 2026-09-13 — Dependency, safety, secrets and hardening pass
+
+Every secret scan below printed counts and filenames only, never matched content.
+
+### Secrets: clean
+
+- Tracked tree at HEAD: 0 hits for private-key blocks, 64-hex keys, AWS/GitHub/OpenAI token
+  shapes. 20 hits for `KALSHI_API_KEY_ID=`/`POLYMARKET_*=` with a value — all in tests, CLAUDE.md
+  and the market-edge NOTES; inspected by SHAPE (alphanumerics masked, length shown): every one is
+  a short snake_case fixture (11-19 chars with underscores). A real Kalshi key id is a 36-char UUID;
+  a real Polymarket key is 66 chars of hex. None present.
+- `.env` never entered git history (`git log --all --diff-filter=A -- .env` empty); mode 600;
+  ignored, as are `backend/.env`, `.cache`, `*.pem`.
+- `.env.example`: placeholders only, except the compose-default Postgres credentials and a
+  localhost URL — expected for local dev, and see hardening below.
+- Daemon logs (4,334 lines, both files): 0 hits for `Authorization`, `KALSHI-ACCESS-*`,
+  `PRIVATE KEY`, 64-hex, `POLY_*`, passphrase, api_key, or any 40+ char base64 run.
+- launchd plist: `EnvironmentVariables` holds only `PATH` and `PYTHONUNBUFFERED`.
+
+### Safety: clean
+
+- `tests/test_fences.py` 31 passed. `Settings(trading_mode="live").trading_mode -> 'paper'`
+  without `LIVE_TRADING_CONFIRMATION`. The daemon's own two `start` lines both say `mode=paper`.
+- No `privileged`, no docker socket mount, no `network_mode: host` in compose.
+- CORS default is localhost origins only. **The API has no authentication** (0 auth-guarded route
+  dependencies) — acceptable only because it is now loopback-bound (below); recorded as the first
+  thing to add before any non-local deployment.
+
+### Hardening: one real finding, fixed
+
+**Postgres was published on `0.0.0.0:5432` with the compose-default password, and the macOS
+firewall is disabled.** A writable database — the one T23's verdict will be computed from —
+reachable from anything on the same network with a known credential. Not a data-secrecy problem
+(it holds public market data); a data-INTEGRITY problem.
+
+Fixed in `docker-compose.yml`: every published port (`5432`, `6379`, `8000`, `5173`) now binds
+`127.0.0.1:` explicitly, with a comment saying why. Recreated the Postgres container; the data
+volume persisted (12,976 rows, revision 009, both checked after); `lsof` now shows
+`127.0.0.1:5432` only; the app reaches it via `localhost` (`select 1 -> 1`).
+
+**The recreate cost one Kalshi pass, and that was me.** The container restart landed inside
+Kalshi's write phase on the 03:07-03:12Z tick: `InterfaceError` (asyncpg connection closed) at
+03:12:46Z, the venue's uncommitted rows rolled back, Polymarket's 178 rows (already committed)
+untouched, and the next tick wrote both venues in full (178 / 1,000). The database shows the
+10-minute bucket at 03:10Z empty for Kalshi and 1,000 again at 03:20Z. The per-venue isolation
+T16 built behaved exactly as tested, under a fault it was not warned about. Net: a ~7-minute gap
+on one venue, inside T23 criterion 1's 10% allowance by a wide margin.
+
+Recommended, NOT done (system-level or credential changes are the user's):
+- Enable the macOS application firewall (`socketfilterfw --setglobalstate on`). With every port
+  now on loopback this is defence in depth, not the fix.
+- Change `POSTGRES_PASSWORD` from the compose default. Requires editing `.env` and
+  `DATABASE_URL`, which this kit's fences keep out of a task's hands.
+- 62% of the daemon log is `kalshi_unknown_market_status: inactive, assumed open` (2,687 lines).
+  Pre-existing adapter behaviour; a once-per-pass dedupe in the adapter would cut the log by
+  half. Hygiene, not safety.
+
+### Dependencies
+
+- Frontend: this branch was cut from `main` and so still carried the vulnerable lockfile — the
+  axios fix lived only on `fix/frontend-dependency-advisories`. `npm audit` here read 20 (14 high)
+  again. Cherry-picked `41da3ed` (verified by `git diff-tree` to touch `package-lock.json` alone)
+  -> `npm audit` 0, axios 1.20.0. A branch merged alone must not ship what another branch fixed.
+- Backend: `pip-audit` was not installed. The first attempt did not run at all — zsh does not
+  word-split an unquoted variable, so `$RUN -r ...` became one command named
+  `"python3 -m pip_audit"`; caught because the "exit code" line printed empty. Installed and
+  re-run explicitly; result recorded below when it lands. `pip list --outdated` = 367 is the
+  whole Anaconda base environment, not this project, and is not a signal.
+- Backend result: `pip-audit -r requirements.txt` -> **No known vulnerabilities found**, exit 0.

@@ -12,8 +12,13 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-polymarket}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    # Every published port in this file binds to loopback. Measured 2026-09-13: with
+    # the plain "5432:5432" form Docker published Postgres on 0.0.0.0, i.e. to the
+    # LAN, with the default password below and the macOS firewall off. Nothing in
+    # this repo needs these services reachable from another host; the compose
+    # network reaches them by service name regardless of the host binding.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-polymarket}"]
       interval: 10s
@@ -28,7 +33,7 @@ services:
     volumes:
       - redis_data:/data
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -76,7 +81,7 @@ services:
     volumes:
       - ./backend:/app
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -167,7 +172,7 @@ services:
       - ./frontend:/app
       - /app/node_modules
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     depends_on:
       - backend
     command: npm run dev -- --host 0.0.0.0
