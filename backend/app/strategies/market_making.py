@@ -151,10 +151,44 @@ Three further reasons the positive CI above is not a green light:
     `last_mid`. They differ in how much settlement they absorb, not in
     whether they absorb any — and 805 of these 919 markets held
     inventory into settlement, so the term is doing real work in both
-    numbers. Separating spread capture from settlement needs a
-    genuinely settlement-free measurement, which is what
-    `mm_replay_snapshots.py --markout-only` (`terminal="excluded"`)
-    exists to produce; that has not been run on Kalshi.
+    numbers.
+
+    **Measured on 2026-09-13 by stripping that term**
+    (`app/scripts/mm_markout_validation.py`,
+    `reports/kalshi-markout-only.json`; interpretation fixed in the
+    script's docstring before its first run). Same 919 test markets,
+    same policy, pessimistic, 5,000-replicate event-clustered bootstrap
+    across 20 seeds:
+
+        statistic         terminal   mean/mkt   per contract   CI95                  seeds > 0
+        cash              settled    +0.4360    +0.0168        [+0.0464, +0.8295]    20/20
+        markout_settled   settled    +0.6281    +0.0241        [+0.2809, +0.9953]    20/20
+        markout_only      excluded   +2.3671    +0.0909        [+2.1087, +2.6427]    20/20
+        settlement term   —          -1.7390    (805 of 919 rows nonzero; total -$1,598)
+
+    So the quoting captured +$2.37 per market of spread at a two-interval
+    horizon, and carrying inventory into settlement gave back -$1.74 of
+    it. The mechanism is real and it is not fragile: the top event is
+    2.22% of markout_only across 789 events, against five MARKETS
+    carrying 39.95% of cash P&L — the fragility in the cash interval was
+    the settlement term's, not the spread capture's. And +0.0909 per
+    contract sits between the two numbers the adverse-selection table at
+    the top of this docstring measured for the >= 0.25 bucket on a
+    different sample at a different resolution (front of queue +0.1152,
+    behind +0.0735): two independent measurements agreeing.
+
+    **What this does NOT say, stated because it is the tempting
+    misreading.** Two-interval markout overstates the money by 5.4x here
+    (2.37 vs 0.44): adverse selection keeps playing out after `mid(i+2)`
+    — takers are net buyers of YES, and the YES they bought tends to
+    settle higher than the last mid the quoter was marked at. A markout
+    result on Polymarket (T23) therefore establishes that spread capture
+    EXISTS there; it does not establish that money is made, and on
+    Kalshi the settlement drag consumed ~73% of the captured spread.
+    That ratio is a post-hoc observation from one venue at 1-minute
+    resolution, not a pre-committed criterion, and Polymarket's ~7-minute
+    collection cadence puts `mid(i+2)` ~14 minutes out rather than 2 —
+    a different horizon, not directly comparable.
 
 HOW MUCH THAT CI SHOULD BE BELIEVED, counted rather than waved at
 (`reports/kalshi-density-gate.json`): **23 distinct policy variants and

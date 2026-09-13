@@ -819,6 +819,15 @@ of adverse selection on Polymarket, markout basis; cash-settled P&L remains UNME
 clauses in one sentence, always. Any criterion missing -> name which; no partial result is a pass.
 This task decides nothing about trading real money; that is Gate 2 (T14) and the user's decision.
 
+**Post-hoc note, added 2026-09-13 AFTER the criteria above were fixed — it changes no criterion.**
+T27 ran the same markout-only instrument on the Kalshi honest holdout, where cash is known:
+markout_only +2.3671/market against cash +0.4360 — the two-interval mark overstates the money
+5.4x, because adverse selection keeps playing out after `mid(i+2)` and the settlement term ate
+~73% of the captured spread. A T23 pass therefore means "spread capture exists on Polymarket",
+never "money is made"; the report's verdict sentence already carries both clauses and must keep
+them. Polymarket's ~7-minute cadence puts `mid(i+2)` ~14 minutes out, not 2, so even the ratio is
+not directly transferable. See `reports/kalshi-markout-only.md`.
+
 **Verify.**
 ```bash
 cd backend && test -f ../.claude/kits/mm-proveout/reports/polymarket-markout.md && grep -q "terminal=excluded" ../.claude/kits/mm-proveout/reports/polymarket-markout.md && grep -q "cash-settled P&L remains UNMEASURED\|criterion .* NOT met" ../.claude/kits/mm-proveout/reports/polymarket-markout.md
@@ -860,7 +869,7 @@ cd backend && test -f ../.claude/kits/mm-proveout/reports/polymarket-settlement-
 ```
 
 ### T26 — A loop that runs collection without running the whole app
-- status: in-progress
+- status: done
 - model: opus
 - independent: yes
 
@@ -874,6 +883,27 @@ wrappers do, logs each tick as one JSON line, survives a failing tick, exits on 
 **Verify.**
 ```bash
 cd backend && python3 -m pytest -q tests/scripts/test_collection_loop.py tests/test_fences.py && python3 -m app.scripts.collection_loop --once
+```
+
+### T27 — Validate the instrument where the answer is known: markout-only on Kalshi
+- status: done
+- model: opus
+- depends: T20
+
+**Brief.** `--markout-only` was built for Polymarket and never run on Kalshi. Run
+`_strip_terminal_settlement` over T20's exact test split (same cache, cutoff, seed, policy) and
+report cash / markout_settled / markout_only side by side at T23's bootstrap standard, with the
+settlement term totalled separately. Interpretation fixed in the script docstring before the
+first run. `app/scripts/mm_markout_validation.py`; `reports/kalshi-markout-only.{md,json}`.
+
+**Outcome: branch A.** markout_only +2.3671/mkt, CI [+2.1087, +2.6427], 20/20 seeds, top event
+2.22% of 789. Settlement term -$1,598 over 805 rows. Spread capture is positive and dispersed;
+the settlement term is where the cash P&L's fragility lived. Per contract +0.0909 reconciles with
+the header study's >= 0.25 bucket (+0.1152 front / +0.0735 behind) — independent agreement.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/scripts/test_mm_markout_validation.py && python3 -c "import json;d=json.load(open('../.claude/kits/mm-proveout/reports/kalshi-markout-only.json'));assert d['verdict']['branch'] in 'ABCD';assert d['fill_models']['pessimistic']['markout_only']['terminal']=='excluded';print('ok')"
 ```
 
 **— end of Phase 3 —**

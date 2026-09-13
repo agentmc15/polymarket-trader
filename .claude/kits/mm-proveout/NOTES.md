@@ -1864,3 +1864,93 @@ its existing row (`observed_at` refreshed, no new row — T15's design), and fea
 48.7-68.0% of Polymarket books changing inside a 15-minute window. 144/256 = 56% is inside that
 range. Consistent with the measurement, not a defect; T24 will measure it properly over weeks.
 Kalshi wrote 1,000 again — every selected book was new at its poll `ts`.
+
+### 8. Handed off to launchd — survives logout, sleep and reboot
+
+The nohup process would have died with the session. Installed
+`~/Library/LaunchAgents/com.polymarket-trader.collection-loop.plist` (outside the repo; its
+content is reproduced below so it can be rebuilt): `/opt/anaconda3/bin/python3 -m
+app.scripts.collection_loop`, `WorkingDirectory` = `backend/`, stdout+stderr appended to
+`backend/.cache/collection-loop.log`, `RunAtLoad` + `KeepAlive` true, `ThrottleInterval` 60s,
+minimal explicit PATH (launchd sources no shell profile). `.env` is found by `Settings` via
+`_REPO_ROOT`, not the cwd, so the working directory only matters for the module path.
+
+Handoff sequence, measured: SIGTERM to the nohup PID 33372 -> it finished its in-flight tick and
+logged `{"tick": "stop", "collect_ticks": 5, "signalled": true}` at 02:17:08Z -> `launchctl load`
+-> launchd PID 56443 logged `start` at 02:17:20Z. The `ps` check fired inside the old process's
+12-second teardown and reported it alive; re-checked after: gone, exactly one loop running. The
+log was backed up to `.cache/collection-loop.nohup.log` before the swap in case launchd
+truncated it; it appended (1,444 lines, both `start` lines present), so the backup is redundant
+and harmless.
+
+**Stop for real:** `launchctl unload ~/Library/LaunchAgents/com.polymarket-trader.collection-loop.plist`.
+A plain `kill` is honoured (clean stop line) and then undone by `KeepAlive`, which restarts it —
+that is the point of the agent, and it is the trap for anyone who expects `kill` to be final.
+**Status:** `launchctl list | grep polymarket-trader` (PID, last exit code).
+
+Plist, verbatim minus comments:
+
+    Label                com.polymarket-trader.collection-loop
+    ProgramArguments     /opt/anaconda3/bin/python3 -m app.scripts.collection_loop
+    WorkingDirectory     /Users/michaelcave/Developer/reposV2/polymarket-trader/backend
+    EnvironmentVariables PATH=/opt/anaconda3/bin:/usr/local/bin:/usr/bin:/bin  PYTHONUNBUFFERED=1
+    StandardOutPath      .../backend/.cache/collection-loop.log   (StandardErrorPath the same)
+    RunAtLoad true   KeepAlive true   ThrottleInterval 60   ProcessType Background
+
+## T27 — Markout-only on Kalshi: the maker mechanism is real, and settlement is where it went
+
+The Phase 3/4 review established that `markout_pnl` in settled mode is not settlement-free, and I
+called running the settlement-free version on Kalshi "the cheapest remaining measurement" because
+Kalshi is the venue where cash is already known. Ran it: `app/scripts/mm_markout_validation.py`,
+committed (unlike the T20/T22 generators), interpretation fixed in its docstring BEFORE the first
+run, at T23's own bootstrap standard (5,000 replicates, 20 seeds). T20's exact test split.
+
+    pessimistic, 919 markets / 789 events / 2,392 fills / 805 held into settlement
+
+    statistic         terminal   mean/mkt   per contract   CI95 (seed 0)         min low   seeds>0
+    cash              settled    +0.4360    +0.01675       [+0.0464, +0.8295]    +0.0277   20/20
+    markout_settled   settled    +0.6281    +0.02413       [+0.2809, +0.9953]    +0.2666   20/20
+    markout_only      excluded   +2.3671    +0.09094       [+2.1087, +2.6427]    +2.0933   20/20
+    settlement term              -1.7390                   total -$1,598.10, nonzero on 805 rows
+
+    optimistic agrees: markout_only +2.4964 [+2.2381, +2.7779] 20/20; settlement term -1.7883.
+
+**Branch A fired, all three conditions met.** Concentration is the opposite of the cash picture:
+top event `KXNCAAFFIRSTTDTEAM-26SEP03COLOGT` is **2.22%** of markout_only across 789 events, and
+the CI without it is [+2.07, +2.57]. Recall five MARKETS carried 39.95% of CASH P&L. So the
+fragility the reviewer and I found in the cash interval was the settlement term's fragility — a
+handful of positions that happened to settle well — not the spread capture's, which is spread
+almost uniformly across events.
+
+**Independent agreement.** +0.0909 per contract sits between the two numbers the original
+adverse-selection study (537 markets, hourly, in `market_making.py`'s header) measured for the
+>= 0.25 bucket: +0.1152 front-of-queue, +0.0735 behind. Different sample, different resolution,
+different code path, same answer to within the queue-position uncertainty.
+
+**Cash at 5,000 replicates: [+0.0464, +0.8295], 20/20 seeds.** The review predicted the bound would
+converge upward from +0.0365 and it did. This does NOT reopen the Kalshi NO-GO — n_trading is
+still 919 and the multiplicity is still 33 looks — but the seed-fragility finding is now closed at
+the standard T23 uses.
+
+### The finding that matters most, and it is post-hoc
+
+**Two-interval markout overstates the money 5.4x** (2.37 vs 0.44). The quoting earns the spread at
+`mid(i+2)`; then adverse selection keeps playing out — takers are net buyers of YES (the header's
+own measurement), and the YES they bought settles higher than the quoter's last mid more often
+than not. The settlement term consumed ~73% of the captured spread. Three consequences:
+
+1. **For T23:** a Polymarket markout pass means spread capture EXISTS there, never that money is
+   made. Written into T23 as a labelled post-hoc note; the seven criteria are unchanged.
+2. **For the taper question (T6):** the settlement drag is real and large, yet T4/T6 found
+   `taper_hours=0` optimal on ROC. Not a contradiction — the taper stops QUOTING, it does not exit
+   inventory, and exiting means crossing a >= 0.25 spread plus the 7% taker fee, which costs more
+   than -$1.74/market. The lead this opens: a policy that reduces terminal inventory WITHOUT
+   crossing (lean the quotes harder as close approaches, so the crowd takes you out on your side)
+   — that is what `skew_strength` does, and T5 measured skew 1.0 WORSE than 0.0. Unresolved, noted.
+3. **For the ratio itself:** one venue, 1-minute resolution, 919 markets. Polymarket's ~7-minute
+   cadence puts `mid(i+2)` ~14 minutes out, so its markout already contains more of the drift.
+   Not transferable as a number; transferable as a direction.
+
+
+outcome: T27 model=opus attempts=1 result=pass review=none run=2026-09-13-4c1d
+outcome: T26 model=opus attempts=1 result=pass review=none run=2026-09-13-4c1d

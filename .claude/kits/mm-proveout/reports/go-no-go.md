@@ -821,3 +821,18 @@ below zero. Neither measurement exists today.
 - Every P&L, ROC and spread figure carries `fill_model=` and `terminal=`;
   pessimistic is first and every verdict is computed on it; the rebate is its own
   line and is in no P&L figure; every interval is clustered by event.
+
+---
+
+## Addendum, 2026-09-13 — the instrument §8.2 names has now been calibrated on Kalshi
+
+§8.2 describes `--markout-only` as the weeks-long path for Polymarket and says a markout verdict
+"would answer 'does quoting this venue capture spread net of adverse selection'; it would not
+answer 'does the strategy make money after terminal inventory settles'." That distinction is now
+measured rather than asserted (`reports/kalshi-markout-only.md`, T27): on the same 919 Kalshi
+test markets, `markout_only` (`terminal=excluded`) is **+2.3671** per trading market against cash
+**+0.4360** — the settlement term is **-$1,598** over 805 rows. Spread capture is real,
+dispersed (top event 2.22% of 789), and 5.4x larger than the money it left behind. Neither
+verdict above changes: Kalshi stays NO-GO at n_trading=919 and 33 looks; Polymarket stays
+UNDERPOWERED. What changes is how a future T23 pass must be read — as evidence of the mechanism,
+never of profit — and T23 now says so.

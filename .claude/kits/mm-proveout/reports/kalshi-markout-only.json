@@ -1,0 +1,204 @@
+{
+  "generated_at": "2026-09-13T02:16:55+00:00",
+  "what": "Kalshi honest holdout, shipped policy, TEST split: cash vs markout with and without the terminal-settlement term. Pessimistic first.",
+  "provenance": {
+    "cache": ".cache/mm/kalshi-honest-1m.json",
+    "n_markets_in_cache": 4903,
+    "cutoff_ts": 1787270400,
+    "split_seed": 20260912,
+    "policy": {
+      "edge_fraction": 0.9,
+      "min_spread": 0.25,
+      "max_inventory": 50.0
+    },
+    "replicates": 5000,
+    "seeds": 20,
+    "harness": "app.scripts.mm_backtest.replay/_split; app.scripts.mm_replay_snapshots._strip_terminal_settlement; app.scripts.calibration.cluster_bootstrap"
+  },
+  "interpretation_fixed_in_advance": {
+    "A": "markout_only pessimistic lower bound > 0 on all seeds AND top event share < 0.25 AND clears without top event -> spread capture positive independent of settlement",
+    "B": "markout_only lower bound <= 0 on any seed while cash clears on all seeds -> the cash edge is not demonstrated to be spread capture",
+    "C": "markout_only lower bound < 0 on a majority of seeds -> spread capture negative",
+    "D": "anything else -> name which condition failed; no partial pass"
+  },
+  "fill_models": {
+    "pessimistic": {
+      "fill_model": "pessimistic",
+      "split": "temporal-test",
+      "n_trading": 919,
+      "n_events_trading": 789,
+      "n_fills": 2392,
+      "held_into_settlement": 805,
+      "settlement_term": {
+        "total": -1598.1000000000001,
+        "mean_per_trading_market": -1.7389553862894451,
+        "n_rows_nonzero": 805,
+        "note": "markout_settled minus markout_only, summed; exactly what replay() added to the maker statistic for terminal inventory"
+      },
+      "cash": {
+        "terminal": "settled",
+        "basis": "cash_settled",
+        "n": 919,
+        "mean": 0.43598476605005465,
+        "sd": 6.090764953520042,
+        "total": 400.67000000000024,
+        "ci95_seed0": [
+          0.04643702906350941,
+          0.8295031712473576
+        ],
+        "replicates": 5000,
+        "seeds": 20,
+        "lower_bound_min": 0.02771775082690218,
+        "lower_bound_max": 0.05321917808219205,
+        "lower_bound_sd": 0.007467138005990678,
+        "seeds_with_lower_bound_gt_zero": 20,
+        "clears_zero_on_all_seeds": true,
+        "per_fill": 0.16750418060200678
+      },
+      "markout_settled": {
+        "terminal": "settled",
+        "basis": "marked_at_i_plus_2_plus_terminal_term",
+        "n": 919,
+        "mean": 0.6280957562568009,
+        "sd": 5.56978528542708,
+        "total": 577.22,
+        "ci95_seed0": [
+          0.2809219088937093,
+          0.9953030303030302
+        ],
+        "replicates": 5000,
+        "seeds": 20,
+        "lower_bound_min": 0.2666386554621849,
+        "lower_bound_max": 0.28700325732899024,
+        "lower_bound_sd": 0.005486068761465447,
+        "seeds_with_lower_bound_gt_zero": 20,
+        "clears_zero_on_all_seeds": true,
+        "per_fill": 0.24131270903010035
+      },
+      "markout_only": {
+        "terminal": "excluded",
+        "basis": "marked_at_i_plus_2_only",
+        "n": 919,
+        "mean": 2.367051142546246,
+        "sd": 4.017194776488741,
+        "total": 2175.32,
+        "ci95_seed0": [
+          2.1086824324324325,
+          2.642666666666667
+        ],
+        "replicates": 5000,
+        "seeds": 20,
+        "lower_bound_min": 2.0932548179871517,
+        "lower_bound_max": 2.1129944751381213,
+        "lower_bound_sd": 0.005123694780480839,
+        "seeds_with_lower_bound_gt_zero": 20,
+        "clears_zero_on_all_seeds": true,
+        "per_fill": 0.9094147157190636,
+        "concentration": {
+          "n_events": 789,
+          "top_event": "KXNCAAFFIRSTTDTEAM-26SEP03COLOGT",
+          "top_event_total": 48.25,
+          "top_event_share": 0.02218064468675873,
+          "share_under_ceiling": true,
+          "ci95_seed0_without_top_event": [
+            2.0716611661166118,
+            2.5702711496746202
+          ],
+          "clears_zero_without_top_event": true
+        }
+      }
+    },
+    "optimistic": {
+      "fill_model": "optimistic",
+      "split": "temporal-test",
+      "n_trading": 935,
+      "n_events_trading": 804,
+      "n_fills": 2545,
+      "held_into_settlement": 819,
+      "settlement_term": {
+        "total": -1672.1000000000001,
+        "mean_per_trading_market": -1.788342245989305,
+        "n_rows_nonzero": 819,
+        "note": "markout_settled minus markout_only, summed; exactly what replay() added to the maker statistic for terminal inventory"
+      },
+      "cash": {
+        "terminal": "settled",
+        "basis": "cash_settled",
+        "n": 935,
+        "mean": 0.45299465240641745,
+        "sd": 6.371877216907988,
+        "total": 423.5500000000003,
+        "ci95_seed0": [
+          0.043401506996771026,
+          0.8579249217935352
+        ],
+        "replicates": 5000,
+        "seeds": 20,
+        "lower_bound_min": 0.032673575129534047,
+        "lower_bound_max": 0.0595638629283492,
+        "lower_bound_sd": 0.00716403981874454,
+        "seeds_with_lower_bound_gt_zero": 20,
+        "clears_zero_on_all_seeds": true,
+        "per_fill": 0.1664243614931239
+      },
+      "markout_settled": {
+        "terminal": "settled",
+        "basis": "marked_at_i_plus_2_plus_terminal_term",
+        "n": 935,
+        "mean": 0.7080748663101605,
+        "sd": 5.813462610510779,
+        "total": 662.0500000000001,
+        "ci95_seed0": [
+          0.3443829787234043,
+          1.076474973375932
+        ],
+        "replicates": 5000,
+        "seeds": 20,
+        "lower_bound_min": 0.3386519337016574,
+        "lower_bound_max": 0.3533439829605964,
+        "lower_bound_sd": 0.003603986016977426,
+        "seeds_with_lower_bound_gt_zero": 20,
+        "clears_zero_on_all_seeds": true,
+        "per_fill": 0.2601375245579568
+      },
+      "markout_only": {
+        "terminal": "excluded",
+        "basis": "marked_at_i_plus_2_only",
+        "n": 935,
+        "mean": 2.4964171122994654,
+        "sd": 4.133720197465852,
+        "total": 2334.15,
+        "ci95_seed0": [
+          2.238062015503876,
+          2.7779395900755124
+        ],
+        "replicates": 5000,
+        "seeds": 20,
+        "lower_bound_min": 2.2166206163655686,
+        "lower_bound_max": 2.238062015503876,
+        "lower_bound_sd": 0.004396757781792009,
+        "seeds_with_lower_bound_gt_zero": 20,
+        "clears_zero_on_all_seeds": true,
+        "per_fill": 0.9171512770137525,
+        "concentration": {
+          "n_events": 804,
+          "top_event": "KXPGAPLAYOFF-BMC26",
+          "top_event_total": 47.90000000000002,
+          "top_event_share": 0.02052138894244158,
+          "share_under_ceiling": true,
+          "ci95_seed0_without_top_event": [
+            2.192636165577342,
+            2.717760577915377
+          ],
+          "clears_zero_without_top_event": true
+        }
+      }
+    }
+  },
+  "verdict": {
+    "statistic": "markout_only, pessimistic, temporal-test, terminal=excluded",
+    "branch": "A",
+    "conditions_failed": [],
+    "decides_trading": false
+  }
+}
