@@ -1769,3 +1769,98 @@ wearing a reproducibility label — an eighth "check that cannot fail".
 reviewer: P3-P4 model=opus findings=19 confirmed=19 result=accepted
 defect: T22 kind=tautological-verify
 defect: T13 kind=post-hoc-criterion
+
+## 2026-09-12/13 — Forward collection is running
+
+The user authorised the remedy for Polymarket's UNDERPOWERED verdict: apply the migrations and
+start the collector. Done in this order, deliberately — criteria first, fence lift on record,
+apply, hand-run one pass, daemonize — so that no bar was written after a number existed.
+
+### 1. Criteria pre-committed before any data (TASKS.md Phase 3b)
+
+T23 (Polymarket markout verdict: seven criteria, all required, interpretation fixed), T24 (the
+entry rate that replaces feasibility §5.2's Scenario A/B assumption), T25 (the Dec-31 batch
+settlement — a sanity check, labelled so on its first line), T26 (the loop). Two criteria come
+straight from this session's review: bootstrap at >= 5,000 replicates, and the lower bound must
+survive 20 seeds. The 500-replicate default gave the Kalshi bound an MC sd of 0.022.
+
+### 2. GUARDRAILS §1.2 lifted by the user — scope recorded in the file
+
+For exactly one target: the local `polymarket-postgres` container on a fresh volume. Lifted AFTER
+the rule had been satisfied in full (SQL rendered, reviewed additive, models tested on SQLite),
+not instead of it. The orchestrator applied the migrations under that authorisation; no task did.
+
+### 3. Applied: `alembic upgrade head`, 001 -> 009, exit 0
+
+A fresh volume has no schema, so all NINE revisions ran, not just 008/009. Full base->head render
+saved to `reports/applied-migrations-001-009.sql` (89 DDL statements). The DROPs in it are 002
+removing tables 001 creates (trader mimicry), and 007's DELETE/UPDATE ran against an empty
+`book_snapshots` — nothing destructive to any data, because there was no data. `alembic current`
+= `009 (head)`. 16 tables present; all seven 008 columns present on `book_snapshots`.
+
+### 4. Preflight, live: database PASS, both venues PASS, broker FAIL (unused)
+
+`preflight --check-collection`: schema at head; Kalshi 5 quotable sampled live, fee parsed,
+two-sided book returned, 80,010/124,159 listed parse a quotable spread (Kalshi's listing is
+124,159 today vs 96,072 on 09-07); Polymarket 5 sampled, 1,642/1,919 two-sided. The one FAIL is
+`CELERY_BROKER_URL` unreachable — Redis is not running, and the loop does not use it.
+`run_collect_books()`'s internal preflight checks only DB head and live field names, so the
+broker FAIL cannot block a tick.
+
+### 5. One pass by hand (`collection_loop --once`): both venues wrote
+
+    collect  ok  elapsed 239.0s  written polymarket=256 kalshi=1000
+    health   ok  exit 0
+
+1,763 HTTP requests (1,143 Kalshi, 387 CLOB, 233 Gamma). Rows verified in the database:
+
+    venue       outcome  rows  markets  volume  taker_fee  rebate  rebate>0  fee_source
+    kalshi      YES/NO   500/500  500    all     all        all       0       settings
+    polymarket  YES/NO   128/128  128    all     all        all     127       venue_schedule
+
+Kalshi = 500 markets x 2 outcomes = `book_collection_top_n`; Polymarket = 128 x 2, matching the
+feasibility grid's 130 at the production floor to within same-day drift. **127 of 128 Polymarket
+markets publish a rebate > 0 (99.2%)** — the 96-99% figure, now in the database rather than a
+probe. `selection_membership`: 500 + 128 selected.
+
+**The pass took 239s against a 180s configured interval.** The 110-125s that derived 180s is
+stale — Kalshi's listing grew ~30%. Not a problem for correctness: the loop's interval is a GAP
+between passes, so ticks never overlap; a start-to-start schedule at 180s would have run at 100%
+duty, ~7 req/s sustained against Kalshi's ~10/s measured ceiling. It IS a measurement fact every
+report on this data must carry: the real cadence is ~7 minutes, not 3, and the markout mark at
+`mid(i+2)` is therefore ~14 minutes after the fill, not 6. Recorded in the module docstring.
+
+Two Polymarket warnings on every pass, pre-existing and structural: `gamma_market_page_cap_reached`
+at 2,100 (the venue's offset ceiling, feasibility §1) and 181 listed markets skipped for a missing
+`endDate`. Kalshi logs `kalshi_unknown_market_status: inactive, assumed open` for a handful of
+markets — adapter behaviour that predates this kit.
+
+### 6. Daemonized
+
+`nohup python3 -m app.scripts.collection_loop`, detached, PID in `backend/.cache/collection-loop.pid`,
+JSON-lines log at `backend/.cache/collection-loop.log` (both gitignored). Start line logged at
+2026-09-13T01:43:50Z, `mode=paper`, `collect_interval_s=180`, `health_interval_s=1800`. httpx
+INFO is silenced in the loop (measured ~1,700 lines per pass); venue WARNING/ERROR still logs.
+
+**Stop it with:** `kill $(cat backend/.cache/collection-loop.pid)` — SIGTERM sets a flag the
+loop honours within a second and it exits after the current tick, logging a `stop` line.
+**Check it with:** `grep '"tick"' backend/.cache/collection-loop.log | tail` or
+`python3 -m app.scripts.collection_health --hours 1` from `backend/`.
+
+What is NOT exercised: the Celery task wrappers and the Redis broker. The loop calls the same
+two coroutines through the same `run_async_task`; the wrapper is one line, and it is untested in
+production. Said here so nobody reads "collection is running" as "the beat is running".
+
+outcome: T26 model=opus attempts=1 result=pass review=none run=2026-09-12-3e71
+
+### 7. First daemon tick, measured
+
+    2026-09-13T01:47:44Z  collect  ok  elapsed 234.0s  written polymarket=144 kalshi=1000
+
+Second pass in ~4 minutes; 234s against the hand-run's 239s, so ~235s is the steady-state pass
+time on today's listings and the real cadence is ~415s (pass + 180s gap). Polymarket wrote 144
+rows against the hand-run's 256: an unchanged book carries the same venue `ts` and upserts into
+its existing row (`observed_at` refreshed, no new row — T15's design), and feasibility §4 measured
+48.7-68.0% of Polymarket books changing inside a 15-minute window. 144/256 = 56% is inside that
+range. Consistent with the measurement, not a defect; T24 will measure it properly over weeks.
+Kalshi wrote 1,000 again — every selected book was new at its poll `ts`.

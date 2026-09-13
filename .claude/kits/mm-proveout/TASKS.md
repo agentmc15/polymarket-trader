@@ -779,6 +779,103 @@ the user's decision.
 cd backend && test -f ../.claude/kits/mm-proveout/reports/go-no-go.md && test "$(grep -c '^VERDICT ' ../.claude/kits/mm-proveout/reports/go-no-go.md)" = "2" && grep -q "queue position" ../.claude/kits/mm-proveout/reports/go-no-go.md
 ```
 
+## Phase 3b — Forward collection is running; the verdicts it can and cannot produce
+
+Written 2026-09-12, BEFORE the first snapshot existed. The user lifted GUARDRAILS §1.2 for the
+local development database on this date (recorded there). Every criterion below is fixed now so
+that no number seen later can move it — the discipline that produced this kit's only honest
+results. Collection runs through `app.scripts.collection_loop` (T26), calling the SAME
+`run_collect_books()` and `collection_health._run` coroutines the Celery beat wraps; the Celery
+wrapper and broker path remain unexercised in production and that is stated, not hidden.
+
+### T23 — Polymarket markout verdict on forward snapshots
+- status: pending
+- model: opus
+- depends: T11, T26
+
+**Brief.** Run `mm_replay_snapshots.py --markout-only --venue polymarket` on the forward
+`book_snapshots` rows, shipped params (`edge_fraction=0.90, min_spread=0.25, max_inventory=50.0`),
+pessimistic FIRST, `terminal=excluded`. Write `reports/polymarket-markout.md` and `.json`.
+
+**Criteria — ALL required, fixed 2026-09-12 before any data existed:**
+1. Data window >= 28 days of collection, with `collection_health` stale gaps totalling < 10% of
+   the window. State the window (first/last snapshot, n passes, n stale) at the top.
+2. `n_events_trading >= 30` (the harness's own `MIN_POWER_POOL_EVENTS`) AND `n_fills >= 300`.
+3. Verdict statistic: `mean_markout_pnl_per_trading_market`, event-clustered CI95 by
+   `cluster_bootstrap` at **>= 5,000 replicates** (the shipped 500 gave the Kalshi lower bound a
+   Monte-Carlo sd of 0.022 — see NOTES.md, Phase 3/4 review). Lower bound > 0.
+4. The lower bound stays > 0 across 20 distinct bootstrap seeds at 5,000 replicates. A criterion
+   that flips with the seed is not met.
+5. No single event > 25% of total markout P&L, AND the CI still clears zero with the largest
+   event removed. (NCAAF was 75.3% of one rejected result; ITF tennis was the whole of another.)
+6. The rebate is its own line — "would add $X per trading market if paid as published" — and
+   is EXCLUDED from the verdict statistic. Published is not paid.
+7. Multiplicity: the shipped policy is scored against the verdict window EXACTLY ONCE. No grid
+   touches these rows. Any calibration (T12) runs on an event-disjoint tuning subset declared in
+   advance, and the verdict subset is never re-scored after a parameter is chosen from it.
+
+**Interpretation, fixed in advance.** All seven met -> "the quoting mechanism captures spread net
+of adverse selection on Polymarket, markout basis; cash-settled P&L remains UNMEASURED" — both
+clauses in one sentence, always. Any criterion missing -> name which; no partial result is a pass.
+This task decides nothing about trading real money; that is Gate 2 (T14) and the user's decision.
+
+**Verify.**
+```bash
+cd backend && test -f ../.claude/kits/mm-proveout/reports/polymarket-markout.md && grep -q "terminal=excluded" ../.claude/kits/mm-proveout/reports/polymarket-markout.md && grep -q "cash-settled P&L remains UNMEASURED\|criterion .* NOT met" ../.claude/kits/mm-proveout/reports/polymarket-markout.md
+```
+
+### T24 — The entry rate: replace feasibility §5.2's assumption with a number
+- status: pending
+- model: sonnet
+- depends: T26
+
+**Brief.** At >= 14 days of collection, measure from `selection_membership` and `book_snapshots`
+how many NEW markets entered the quotable set per day on each venue, how many left, and the
+distinct-EVENT entry rate — the quantity `polymarket-feasibility.md` §5.3 names as the single
+largest unmeasured unknown. Recompute time-to-1,000-trading-markets from the measured rate and
+put it beside Scenario A's ~2.4y / ~4.2y. Descriptive only: no verdict, no threshold, no
+recommendation. Write `reports/entry-rate.md`.
+
+**Verify.**
+```bash
+cd backend && test -f ../.claude/kits/mm-proveout/reports/entry-rate.md && grep -qi "events per day\|distinct events" ../.claude/kits/mm-proveout/reports/entry-rate.md
+```
+
+### T25 — The January batch: the Dec-31 cohort settles together
+- status: pending
+- model: sonnet
+- depends: T23
+
+**Brief.** ~127 of 141 quotable Polymarket markets close on 2026-12-31 (feasibility §5.1). When
+they resolve, run the cash-settled replay (`terminal=settled`) on exactly that cohort and report
+it beside T23's markout result. **This is a sanity check, not a verdict, and the report's first
+line says so**: at n ~ 130 it is underpowered for any cash verdict (on Kalshi's per-market sd
+the CI is roughly +/-1.0 around a mean of ~0.4). The ONLY pre-committed criterion is
+sign-agreement: does cash-settled mean P&L have the same sign as markout? Disagreement is the
+finding this exists to catch — the case where the mechanism works and the settlement does not.
+
+**Verify.**
+```bash
+cd backend && test -f ../.claude/kits/mm-proveout/reports/polymarket-settlement-batch.md && grep -qi "sanity check, not a verdict" ../.claude/kits/mm-proveout/reports/polymarket-settlement-batch.md
+```
+
+### T26 — A loop that runs collection without running the whole app
+- status: in-progress
+- model: opus
+- independent: yes
+
+**Brief.** `app/tasks/__init__.py`'s beat schedule also fires the arbitrage scanner, execution
+reconciliation and link proposals. The user authorised the COLLECTOR. `app/scripts/collection_loop.py`
+calls `run_collect_books()` every `settings.book_collection_interval_s` and `collection_health._run`
+every `settings.collection_health_interval_s`, through `run_async_task` exactly as the Celery
+wrappers do, logs each tick as one JSON line, survives a failing tick, exits on SIGTERM, and has a
+`--once` flag. It imports nothing that can place an order; `tests/test_fences.py` must stay green.
+
+**Verify.**
+```bash
+cd backend && python3 -m pytest -q tests/scripts/test_collection_loop.py tests/test_fences.py && python3 -m app.scripts.collection_loop --once
+```
+
 **— end of Phase 3 —**
 
 ---

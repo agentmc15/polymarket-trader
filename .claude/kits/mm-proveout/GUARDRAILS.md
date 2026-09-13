@@ -13,6 +13,12 @@ its provenance labels) apply verbatim. Read that file too.
    allowed-files list by AST; do not add a file to that list.
 2. **Nothing applies a migration to a live database.** `alembic upgrade head --sql` only. A task that
    needs a schema change renders the SQL, tests the model on SQLite, and stops.
+   **Lifted 2026-09-12 by the user, for exactly one target: the local development database
+   `polymarket-postgres` (docker-compose, port 5432, a fresh volume with no prior data).** The
+   lift was made after the SQL was rendered to `reports/pending-migrations-008-009.sql`, reviewed as
+   purely additive, and the models tested on SQLite — i.e. after this rule had been satisfied in
+   full, not instead of it. It does NOT extend to any other database, and the orchestrator applied
+   the migrations itself under that authorisation; no task did.
 3. **Network is read-only public GETs**, plus the signed Kalshi GETs the adapter already makes. No
    POST/PUT/DELETE to any venue. No new authenticated endpoint. If a probe needs `/trades` on
    Polymarket (401 without keys), it is not available — say so and use what is.
